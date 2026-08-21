@@ -132,6 +132,7 @@ FL_CONFIG = {
     "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
     "MAX_WEIGHT_NORM": 1000.0,
     "WEIGHT_DECAY": 0.0001,
+    "SERVER_LR": 0.1,             # 🎯 NEW: Scales sequential updates to prevent divergence
     "IP_TIMEOUT_S": 600,          # consider an IP "active" if seen in last 10 min
     "SHARD_TIMEOUT_S": 1800,      # force-aggregate a shard after 30 min (avoid stuck shards)
     "CLEANUP_INTERVAL_S": 60,
@@ -299,67 +300,46 @@ def load_latest_checkpoint() -> bool:
 
 def save_latest_checkpoint():
     try:
-        global_weights.numpy().tofile(LATEST_CHECKPOINT_FILE)
+        global_weights.cpu().numpy().tofile(LATEST_CHECKPOINT_FILE)
         with open(GLOBAL_STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump({"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(),
                        "modelSize": MODEL_SIZE, "modelConfig": MODEL_CONFIG, "loraStats": lora_stats}, f, indent=2)
     except Exception as e:
         log.error(f"❌ save checkpoint: {e}")
 
-# ============ VECTOR MATH / ROBUST AGGREGATION ============
-def compute_cosine_similarity(a, b):
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
+# ============ VECTOR MATH / SEQUENTIAL AGGREGATION ============
 def compute_max_allowed_norm(local_steps, rank=None):
     steps = max(1, int(local_steps or 1))
     base = FL_CONFIG["DELTA_NORM_BASE"] * math.sqrt(steps / 100.0)
     rank_factor = np.sqrt(rank / LORA_CONFIG["FULL_RANK"]) if rank and rank < LORA_CONFIG["FULL_RANK"] else 1.0
     return base * rank_factor
 
-def compute_robust_delta(submissions: List[dict]) -> Optional[np.ndarray]:
-    """Byzantine-tolerant aggregation: coordinate-wise median + cosine filter."""
-    if len(submissions) == 1:
-        return submissions[0]["delta"]
-    deltas = np.stack([s["delta"] for s in submissions])
-    median_delta = np.median(deltas, axis=0)
-
-    valid = []
-    for s in submissions:
-        cos = compute_cosine_similarity(s["delta"], median_delta)
-        if cos > 0.3:
-            valid.append(s["delta"])
-        else:
-            log.warning(f"🛡️ dropped divergent delta from {s.get('nodeIp')} (cos={cos:.2f})")
-            ban_subnet(s.get("nodeIp", "unknown"), "divergent gradient / poison attempt")
-
-    if not valid:
-        log.error("🚨 all deltas divergent — rejecting shard")
-        return None
-    return np.mean(np.stack(valid), axis=0)
-
-def apply_global_update(mean_delta: np.ndarray, num_clients: int = 1):
+def apply_sequential_update(delta: np.ndarray, client_ip: str, rank: int):
+    """🎯 NEW: Applies delta immediately to global weights (sequential FedSGD style)"""
     global global_weights, global_step
-    if np.isnan(mean_delta).any() or np.isinf(mean_delta).any():
-        log.error("🚨 mean delta has NaN/Inf — rejected")
+    
+    if np.isnan(delta).any() or np.isinf(delta).any():
+        log.error("🚨 Sequential update rejected: NaN/Inf in delta")
         return
-    if num_clients > 1:
-        mean_delta = mean_delta / num_clients
 
-    global_weights = global_weights * (1.0 - FL_CONFIG["WEIGHT_DECAY"]) + torch.from_numpy(mean_delta)
-    if torch.isnan(global_weights).any() or torch.isinf(global_weights).any():
-        global_weights[torch.isnan(global_weights)] = 0.0
-        global_weights[torch.isinf(global_weights)] = 0.0
-
-    norm = torch.norm(global_weights).item()
-    if norm > FL_CONFIG["MAX_WEIGHT_NORM"]:
-        global_weights = global_weights * (FL_CONFIG["MAX_WEIGHT_NORM"] / norm)
-        log.warning(f"⚠️ weight norm {norm:.2f} clipped")
-
-    global_step += 1
-    log.info(f"✅ global update step {global_step} norm={norm:.2f}")
+    delta_tensor = torch.from_numpy(delta)
+    
+    with shard_lock:
+        # 1. Weight decay
+        global_weights.mul_(1.0 - FL_CONFIG["WEIGHT_DECAY"])
+        
+        # 2. Apply scaled sequential update
+        global_weights.add_(delta_tensor, alpha=FL_CONFIG["SERVER_LR"])
+        
+        # 3. Global norm clip to prevent explosion
+        norm = torch.norm(global_weights).item()
+        if norm > FL_CONFIG["MAX_WEIGHT_NORM"]:
+            global_weights.mul_(FL_CONFIG["MAX_WEIGHT_NORM"] / norm)
+            log.warning(f"⚠️ global weight norm {norm:.2f} clipped")
+            
+        global_step += 1
+        
+    log.info(f"✅ Sequential update step {global_step} from {client_ip} (rank={rank})")
     save_latest_checkpoint()
     handle_checkpoints()
 
@@ -368,7 +348,7 @@ def handle_checkpoints():
         return
     try:
         fp = CHECKPOINT_DIR / f"model_step_{global_step}.bin"
-        global_weights.numpy().tofile(fp)
+        global_weights.cpu().numpy().tofile(fp)
         with open(CHECKPOINT_DIR / f"model_step_{global_step}.json", 'w', encoding='utf-8') as f:
             json.dump({"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(),
                        "modelSize": MODEL_SIZE}, f, indent=2)
@@ -381,20 +361,6 @@ def handle_checkpoints():
             if meta.exists(): meta.unlink()
     except Exception as e:
         log.error(f"❌ checkpoint: {e}")
-
-def _do_aggregate(shard_id: str):
-    """Aggregate + apply all pending submissions for a shard, then clear it."""
-    subs = db["pendingSubmissions"].get(shard_id, [])
-    if not subs:
-        return
-    robust = compute_robust_delta(subs)
-    if robust is None:
-        db["pendingSubmissions"][shard_id] = []
-        return
-    apply_global_update(robust, num_clients=len(subs))
-    ranks = [s.get("rank", LORA_CONFIG["FULL_RANK"]) for s in subs]
-    log.info(f"🎯 aggregated {len(subs)} deltas for {shard_id} ranks={ranks}")
-    db["pendingSubmissions"][shard_id] = []
 
 # ============ BACKGROUND THREADS ============
 def cleanup_loop():
@@ -409,7 +375,7 @@ def cleanup_loop():
                 del blacklisted_subnets[sn]
 
 def aggregation_watchdog():
-    """Force-aggregate shards that timed out with partial submissions (avoids stuck shards)."""
+    """Force-cleans shards that timed out (keeps stats/watchdog logic intact)"""
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
         now_ms = int(time.time()*1000)
@@ -420,12 +386,10 @@ def aggregation_watchdog():
                     continue
                 meta = db["shardMeta"].get(shard_id, {})
                 age_s = (now_ms - meta.get("createdAt", now_ms)) / 1000
-                required = meta.get("required", FL_CONFIG["CONSENSUS_REQUIRED"])
-                if len(subs) >= required or (age_s > FL_CONFIG["SHARD_TIMEOUT_S"] and len(subs) >= 1):
-                    try:
-                        _do_aggregate(shard_id)
-                    except Exception as e:
-                        log.error(f"❌ watchdog aggregation {shard_id}: {e}")
+                # In sequential mode, we just clean up old shards to prevent memory leaks
+                if age_s > FL_CONFIG["SHARD_TIMEOUT_S"]:
+                    log.info(f"🧹 Watchdog cleaning stale shard {shard_id} (age={age_s}s)")
+                    db["pendingSubmissions"][shard_id] = []
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
 threading.Thread(target=aggregation_watchdog, daemon=True).start()
@@ -498,7 +462,7 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16"):
     metadata_json = json.dumps(metadata).encode('utf-8')
     metadata_length = struct.pack('<I', len(metadata_json))
 
-    weights_np = global_weights.numpy()
+    weights_np = global_weights.cpu().numpy()
     if format == "fp8":
         compressed = compress_weights_fp8(weights_np)
     elif format == "fp16":
@@ -566,27 +530,32 @@ async def submit_delta(request: Request):
     if delta_norm > abs_max:
         ban_subnet(client_ip, f"delta norm {delta_norm:.0f} > max {abs_max:.0f}")
         raise HTTPException(status_code=400, detail=f"Delta too large ({delta_norm:.2f})")
+    
     normalized = False
     if delta_norm > max_allowed:
         delta = delta * (max_allowed / delta_norm)
         normalized = True
 
+    # 🎯 SEQUENTIAL AGGREGATION: Apply immediately
+    apply_sequential_update(delta, client_ip, rank)
+
+    # Still track in shard for stats/watchdog compatibility
     with shard_lock:
         subs = db["pendingSubmissions"].setdefault(shard_id, [])
-        # prevent the same IP submitting twice to the same shard
         if any(s["nodeIp"] == client_ip for s in subs):
-            raise HTTPException(status_code=400, detail="Already submitted for this shard")
-
-        subs.append({
-            "nodeIp": client_ip,
-            "delta": delta,
-            "rank": rank,
-            "loss": loss,
-            "localSteps": local_steps,
-            "tokensProcessed": body.get("tokensProcessed", 0),
-            "normalized": normalized,
-            "submittedAt": int(time.time()*1000),
-        })
+            # Don't reject, just don't double-count stats if they retry
+            pass
+        else:
+            subs.append({
+                "nodeIp": client_ip,
+                "delta_norm": delta_norm,
+                "rank": rank,
+                "loss": loss,
+                "localSteps": local_steps,
+                "tokensProcessed": body.get("tokensProcessed", 0),
+                "normalized": normalized,
+                "submittedAt": int(time.time()*1000),
+            })
 
         global_stats["totalTokens"] += body.get("tokensProcessed", 0)
         global_stats["totalSteps"] += local_steps or 0
@@ -600,10 +569,7 @@ async def submit_delta(request: Request):
         lora_stats["last_update"] = datetime.now(timezone.utc).isoformat()
 
         required = db["shardMeta"].get(shard_id, {}).get("required", FL_CONFIG["CONSENSUS_REQUIRED"])
-        log.info(f"📥 {shard_id}: {len(subs)}/{required} deltas (ip={client_ip}, norm={delta_norm:.2f})")
-
-        if len(subs) >= required:
-            _do_aggregate(shard_id)
+        log.info(f"📥 {shard_id}: tracking submission {len(subs)}/{required} (ip={client_ip}, norm={delta_norm:.2f})")
 
     return {"status": "success", "globalStep": global_step, "normalized": normalized,
             "shardId": shard_id, "chunkIdx": task["chunkIdx"], "loss": loss}
@@ -681,7 +647,8 @@ async def startup():
     initialize_dataset()
     log.info("="*60)
     log.info(f"🚀 CrowdGPT Swarm Coordinator on port {PORT}")
-    log.info(f"🧩 consensus_required={FL_CONFIG['CONSENSUS_REQUIRED']} shard_timeout={FL_CONFIG['SHARD_TIMEOUT_S']}s")
+    log.info(f"⚡ Mode: SEQUENTIAL AGGREGATION (SERVER_LR={FL_CONFIG['SERVER_LR']})")
+    log.info(f"🧩 consensus_tracking={FL_CONFIG['CONSENSUS_REQUIRED']} shard_timeout={FL_CONFIG['SHARD_TIMEOUT_S']}s")
     log.info("="*60)
 
 if __name__ == "__main__":
