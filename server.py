@@ -11,6 +11,8 @@ import threading
 import requests
 import math
 import random
+import hashlib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -40,6 +42,7 @@ DATA_DIR = BASE_DIR / "data"
 LATEST_CHECKPOINT_FILE = CHECKPOINT_DIR / "model_latest.bin"
 GLOBAL_STATE_FILE = CHECKPOINT_DIR / "global_state.json"
 DATASET_CACHE_FILE = DATA_DIR / "dataset_info.json"
+USERS_DB_FILE = BASE_DIR / "users.json"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +70,6 @@ DATASET_CONFIG = {
     "tokenBytes": 2,
 }
 
-# 🎯 Training modes — the server enforces ONE mode per shard (same settings for the whole group)
 MODE_CONFIGS = {
     "quick":    {"localSteps": 500,    "batchSize": 4, "seqLen": 64},
     "balanced": {"localSteps": 5000,   "batchSize": 4, "seqLen": 64},
@@ -102,15 +104,15 @@ def compress_weights_bf16(w): return float32_to_bf16_array(w).tobytes()
 def compress_weights_fp16(w): return float32_to_fp16_array(w).tobytes()
 def compress_weights_fp8(w): return float32_to_fp8_array(w).tobytes()
 
-# ============ GLOBAL STATE (ANONYMOUS SWARM) ============
+# ============ GLOBAL STATE ============
 db = {
-    "tasks": {},              # taskId -> {shardId, chunkIdx, mode, requestedByIp}
-    "pendingSubmissions": {}, # shardId -> [ {nodeIp, delta, rank, ...} ]
-    "shardMeta": {},          # shardId -> {mode, createdAt, required, chunkIdx}
+    "tasks": {},
+    "pendingSubmissions": {},
+    "shardMeta": {},
 }
 
-active_ips: Dict[str, float] = {}      # ip -> last_seen (seconds)
-blacklisted_subnets: Dict[str, float] = {}  # subnet -> expiry timestamp
+active_ips: Dict[str, float] = {}
+blacklisted_subnets: Dict[str, float] = {}
 
 global_weights: Optional[torch.Tensor] = None
 global_step = 0
@@ -125,20 +127,96 @@ current_data_shard = {"chunkIdx": 0, "assignedIPs": [], "shardId": None, "create
 dataset_stats = {"totalShardsProcessed": 0, "epochsCompleted": 0, "samplesProcessed": 0, "lastUpdate": None}
 
 FL_CONFIG = {
-    "CONSENSUS_REQUIRED": 3,      # distinct IPs needed to fill a shard / aggregate
+    "CONSENSUS_REQUIRED": 3,
     "CHECKPOINT_INTERVAL": 100,
     "MAX_CHECKPOINTS": 10,
     "DELTA_NORM_BASE": 500.0,
     "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
     "MAX_WEIGHT_NORM": 1000.0,
     "WEIGHT_DECAY": 0.0001,
-    "SERVER_LR": 0.1,             # 🎯 NEW: Scales sequential updates to prevent divergence
-    "IP_TIMEOUT_S": 600,          # consider an IP "active" if seen in last 10 min
-    "SHARD_TIMEOUT_S": 1800,      # force-aggregate a shard after 30 min (avoid stuck shards)
+    "SERVER_LR": 0.1,
+    "IP_TIMEOUT_S": 600,
+    "SHARD_TIMEOUT_S": 1800,
     "CLEANUP_INTERVAL_S": 60,
 }
 
-shard_lock = threading.Lock()  # guards shard/submission mutations
+shard_lock = threading.Lock()
+
+# ============ AUTH & LEADERBOARD STATE ============
+users_db = {"users": {}, "tokens": {}}
+users_lock = threading.Lock()
+
+BAD_WORDS = [
+    "fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt",
+    "bastard", "damn", "piss", "crap", "twat",
+    "nigger", "nigga", "faggot", "fag", "retard", "tranny",
+    "whore", "slut", "rape", "pedo", "nazi", "hitler",
+    "porn", "xxx", "hentai",
+    "admin", "administrator", "root", "system", "moderator", "mod",
+    "staff", "official", "crowdgpt", "vxtzq", "nicolas",
+]
+
+def load_users_db():
+    global users_db
+    try:
+        if USERS_DB_FILE.exists():
+            with open(USERS_DB_FILE, 'r', encoding='utf-8') as f:
+                users_db = json.load(f)
+            log.info(f"👥 Loaded {len(users_db['users'])} users from disk")
+    except Exception as e:
+        log.error(f"❌ load_users_db: {e}")
+        users_db = {"users": {}, "tokens": {}}
+
+def save_users_db():
+    try:
+        with open(USERS_DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(users_db, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ save_users_db: {e}")
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'),
+                               salt.encode('utf-8'), 100000).hex()
+
+def generate_token() -> str:
+    return secrets.token_urlsafe(32)
+
+def contains_bad_word(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    normalized = lower.translate(str.maketrans("013@$", "oieas"))
+    for word in BAD_WORDS:
+        if word in lower or word in normalized:
+            return True
+    return any(c in text for c in ['\n', '\r', '\t'])
+
+def get_current_user(request: Request) -> Optional[dict]:
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:].strip()
+    with users_lock:
+        user_uuid = users_db["tokens"].get(token)
+        if not user_uuid:
+            return None
+        return users_db["users"].get(user_uuid)
+
+def compute_trust_score(stats: dict) -> float:
+    contributions = stats.get("contributions", 0)
+    return round(min(1.0, 0.5 + (contributions / 200.0)), 2)
+
+def compute_global_rank(user_uuid: str) -> int:
+    with users_lock:
+        sorted_users = sorted(
+            users_db["users"].values(),
+            key=lambda u: u["stats"].get("totalTokens", 0),
+            reverse=True
+        )
+        for i, u in enumerate(sorted_users):
+            if u["uuid"] == user_uuid:
+                return i + 1
+    return 0
 
 # ============ SUBNET HELPERS ============
 def get_subnet(ip: str) -> str:
@@ -147,7 +225,7 @@ def get_subnet(ip: str) -> str:
     parts = ip.split(".")
     if len(parts) == 4:
         return ".".join(parts[:3]) + ".0/24"
-    return ip  # IPv6 or weird -> use as-is
+    return ip
 
 def is_blacklisted(ip: str) -> bool:
     subnet = get_subnet(ip)
@@ -163,7 +241,6 @@ def ban_subnet(ip: str, reason: str, hours: int = 24):
     log.warning(f"🔨 BANNED {subnet} for {hours}h — {reason}")
 
 def get_client_ip(request: Request) -> str:
-    # honor X-Forwarded-For if behind a proxy, else direct client
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
@@ -208,7 +285,7 @@ def initialize_dataset():
     except Exception as e:
         log.error(f"❌ initialize_dataset: {e}")
 
-# ============ SHARD MANAGEMENT (the core "same chunk" logic) ============
+# ============ SHARD MANAGEMENT ============
 def _active_ip_count() -> int:
     now = time.time()
     return sum(1 for ts in active_ips.values() if now - ts < FL_CONFIG["IP_TIMEOUT_S"])
@@ -225,12 +302,6 @@ def _advance_chunk_pointer():
     dataset_stats["lastUpdate"] = datetime.now(timezone.utc).isoformat()
 
 def get_or_advance_shard(client_ip: str, requested_mode: str = "quick") -> dict:
-    """
-    Assigns client_ip to the current shard.
-    - Solo mode (< CONSENSUS_REQUIRED active IPs): advance chunk on every request.
-    - Consensus mode: a shard fills to CONSENSUS_REQUIRED distinct IPs, then advances.
-    The FIRST node to a brand-new shard sets its training mode (enforces same settings).
-    """
     global current_data_shard
     if not dataset_info["initialized"]:
         initialize_dataset()
@@ -259,7 +330,7 @@ def get_or_advance_shard(client_ip: str, requested_mode: str = "quick") -> dict:
                 "createdAt": int(time.time()*1000),
             }
             db["shardMeta"][shard_id] = {
-                "mode": mode,                       # first node locks the mode for this shard
+                "mode": mode,
                 "createdAt": int(time.time()*1000),
                 "required": 1 if solo else FL_CONFIG["CONSENSUS_REQUIRED"],
                 "chunkIdx": data_position["currentChunkIdx"],
@@ -315,7 +386,6 @@ def compute_max_allowed_norm(local_steps, rank=None):
     return base * rank_factor
 
 def apply_sequential_update(delta: np.ndarray, client_ip: str, rank: int):
-    """🎯 NEW: Applies delta immediately to global weights (sequential FedSGD style)"""
     global global_weights, global_step
     
     if np.isnan(delta).any() or np.isinf(delta).any():
@@ -325,13 +395,9 @@ def apply_sequential_update(delta: np.ndarray, client_ip: str, rank: int):
     delta_tensor = torch.from_numpy(delta)
     
     with shard_lock:
-        # 1. Weight decay
         global_weights.mul_(1.0 - FL_CONFIG["WEIGHT_DECAY"])
-        
-        # 2. Apply scaled sequential update
         global_weights.add_(delta_tensor, alpha=FL_CONFIG["SERVER_LR"])
         
-        # 3. Global norm clip to prevent explosion
         norm = torch.norm(global_weights).item()
         if norm > FL_CONFIG["MAX_WEIGHT_NORM"]:
             global_weights.mul_(FL_CONFIG["MAX_WEIGHT_NORM"] / norm)
@@ -375,7 +441,6 @@ def cleanup_loop():
                 del blacklisted_subnets[sn]
 
 def aggregation_watchdog():
-    """Force-cleans shards that timed out (keeps stats/watchdog logic intact)"""
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
         now_ms = int(time.time()*1000)
@@ -386,7 +451,6 @@ def aggregation_watchdog():
                     continue
                 meta = db["shardMeta"].get(shard_id, {})
                 age_s = (now_ms - meta.get("createdAt", now_ms)) / 1000
-                # In sequential mode, we just clean up old shards to prevent memory leaks
                 if age_s > FL_CONFIG["SHARD_TIMEOUT_S"]:
                     log.info(f"🧹 Watchdog cleaning stale shard {shard_id} (age={age_s}s)")
                     db["pendingSubmissions"][shard_id] = []
@@ -404,7 +468,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    expose_headers=["X-Task-Id", "X-Shard-Id", "X-Chunk-Idx", "X-Global-Step",
                                    "X-Model-Size", "X-Quantized"])
 
-# ============ FL ROUTES (PERMISSIONLESS) ============
+# ============ FL ROUTES ============
 @app.get("/fl/task")
 async def get_task(request: Request, mode: str = "quick", format: str = "bf16"):
     client_ip = get_client_ip(request)
@@ -415,7 +479,7 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16"):
     shard = get_or_advance_shard(client_ip, requested_mode=mode)
     shard_id = shard["shardId"]
     meta = db["shardMeta"].get(shard_id, {})
-    shard_mode = meta.get("mode", mode if mode in MODE_CONFIGS else "quick")  # enforce same settings
+    shard_mode = meta.get("mode", mode if mode in MODE_CONFIGS else "quick")
     cfg = MODE_CONFIGS[shard_mode]
 
     task_id = f"{shard_id}_{secrets.token_hex(4)}"
@@ -433,9 +497,9 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16"):
         "globalStep": global_step,
         "modelSize": MODEL_SIZE,
         "modelConfig": MODEL_CONFIG,
-        "trainingConfig": cfg,                      # ⬅ same settings for the whole shard
+        "trainingConfig": cfg,
         "weightFormat": format,
-        "datasetConfig": {                          # ⬅ client uses these to fetch its chunk
+        "datasetConfig": {
             "url": dataset_info["url"],
             "chunkIdx": shard["chunkIdx"],
             "chunkOffset": chunk_offset,
@@ -488,7 +552,6 @@ async def submit_delta(request: Request):
     if not raw:
         raise HTTPException(status_code=400, detail="Empty payload")
 
-    # decompress + parse
     try:
         buf = gzip.decompress(raw) if (len(raw) >= 2 and raw[0] == 0x1f and raw[1] == 0x8b) else raw
         payload_len = struct.unpack('<I', buf[:4])[0]
@@ -523,7 +586,6 @@ async def submit_delta(request: Request):
     local_steps = body.get("localSteps", 1)
     loss = body.get("loss")
 
-    # norm gate
     delta_norm = float(np.linalg.norm(delta))
     max_allowed = compute_max_allowed_norm(local_steps, rank)
     abs_max = max(FL_CONFIG["DELTA_NORM_ABSOLUTE_MAX"], max_allowed * 3)
@@ -536,14 +598,11 @@ async def submit_delta(request: Request):
         delta = delta * (max_allowed / delta_norm)
         normalized = True
 
-    # 🎯 SEQUENTIAL AGGREGATION: Apply immediately
     apply_sequential_update(delta, client_ip, rank)
 
-    # Still track in shard for stats/watchdog compatibility
     with shard_lock:
         subs = db["pendingSubmissions"].setdefault(shard_id, [])
         if any(s["nodeIp"] == client_ip for s in subs):
-            # Don't reject, just don't double-count stats if they retry
             pass
         else:
             subs.append({
@@ -571,14 +630,173 @@ async def submit_delta(request: Request):
         required = db["shardMeta"].get(shard_id, {}).get("required", FL_CONFIG["CONSENSUS_REQUIRED"])
         log.info(f"📥 {shard_id}: tracking submission {len(subs)}/{required} (ip={client_ip}, norm={delta_norm:.2f})")
 
+    # Track per-user stats if authenticated
+    auth_user = get_current_user(request)
+    if auth_user:
+        with users_lock:
+            auth_user["stats"]["contributions"] = auth_user["stats"].get("contributions", 0) + 1
+            auth_user["stats"]["totalTokens"] = auth_user["stats"].get("totalTokens", 0) + body.get("tokensProcessed", 0)
+            auth_user["stats"]["totalSteps"] = auth_user["stats"].get("totalSteps", 0) + (local_steps or 0)
+            save_users_db()
+
     return {"status": "success", "globalStep": global_step, "normalized": normalized,
             "shardId": shard_id, "chunkIdx": task["chunkIdx"], "loss": loss}
 
-# ============ PUBLIC STATS ============
+# ============ AUTH ROUTES ============
+@app.post("/auth/register")
+async def register(request: Request):
+    data = await request.json()
+    username = data.get("username", "").strip()
+    email = data.get("email", "").strip()
+    password = data.get("password", "")
+
+    if not username or not (3 <= len(username) <= 20):
+        raise HTTPException(400, "Username must be 3-20 characters")
+    if not username.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(400, "Username can only contain letters, numbers, _ and -")
+    if contains_bad_word(username):
+        raise HTTPException(400, "Username contains prohibited words")
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(400, "Invalid email")
+    if not password or len(password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    with users_lock:
+        for u in users_db["users"].values():
+            if u["username_lower"] == username.lower():
+                raise HTTPException(400, "Username already taken")
+            if u.get("email", "").lower() == email.lower():
+                raise HTTPException(400, "Email already registered")
+
+        user_uuid = str(uuid.uuid4())
+        salt = secrets.token_hex(16)
+        password_hash = hash_password(password, salt)
+        token = generate_token()
+
+        users_db["users"][user_uuid] = {
+            "uuid": user_uuid,
+            "username": username,
+            "username_lower": username.lower(),
+            "email": email,
+            "password_hash": password_hash,
+            "salt": salt,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "stats": {"contributions": 0, "totalTokens": 0, "totalSteps": 0},
+        }
+        users_db["tokens"][token] = user_uuid
+        save_users_db()
+
+    log.info(f"✅ Registered user {username} ({user_uuid[:8]})")
+    return {"token": token, "uuid": user_uuid, "username": username}
+
+@app.post("/auth/login")
+async def login(request: Request):
+    data = await request.json()
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+
+    with users_lock:
+        user = next((u for u in users_db["users"].values()
+                     if u["username_lower"] == username.lower()), None)
+        if not user:
+            raise HTTPException(401, "Invalid credentials")
+        if hash_password(password, user["salt"]) != user["password_hash"]:
+            raise HTTPException(401, "Invalid credentials")
+
+        token = generate_token()
+        users_db["tokens"][token] = user["uuid"]
+        save_users_db()
+
+    log.info(f"✅ Login: {username}")
+    return {"token": token, "uuid": user["uuid"], "username": user["username"]}
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+    return {
+        "uuid": user["uuid"],
+        "username": user["username"],
+        "email": user.get("email"),
+        "stats": user["stats"],
+        "trustScore": compute_trust_score(user["stats"]),
+        "globalRank": compute_global_rank(user["uuid"]),
+    }
+
+@app.post("/auth/username")
+async def change_username(request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+
+    data = await request.json()
+    new_username = data.get("username", "").strip()
+
+    if not new_username or not (3 <= len(new_username) <= 20):
+        raise HTTPException(400, "Username must be 3-20 characters")
+    if not new_username.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(400, "Username can only contain letters, numbers, _ and -")
+    if contains_bad_word(new_username):
+        raise HTTPException(400, "Username contains prohibited words")
+
+    with users_lock:
+        for u in users_db["users"].values():
+            if u["uuid"] != user["uuid"] and u["username_lower"] == new_username.lower():
+                raise HTTPException(400, "Username already taken")
+        users_db["users"][user["uuid"]]["username"] = new_username
+        users_db["users"][user["uuid"]]["username_lower"] = new_username.lower()
+        save_users_db()
+
+    return {"status": "ok", "username": new_username}
+
+@app.post("/auth/password")
+async def change_password(request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+
+    data = await request.json()
+    current_pw = data.get("currentPassword", "")
+    new_pw = data.get("newPassword", "")
+
+    if hash_password(current_pw, user["salt"]) != user["password_hash"]:
+        raise HTTPException(400, "Current password is incorrect")
+    if not new_pw or len(new_pw) < 6:
+        raise HTTPException(400, "New password must be at least 6 characters")
+
+    with users_lock:
+        new_salt = secrets.token_hex(16)
+        users_db["users"][user["uuid"]]["salt"] = new_salt
+        users_db["users"][user["uuid"]]["password_hash"] = hash_password(new_pw, new_salt)
+        save_users_db()
+
+    return {"status": "ok"}
+
+@app.delete("/auth/account")
+async def delete_account(request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(401, "Unauthorized")
+
+    with users_lock:
+        user_uuid = user["uuid"]
+        users_db["tokens"] = {t: uid for t, uid in users_db["tokens"].items() if uid != user_uuid}
+        del users_db["users"][user_uuid]
+        save_users_db()
+
+    log.info(f"🗑️ Account deleted: {user['username']}")
+    return {"status": "deleted"}
+
+# ============ PUBLIC STATS & LEADERBOARD ============
 @app.get("/api/stats")
 async def get_stats(request: Request):
     recent = global_stats["lossHistory"][-10:]
     avg_loss = sum(recent)/len(recent) if recent else 0.0
+    
+    with users_lock:
+        total_users = len(users_db["users"])
+    
     return {
         "activeNow": _active_ip_count(),
         "totalTokens": global_stats["totalTokens"],
@@ -589,6 +807,8 @@ async def get_stats(request: Request):
         "avgLoss": avg_loss,
         "weightNorm": float(torch.norm(global_weights).item()) if global_weights is not None else 0.0,
         "loraStats": lora_stats,
+        "totalUsers": total_users,
+        "activeContributors": total_users,
         "datasetStats": {
             "totalChunks": dataset_info["totalChunks"],
             "currentChunk": data_position["currentChunkIdx"],
@@ -604,6 +824,22 @@ async def get_stats(request: Request):
         },
     }
 
+@app.get("/api/leaderboard")
+async def get_leaderboard():
+    with users_lock:
+        users_list = []
+        for u in users_db["users"].values():
+            users_list.append({
+                "uuid": u["uuid"],
+                "username": u["username"],
+                "contributions": u["stats"].get("contributions", 0),
+                "totalTokens": u["stats"].get("totalTokens", 0),
+                "totalSteps": u["stats"].get("totalSteps", 0),
+                "trustScore": compute_trust_score(u["stats"]),
+            })
+    users_list.sort(key=lambda x: x["totalTokens"], reverse=True)
+    return users_list
+
 @app.get("/api/checkpoint")
 async def get_checkpoint(request: Request, format: str = "bf16"):
     if not LATEST_CHECKPOINT_FILE.exists():
@@ -617,11 +853,6 @@ async def get_checkpoint(request: Request, format: str = "bf16"):
         c = compress_weights_bf16(w)
     return Response(content=c, media_type="application/octet-stream",
                     headers={"X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE)})
-
-# Fallbacks so old web UI doesn't hard-crash
-@app.get("/api/leaderboard")
-async def get_leaderboard():
-    return []
 
 @app.get("/api/model_info")
 async def get_model_info():
@@ -641,6 +872,7 @@ async def reset_weights():
 @app.on_event("startup")
 async def startup():
     load_dataset_state()
+    load_users_db()
     initialize_model()
     if not load_latest_checkpoint():
         save_latest_checkpoint()
@@ -649,6 +881,7 @@ async def startup():
     log.info(f"🚀 CrowdGPT Swarm Coordinator on port {PORT}")
     log.info(f"⚡ Mode: SEQUENTIAL AGGREGATION (SERVER_LR={FL_CONFIG['SERVER_LR']})")
     log.info(f"🧩 consensus_tracking={FL_CONFIG['CONSENSUS_REQUIRED']} shard_timeout={FL_CONFIG['SHARD_TIMEOUT_S']}s")
+    log.info(f"👥 Users loaded: {len(users_db['users'])}")
     log.info("="*60)
 
 if __name__ == "__main__":
