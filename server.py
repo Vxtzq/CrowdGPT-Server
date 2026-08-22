@@ -29,6 +29,15 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+# HuggingFace integration
+try:
+    from huggingface_hub import HfApi, login
+    from safetensors.torch import save_file
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    log.warning("⚠️ huggingface_hub not installed - HF uploads disabled")
+
 # ============ LOGGING ============
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
@@ -46,18 +55,39 @@ USERS_DB_FILE = BASE_DIR / "users.json"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============ MODEL ============
+# HuggingFace configuration
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID = "Vxtzq/Crowd-v1"
+HF_UPLOAD_INTERVAL_HOURS = int(os.environ.get("HF_UPLOAD_INTERVAL_HOURS", 5))
+HF_ENABLED = HF_AVAILABLE and HF_TOKEN is not None
+
+# ============ MODEL (Crowd-v1: 500M parameters) ============
 MODEL_CONFIG = {
-    "vocabSize": 50257, "dim": 768, "nLayers": 8, "nHeads": 12,
-    "nKvHeads": 4, "headDim": 64, "maxSeqLen": 64, "architecture": "SotaGPT",
-    "features": {"groupedQueryAttention": True, "rotaryPositionEmbedding": True,
-                 "swiGLU": True, "weightTying": True, "chunkedAttention": True}
+    "vocabSize": 50257,
+    "dim": 1536,
+    "nLayers": 24,
+    "nHeads": 16,
+    "nKvHeads": 4,
+    "headDim": 96,
+    "maxSeqLen": 64,
+    "mlpHidden": 2560,
+    "weightTying": True,
+    "architecture": "SotaGPT",
+    "features": {
+        "groupedQueryAttention": True,
+        "rotaryPositionEmbedding": True,
+        "swiGLU": True,
+        "weightTying": True,
+        "chunkedAttention": True
+    }
 }
 
 LORA_CONFIG = {
     "FULL_RANK": MODEL_CONFIG["dim"],
-    "RANK_TIERS": {"minimal": 32, "low": 64, "medium": 128, "high": 256,
-                   "ultra": 512, "extreme": 1024, "max": 2048, "full": MODEL_CONFIG["dim"]},
+    "RANK_TIERS": {
+        "minimal": 32, "low": 64, "medium": 128, "high": 256,
+        "ultra": 512, "extreme": 1024, "max": 2048, "full": MODEL_CONFIG["dim"]
+    },
     "DEFAULT_RANK": MODEL_CONFIG["dim"],
     "WEIGHT_BY_RANK": True,
     "LOG_EFFECTIVE_RANK": True
@@ -78,31 +108,66 @@ MODE_CONFIGS = {
 }
 
 def calculate_model_size(cfg: dict) -> int:
+    """Calculate total parameter count for the model architecture"""
     size = cfg["vocabSize"] * cfg["dim"]
+    
     for _ in range(cfg["nLayers"]):
         d = cfg["dim"]
-        size += d*2 + d*(cfg["nHeads"]*cfg["headDim"]) + d*(cfg["nKvHeads"]*cfg["headDim"])*2
-        size += d*d + d*2
-        size += d*4*d + d*4*d + 4*d*d
-    size += cfg["dim"]*2
+        # LayerNorm (2x dim)
+        size += d * 2
+        # Attention: Q, K, V projections
+        size += d * (cfg["nHeads"] * cfg["headDim"])  # Q
+        size += d * (cfg["nKvHeads"] * cfg["headDim"])  # K
+        size += d * (cfg["nKvHeads"] * cfg["headDim"])  # V
+        size += d * d  # Output projection
+        # LayerNorm (2x dim)
+        size += d * 2
+        # MLP: SwiGLU
+        mlp_hidden = cfg.get("mlpHidden", 4 * d)
+        size += d * mlp_hidden  # w1
+        size += d * mlp_hidden  # w2
+        size += mlp_hidden * d  # w3
+    
+    # Final LayerNorm
+    size += cfg["dim"] * 2
+    
+    # LM head (tied with embedding if weightTying=True)
+    if not cfg.get("weightTying", False):
+        size += cfg["dim"] * cfg["vocabSize"]
+    
     return size
 
 MODEL_SIZE = calculate_model_size(MODEL_CONFIG)
 log.info(f"🧮 SotaGPT size: {MODEL_SIZE:,} params (~{MODEL_SIZE*4/1024/1024:.2f} MB)")
 
 # ============ QUANTIZATION ============
-def float32_to_bf16_array(a): return torch.from_numpy(a.astype(np.float32)).to(torch.bfloat16).view(torch.uint16).numpy()
-def bf16_array_to_float32(a): return torch.from_numpy(a.copy()).view(torch.uint16).view(torch.bfloat16).to(torch.float32).numpy()
+def float32_to_bf16_array(a):
+    return torch.from_numpy(a.astype(np.float32)).to(torch.bfloat16).view(torch.uint16).numpy()
+
+def bf16_array_to_float32(a):
+    return torch.from_numpy(a.copy()).view(torch.uint16).view(torch.bfloat16).to(torch.float32).numpy()
+
 def float32_to_fp16_array(a):
     a = np.ascontiguousarray(a, dtype=np.float32)
     return np.clip(a, -65504.0, 65504.0).astype(np.float16).view(np.uint16)
-def fp16_array_to_float32(a): return a.view(np.float16).astype(np.float32)
-def float32_to_fp8_array(a): return torch.from_numpy(a.astype(np.float32)).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
-def fp8_array_to_float32(a): return torch.from_numpy(a.copy()).view(torch.uint8).view(torch.float8_e4m3fn).to(torch.float32).numpy()
 
-def compress_weights_bf16(w): return float32_to_bf16_array(w).tobytes()
-def compress_weights_fp16(w): return float32_to_fp16_array(w).tobytes()
-def compress_weights_fp8(w): return float32_to_fp8_array(w).tobytes()
+def fp16_array_to_float32(a):
+    return a.view(np.float16).astype(np.float32)
+
+def float32_to_fp8_array(a):
+    return torch.from_numpy(a.astype(np.float32)).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+
+def fp8_array_to_float32(a):
+    return torch.from_numpy(a.copy()).view(torch.uint8).view(torch.float8_e4m3fn).to(torch.float32).numpy()
+
+def compress_weights_bf16(w):
+    return float32_to_bf16_array(w).tobytes()
+
+def compress_weights_fp16(w):
+    return float32_to_fp16_array(w).tobytes()
+
+def compress_weights_fp8(w):
+    return float32_to_fp8_array(w).tobytes()
 
 # ============ GLOBAL STATE ============
 db = {
@@ -119,9 +184,14 @@ global_step = 0
 global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
 lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
 
-dataset_info = {"url": DATASET_CONFIG["url"], "totalSize": 0, "totalChunks": 0,
-                "chunkSizeBytes": DATASET_CONFIG["chunkSizeMB"]*1024*1024,
-                "initialized": False, "lastChecked": None}
+dataset_info = {
+    "url": DATASET_CONFIG["url"],
+    "totalSize": 0,
+    "totalChunks": 0,
+    "chunkSizeBytes": DATASET_CONFIG["chunkSizeMB"]*1024*1024,
+    "initialized": False,
+    "lastChecked": None
+}
 data_position = {"currentChunkIdx": 0, "epoch": 0, "totalSamplesSeen": 0}
 current_data_shard = {"chunkIdx": 0, "assignedIPs": [], "shardId": None, "createdAt": None}
 dataset_stats = {"totalShardsProcessed": 0, "epochsCompleted": 0, "samplesProcessed": 0, "lastUpdate": None}
@@ -250,8 +320,11 @@ def get_client_ip(request: Request) -> str:
 def save_dataset_state():
     try:
         with open(DATASET_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump({"datasetInfo": dataset_info, "dataPosition": data_position,
-                       "datasetStats": dataset_stats}, f, indent=2)
+            json.dump({
+                "datasetInfo": dataset_info,
+                "dataPosition": data_position,
+                "datasetStats": dataset_stats
+            }, f, indent=2)
     except Exception as e:
         log.error(f"❌ save_dataset_state: {e}")
 
@@ -373,10 +446,106 @@ def save_latest_checkpoint():
     try:
         global_weights.cpu().numpy().tofile(LATEST_CHECKPOINT_FILE)
         with open(GLOBAL_STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump({"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(),
-                       "modelSize": MODEL_SIZE, "modelConfig": MODEL_CONFIG, "loraStats": lora_stats}, f, indent=2)
+            json.dump({
+                "globalStep": global_step,
+                "savedAt": datetime.now(timezone.utc).isoformat(),
+                "modelSize": MODEL_SIZE,
+                "modelConfig": MODEL_CONFIG,
+                "loraStats": lora_stats
+            }, f, indent=2)
     except Exception as e:
         log.error(f"❌ save checkpoint: {e}")
+
+# ============ HUGGINGFACE INTEGRATION ============
+last_hf_upload_time = 0
+
+def upload_to_huggingface():
+    """Upload current model weights to HuggingFace as safetensors"""
+    global last_hf_upload_time
+    
+    if not HF_ENABLED:
+        return
+    
+    now = time.time()
+    if now - last_hf_upload_time < HF_UPLOAD_INTERVAL_HOURS * 3600:
+        return
+    
+    try:
+        log.info(f"🤗 Uploading to HuggingFace: {HF_REPO_ID}...")
+        
+        # Login to HF
+        api = HfApi()
+        login(token=HF_TOKEN)
+        
+        # Create temporary directory for safetensors
+        temp_dir = CHECKPOINT_DIR / "hf_upload_temp"
+        temp_dir.mkdir(exist_ok=True)
+        
+        # Convert flat weights to structured format
+        # For simplicity, we'll save as a single tensor
+        # In production, you'd want to reconstruct the full model state dict
+        
+        weights_fp32 = global_weights.cpu()
+        weights_bf16 = weights_fp32.to(torch.bfloat16)
+        
+        # Save as safetensors
+        fp32_path = temp_dir / "model_fp32.safetensors"
+        bf16_path = temp_dir / "model_bf16.safetensors"
+        
+        save_file({"weights": weights_fp32}, str(fp32_path))
+        save_file({"weights": weights_bf16}, str(bf16_path))
+        
+        # Create config.json
+        config_path = temp_dir / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump({
+                "architecture": MODEL_CONFIG["architecture"],
+                "vocabSize": MODEL_CONFIG["vocabSize"],
+                "dim": MODEL_CONFIG["dim"],
+                "nLayers": MODEL_CONFIG["nLayers"],
+                "nHeads": MODEL_CONFIG["nHeads"],
+                "nKvHeads": MODEL_CONFIG["nKvHeads"],
+                "headDim": MODEL_CONFIG["headDim"],
+                "maxSeqLen": MODEL_CONFIG["maxSeqLen"],
+                "mlpHidden": MODEL_CONFIG["mlpHidden"],
+                "weightTying": MODEL_CONFIG["weightTying"],
+                "globalStep": global_step,
+                "modelSize": MODEL_SIZE,
+                "uploadedAt": datetime.now(timezone.utc).isoformat(),
+            }, f, indent=2)
+        
+        # Upload to HF
+        api.upload_folder(
+            folder_path=str(temp_dir),
+            repo_id=HF_REPO_ID,
+            repo_type="model",
+            commit_message=f"Update weights (step {global_step})"
+        )
+        
+        # Cleanup
+        import shutil
+        shutil.rmtree(temp_dir)
+        
+        last_hf_upload_time = now
+        log.info(f"✅ Uploaded to {HF_REPO_ID} at step {global_step}")
+        
+    except Exception as e:
+        log.error(f"❌ HF upload failed: {e}")
+
+def hf_upload_loop():
+    """Background thread to periodically upload to HuggingFace"""
+    if not HF_ENABLED:
+        log.warning("⚠️ HF uploads disabled (missing huggingface_hub or HF_TOKEN)")
+        return
+    
+    log.info(f"🤗 HF uploads enabled: {HF_REPO_ID} every {HF_UPLOAD_INTERVAL_HOURS}h")
+    
+    # Initial upload after 5 minutes
+    time.sleep(300)
+    
+    while True:
+        upload_to_huggingface()
+        time.sleep(HF_UPLOAD_INTERVAL_HOURS * 3600)
 
 # ============ VECTOR MATH / SEQUENTIAL AGGREGATION ============
 def compute_max_allowed_norm(local_steps, rank=None):
@@ -416,15 +585,20 @@ def handle_checkpoints():
         fp = CHECKPOINT_DIR / f"model_step_{global_step}.bin"
         global_weights.cpu().numpy().tofile(fp)
         with open(CHECKPOINT_DIR / f"model_step_{global_step}.json", 'w', encoding='utf-8') as f:
-            json.dump({"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(),
-                       "modelSize": MODEL_SIZE}, f, indent=2)
+            json.dump({
+                "globalStep": global_step,
+                "savedAt": datetime.now(timezone.utc).isoformat(),
+                "modelSize": MODEL_SIZE
+            }, f, indent=2)
         files = sorted([f for f in CHECKPOINT_DIR.iterdir()
                         if f.name.startswith("model_step_") and f.suffix == ".bin"],
                        key=lambda f: int(f.stem.split("_")[2]))
         while len(files) > FL_CONFIG["MAX_CHECKPOINTS"]:
-            old = files.pop(0); old.unlink()
+            old = files.pop(0)
+            old.unlink()
             meta = CHECKPOINT_DIR / f"{old.stem}.json"
-            if meta.exists(): meta.unlink()
+            if meta.exists():
+                meta.unlink()
     except Exception as e:
         log.error(f"❌ checkpoint: {e}")
 
@@ -457,16 +631,22 @@ def aggregation_watchdog():
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
 threading.Thread(target=aggregation_watchdog, daemon=True).start()
+threading.Thread(target=hf_upload_loop, daemon=True).start()
 
 # ============ FASTAPI ============
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="CrowdGPT Swarm Coordinator")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"],
-                   expose_headers=["X-Task-Id", "X-Shard-Id", "X-Chunk-Idx", "X-Global-Step",
-                                   "X-Model-Size", "X-Quantized"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Task-Id", "X-Shard-Id", "X-Chunk-Idx", "X-Global-Step",
+                    "X-Model-Size", "X-Quantized"]
+)
 
 # ============ FL ROUTES ============
 @app.get("/fl/task")
@@ -521,6 +701,10 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16"):
             "rankTiers": LORA_CONFIG["RANK_TIERS"],
             "weightByRank": LORA_CONFIG["WEIGHT_BY_RANK"],
         },
+        "huggingface": {
+            "repoId": HF_REPO_ID,
+            "enabled": HF_ENABLED,
+        } if HF_ENABLED else {},
     }
 
     metadata_json = json.dumps(metadata).encode('utf-8')
@@ -535,11 +719,18 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16"):
         compressed = compress_weights_bf16(weights_np)
 
     log.info(f"📤 task {task_id} shard={shard_id} chunk={shard['chunkIdx']} mode={shard_mode} ip={client_ip}")
-    return Response(content=metadata_length + metadata_json + compressed,
-                    media_type="application/octet-stream",
-                    headers={"X-Task-Id": task_id, "X-Shard-Id": shard_id,
-                             "X-Chunk-Idx": str(shard["chunkIdx"]), "X-Global-Step": str(global_step),
-                             "X-Model-Size": str(MODEL_SIZE), "X-Quantized": format})
+    return Response(
+        content=metadata_length + metadata_json + compressed,
+        media_type="application/octet-stream",
+        headers={
+            "X-Task-Id": task_id,
+            "X-Shard-Id": shard_id,
+            "X-Chunk-Idx": str(shard["chunkIdx"]),
+            "X-Global-Step": str(global_step),
+            "X-Model-Size": str(MODEL_SIZE),
+            "X-Quantized": format
+        }
+    )
 
 @app.post("/fl/submit")
 async def submit_delta(request: Request):
@@ -639,8 +830,14 @@ async def submit_delta(request: Request):
             auth_user["stats"]["totalSteps"] = auth_user["stats"].get("totalSteps", 0) + (local_steps or 0)
             save_users_db()
 
-    return {"status": "success", "globalStep": global_step, "normalized": normalized,
-            "shardId": shard_id, "chunkIdx": task["chunkIdx"], "loss": loss}
+    return {
+        "status": "success",
+        "globalStep": global_step,
+        "normalized": normalized,
+        "shardId": shard_id,
+        "chunkIdx": task["chunkIdx"],
+        "loss": loss
+    }
 
 # ============ AUTH ROUTES ============
 @app.post("/auth/register")
@@ -822,6 +1019,11 @@ async def get_stats(request: Request):
             "assignedIPs": len(current_data_shard["assignedIPs"]),
             "required": db["shardMeta"].get(current_data_shard["shardId"], {}).get("required", FL_CONFIG["CONSENSUS_REQUIRED"]),
         },
+        "huggingface": {
+            "repoId": HF_REPO_ID,
+            "enabled": HF_ENABLED,
+            "uploadIntervalHours": HF_UPLOAD_INTERVAL_HOURS,
+        } if HF_ENABLED else {},
     }
 
 @app.get("/api/leaderboard")
@@ -851,13 +1053,24 @@ async def get_checkpoint(request: Request, format: str = "bf16"):
         c = compress_weights_fp16(w)
     else:
         c = compress_weights_bf16(w)
-    return Response(content=c, media_type="application/octet-stream",
-                    headers={"X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE)})
+    return Response(
+        content=c,
+        media_type="application/octet-stream",
+        headers={"X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE)}
+    )
 
 @app.get("/api/model_info")
 async def get_model_info():
-    return {"architecture": MODEL_CONFIG["architecture"], "parameters": MODEL_SIZE,
-            "config": MODEL_CONFIG, "globalStep": global_step}
+    return {
+        "architecture": MODEL_CONFIG["architecture"],
+        "parameters": MODEL_SIZE,
+        "config": MODEL_CONFIG,
+        "globalStep": global_step,
+        "huggingface": {
+            "repoId": HF_REPO_ID,
+            "enabled": HF_ENABLED,
+        } if HF_ENABLED else {},
+    }
 
 @app.post("/api/reset_weights")
 async def reset_weights():
@@ -882,6 +1095,10 @@ async def startup():
     log.info(f"⚡ Mode: SEQUENTIAL AGGREGATION (SERVER_LR={FL_CONFIG['SERVER_LR']})")
     log.info(f"🧩 consensus_tracking={FL_CONFIG['CONSENSUS_REQUIRED']} shard_timeout={FL_CONFIG['SHARD_TIMEOUT_S']}s")
     log.info(f"👥 Users loaded: {len(users_db['users'])}")
+    if HF_ENABLED:
+        log.info(f"🤗 HF uploads: {HF_REPO_ID} every {HF_UPLOAD_INTERVAL_HOURS}h")
+    else:
+        log.warning("⚠️ HF uploads disabled (set HF_TOKEN env var)")
     log.info("="*60)
 
 if __name__ == "__main__":
