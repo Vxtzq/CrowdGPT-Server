@@ -77,16 +77,18 @@ LORA_CONFIG = {
     "DEFAULT_RANK": MODEL_CONFIG["dim"], "WEIGHT_BY_RANK": True, "LOG_EFFECTIVE_RANK": True
 }
 
-DATASET_CONFIG = {
-    "url": "https://huggingface.co/datasets/Vxtzq/TinyStoriesBIN/resolve/main/tinystories_tokens.bin",
-    "chunkSizeMB": 1, "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1, "tokenBytes": 2,
+MODE_CONFIGS = {
+    "quick":    {"localSteps": 50000,   "batchSize": 8, "seqLen": 64},   # ~25M tokens
+    "balanced": {"localSteps": 110000,  "batchSize": 8, "seqLen": 64},   # ~55M tokens
+    "deep":     {"localSteps": 1000000, "batchSize": 8, "seqLen": 64},   # ~500M tokens
+    "ultra":    {"localSteps": 2000000, "batchSize": 8, "seqLen": 64},   # ~1B tokens
 }
 
-MODE_CONFIGS = {
-    "quick":    {"localSteps": 500,    "batchSize": 4, "seqLen": 64},
-    "balanced": {"localSteps": 5000,   "batchSize": 4, "seqLen": 64},
-    "deep":     {"localSteps": 50000,  "batchSize": 4, "seqLen": 64},
-    "ultra":    {"localSteps": 100000, "batchSize": 4, "seqLen": 64},
+DATASET_CONFIG = {
+    "url": "https://huggingface.co/datasets/Vxtzq/TinyStoriesBIN/resolve/main/tinystories_tokens.bin",
+    "chunkSizeMB": 10,  # Bumped from 1 to 10 to prevent massive overfitting on long sessions
+    "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1,
+    "tokenBytes": 2,
 }
 
 def calculate_model_size(cfg: dict) -> int:
