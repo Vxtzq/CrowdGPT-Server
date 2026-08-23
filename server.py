@@ -41,7 +41,7 @@ except ImportError:
     log.warning("⚠️ huggingface_hub not installed - HF uploads disabled")
 
 # ============ CONFIGURATION (hardcoded) ============
-PORT = 3000
+PORT = 5006
 BASE_DIR = Path(__file__).parent
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 DATA_DIR = BASE_DIR / "data"
@@ -51,7 +51,17 @@ DATASET_CACHE_FILE = DATA_DIR / "dataset_info.json"
 USERS_DB_FILE = BASE_DIR / "users.json"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
+import socket
+hostname = socket.gethostname()
+try:
+    local_ip = socket.gethostbyname(hostname)
+except:
+    local_ip = "unknown"
+print(f"🌐 Container hostname: {hostname}")
+print(f"🌐 Container local IP: {local_ip}")
+print(f"🌐 Listening on: 0.0.0.0:{PORT}")
+print(f"🌐 Pterodactyl mapped address: likely YOUR_PANEL_IP:5006")
+print("="*60)
 # HuggingFace
 HF_TOKEN = "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"
 HF_REPO_ID = "Vxtzq/Crowd-v1"
@@ -77,18 +87,16 @@ LORA_CONFIG = {
     "DEFAULT_RANK": MODEL_CONFIG["dim"], "WEIGHT_BY_RANK": True, "LOG_EFFECTIVE_RANK": True
 }
 
-MODE_CONFIGS = {
-    "quick":    {"localSteps": 50000,   "batchSize": 8, "seqLen": 64},   # ~25M tokens
-    "balanced": {"localSteps": 110000,  "batchSize": 8, "seqLen": 64},   # ~55M tokens
-    "deep":     {"localSteps": 1000000, "batchSize": 8, "seqLen": 64},   # ~500M tokens
-    "ultra":    {"localSteps": 2000000, "batchSize": 8, "seqLen": 64},   # ~1B tokens
-}
-
 DATASET_CONFIG = {
     "url": "https://huggingface.co/datasets/Vxtzq/TinyStoriesBIN/resolve/main/tinystories_tokens.bin",
-    "chunkSizeMB": 10,  # Bumped from 1 to 10 to prevent massive overfitting on long sessions
-    "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1,
-    "tokenBytes": 2,
+    "chunkSizeMB": 1, "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1, "tokenBytes": 2,
+}
+
+MODE_CONFIGS = {
+    "quick":    {"localSteps": 500,    "batchSize": 4, "seqLen": 64},
+    "balanced": {"localSteps": 5000,   "batchSize": 4, "seqLen": 64},
+    "deep":     {"localSteps": 50000,  "batchSize": 4, "seqLen": 64},
+    "ultra":    {"localSteps": 100000, "batchSize": 4, "seqLen": 64},
 }
 
 def calculate_model_size(cfg: dict) -> int:
@@ -258,7 +266,13 @@ def load_dataset_state():
         log.error(f"❌ load_dataset_state: {e}")
 
 def initialize_dataset():
-    if dataset_info["initialized"]: return
+    # Resync chunk geometry from config on every boot (in case chunkSizeMB changed)
+    dataset_info["chunkSizeBytes"] = DATASET_CONFIG["chunkSizeMB"] * 1024 * 1024
+    if dataset_info["totalSize"] > 0:
+        dataset_info["totalChunks"] = (dataset_info["totalSize"] + dataset_info["chunkSizeBytes"] - 1) // dataset_info["chunkSizeBytes"]
+        data_position["currentChunkIdx"] = data_position["currentChunkIdx"] % dataset_info["totalChunks"]
+    if dataset_info["initialized"]:
+        return
     try:
         res = requests.head(dataset_info["url"], allow_redirects=True, timeout=30)
         res.raise_for_status()
