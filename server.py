@@ -40,7 +40,7 @@ except ImportError:
     HF_AVAILABLE = False
     log.warning("⚠️ huggingface_hub not installed - HF uploads disabled")
 
-# ============ CONFIGURATION (hardcoded) ============
+# ============ CONFIGURATION ============
 PORT = 5006
 BASE_DIR = Path(__file__).parent
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
@@ -51,6 +51,7 @@ DATASET_CACHE_FILE = DATA_DIR / "dataset_info.json"
 USERS_DB_FILE = BASE_DIR / "users.json"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 import socket
 hostname = socket.gethostname()
 try:
@@ -60,19 +61,19 @@ except:
 print(f"🌐 Container hostname: {hostname}")
 print(f"🌐 Container local IP: {local_ip}")
 print(f"🌐 Listening on: 0.0.0.0:{PORT}")
-print(f"🌐 Pterodactyl mapped address: likely YOUR_PANEL_IP:5006")
 print("="*60)
 
 # HuggingFace
 HF_TOKEN = "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"
 HF_REPO_ID = "Vxtzq/Crowd-v1"
+DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 5
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
 
 # Admin secret for watchdog endpoints
 ADMIN_SECRET = "crowdgpt-admin-9f3k2m8x"
 
-# ============ MODEL (Crowd-v1: 500M parameters) ============
+# ============ MODEL ============
 MODEL_CONFIG = {
     "vocabSize": 151669, "dim": 1536, "nLayers": 24, "nHeads": 16, "nKvHeads": 4,
     "headDim": 96, "maxSeqLen": 2048, "mlpHidden": 2560, "weightTying": True,
@@ -88,12 +89,14 @@ LORA_CONFIG = {
     "DEFAULT_RANK": MODEL_CONFIG["dim"], "WEIGHT_BY_RANK": True, "LOG_EFFECTIVE_RANK": True
 }
 
+# IMPORTANT: Update totalChunks to match the actual number of chunk_*.bin files!
 DATASET_CONFIG = {
-    "url": "https://huggingface.co/datasets/Vxtzq/CrowdGPT/resolve/main/fineweb_qwen3.bin",
-    "chunkSizeMB": 10,
+    "repoId": DATASET_REPO_ID,
+    "totalChunks": 100,  # <-- UPDATE THIS VALUE
     "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1, 
     "tokenBytes": 4,
 }
+
 MODE_CONFIGS = {
     "quick":    {"localSteps": 50000,   "batchSize": 8, "seqLen": 64},
     "balanced": {"localSteps": 110000,  "batchSize": 8, "seqLen": 64},
@@ -143,9 +146,12 @@ global_step = 0
 global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
 lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
 
-dataset_info = {"url": DATASET_CONFIG["url"], "totalSize": 0, "totalChunks": 0,
-                "chunkSizeBytes": DATASET_CONFIG["chunkSizeMB"]*1024*1024,
-                "initialized": False, "lastChecked": None}
+dataset_info = {
+    "repoId": DATASET_CONFIG["repoId"],
+    "totalChunks": 0,
+    "initialized": False, 
+    "lastChecked": None
+}
 data_position = {"currentChunkIdx": 0, "epoch": 0, "totalSamplesSeen": 0}
 current_data_shard = {"chunkIdx": 0, "assignedIPs": [], "shardId": None, "createdAt": None}
 dataset_stats = {"totalShardsProcessed": 0, "epochsCompleted": 0, "samplesProcessed": 0, "lastUpdate": None}
@@ -268,25 +274,27 @@ def load_dataset_state():
         log.error(f"❌ load_dataset_state: {e}")
 
 def initialize_dataset():
-    dataset_info["chunkSizeBytes"] = DATASET_CONFIG["chunkSizeMB"] * 1024 * 1024
-    if dataset_info["totalSize"] > 0:
-        dataset_info["totalChunks"] = (dataset_info["totalSize"] + dataset_info["chunkSizeBytes"] - 1) // dataset_info["chunkSizeBytes"]
-        data_position["currentChunkIdx"] = data_position["currentChunkIdx"] % dataset_info["totalChunks"]
     if dataset_info["initialized"]:
         return
-    try:
-        res = requests.head(dataset_info["url"], allow_redirects=True, timeout=30)
-        res.raise_for_status()
-        total_size = int(res.headers.get('content-length', 0))
-        chunk_size = dataset_info["chunkSizeBytes"]
-        dataset_info["totalSize"] = total_size
-        dataset_info["totalChunks"] = (total_size + chunk_size - 1) // chunk_size
-        dataset_info["initialized"] = True
-        dataset_info["lastChecked"] = datetime.now(timezone.utc).isoformat()
-        log.info(f"✅ dataset: {total_size/1024/1024:.1f} MB, {dataset_info['totalChunks']} chunks")
-        save_dataset_state()
-    except Exception as e:
-        log.error(f"❌ initialize_dataset: {e}")
+    
+    # Default to configured value
+    dataset_info["totalChunks"] = DATASET_CONFIG.get("totalChunks", 100)
+    
+    # Try to auto-detect chunks if a local 'chunks' directory exists on the server
+    chunks_dir = BASE_DIR / "chunks"
+    if chunks_dir.exists():
+        local_chunks = sorted(list(chunks_dir.glob("chunk_*.bin")))
+        if local_chunks:
+            dataset_info["totalChunks"] = len(local_chunks)
+            log.info(f"✅ Auto-detected {dataset_info['totalChunks']} local chunks in server chunks/ directory")
+        else:
+            log.info(f"⚠️ Server chunks/ dir empty, using configured totalChunks: {dataset_info['totalChunks']}")
+    else:
+        log.info(f"✅ Dataset initialized with configured totalChunks: {dataset_info['totalChunks']} (clients will use local chunks/)")
+        
+    dataset_info["initialized"] = True
+    dataset_info["lastChecked"] = datetime.now(timezone.utc).isoformat()
+    save_dataset_state()
 
 # ============ SHARD MANAGEMENT ============
 def _active_ip_count() -> int:
@@ -369,8 +377,7 @@ def upload_to_huggingface():
     if now - last_hf_upload_time < HF_UPLOAD_INTERVAL_HOURS * 3600: return
     try:
         log.info(f"🤗 Uploading to HuggingFace: {HF_REPO_ID}...")
-        api = HfApi()
-        login(token=HF_TOKEN)
+        api = HfApi(token=HF_TOKEN)
         temp_dir = CHECKPOINT_DIR / "hf_upload_temp"
         temp_dir.mkdir(exist_ok=True)
         weights_fp32 = global_weights.cpu()
@@ -404,6 +411,65 @@ def hf_upload_loop():
     while True:
         upload_to_huggingface()
         time.sleep(HF_UPLOAD_INTERVAL_HOURS * 3600)
+
+# ============ NEW: HF STATUS SYNC ============
+def update_hf_status():
+    if not HF_ENABLED:
+        return
+    try:
+        api = HfApi(token=HF_TOKEN)
+        
+        # Calculate real loss change
+        loss_history = global_stats["lossHistory"]
+        if len(loss_history) >= 2:
+            first_loss = loss_history[0]
+            last_loss = loss_history[-1]
+            training_loss_change = round(((last_loss - first_loss) / first_loss) * 100, 1) if first_loss > 0 else 0.0
+        else:
+            training_loss_change = 0.0
+            
+        now = time.time()
+        active_gpus = sum(1 for ts in active_ips.values() if now - ts < FL_CONFIG["IP_TIMEOUT_S"])
+        
+        with users_lock:
+            total_participants = len(users_db["users"])
+            
+        status_data = {
+            "totalParticipants": total_participants,
+            "activeGpus": active_gpus,
+            "totalTokens": global_stats["totalTokens"],
+            "trainingLossChange": training_loss_change,
+            "globalStep": global_step,
+            "lastLoss": global_stats["lastLoss"],
+            "updatedAt": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Write locally first
+        status_file = BASE_DIR / "status.json"
+        with open(status_file, 'w', encoding='utf-8') as f:
+            json.dump(status_data, f, indent=2)
+            
+        # Upload to HF
+        api.upload_file(
+            path_or_fileobj=str(status_file),
+            path_in_repo="status.json",
+            repo_id=HF_REPO_ID,
+            repo_type="model",
+            commit_message="chore: auto-update status.json"
+        )
+        log.info(f"✅ Uploaded status.json to HF (step {global_step}, {active_gpus} GPUs)")
+    except Exception as e:
+        log.error(f"❌ HF status upload failed: {e}")
+
+def hf_status_loop():
+    if not HF_ENABLED:
+        log.warning("⚠️ HF status updates disabled")
+        return
+    log.info(f"🤗 HF status updates enabled: {HF_REPO_ID} every 5 minutes")
+    time.sleep(60) # Wait 60s on startup to let things settle
+    while True:
+        update_hf_status()
+        time.sleep(300) # 5 minutes
 
 # ============ VECTOR MATH ============
 def compute_max_allowed_norm(local_steps, rank=None):
@@ -473,6 +539,7 @@ def aggregation_watchdog():
 threading.Thread(target=cleanup_loop, daemon=True).start()
 threading.Thread(target=aggregation_watchdog, daemon=True).start()
 threading.Thread(target=hf_upload_loop, daemon=True).start()
+threading.Thread(target=hf_status_loop, daemon=True).start()
 
 # ============ FASTAPI ============
 limiter = Limiter(key_func=get_remote_address)
@@ -495,35 +562,40 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16", 
     cfg = MODE_CONFIGS[shard_mode]
     task_id = f"{shard_id}_{secrets.token_hex(4)}"
     db["tasks"][task_id] = {"shardId": shard_id, "chunkIdx": shard["chunkIdx"], "mode": shard_mode, "requestedByIp": client_ip, "createdAt": int(time.time()*1000)}
-    chunk_offset = shard["chunkIdx"] * dataset_info["chunkSizeBytes"]
-    metadata = {"taskId": task_id, "globalStep": global_step, "modelSize": MODEL_SIZE, "modelConfig": MODEL_CONFIG,
-                "trainingConfig": cfg, "weightFormat": format,
-                "datasetConfig": {"url": dataset_info["url"], "chunkIdx": shard["chunkIdx"], "chunkOffset": chunk_offset,
-                                  "chunkSize": dataset_info["chunkSizeBytes"], "totalChunks": dataset_info["totalChunks"],
-                                  "totalSize": dataset_info["totalSize"], "epoch": data_position["epoch"],
-                                  "tokensPerSample": DATASET_CONFIG["tokensPerSample"], "tokenBytes": DATASET_CONFIG["tokenBytes"]},
-                "shardConfig": {"shardId": shard_id, "slot": len(shard["assignedIPs"]),
-                                "total": meta.get("required", FL_CONFIG["CONSENSUS_REQUIRED"])},
-                "loraConfig": {"defaultRank": LORA_CONFIG["DEFAULT_RANK"], "fullRank": LORA_CONFIG["FULL_RANK"],
-                               "rankTiers": LORA_CONFIG["RANK_TIERS"], "weightByRank": LORA_CONFIG["WEIGHT_BY_RANK"]}}
-    if HF_ENABLED: metadata["huggingface"] = {"repoId": HF_REPO_ID, "enabled": True}
-    metadata["tokenizerConfig"] = {
-        "name": "Qwen/Qwen3-0.6B",
-        "vocabSize": MODEL_CONFIG["vocabSize"],
+    
+    # chunk_offset is no longer relevant for local chunk reading
+    chunk_offset = 0 
+    
+    metadata = {
+        "taskId": task_id, 
+        "globalStep": global_step, 
+        "modelSize": MODEL_SIZE, 
+        "modelConfig": MODEL_CONFIG,
+        "trainingConfig": cfg, 
+        "weightFormat": format,
+        "datasetConfig": {
+            "chunkIdx": shard["chunkIdx"],
+            "totalChunks": dataset_info["totalChunks"],
+            "epoch": data_position["epoch"],
+            "tokensPerSample": DATASET_CONFIG["tokensPerSample"],
+            "tokenBytes": DATASET_CONFIG["tokenBytes"],
+            "repoId": dataset_info.get("repoId", DATASET_REPO_ID)
+        },
+        "shardConfig": {"shardId": shard_id, "slot": len(shard["assignedIPs"]),
+                        "total": meta.get("required", FL_CONFIG["CONSENSUS_REQUIRED"])},
+        "loraConfig": {"defaultRank": LORA_CONFIG["DEFAULT_RANK"], "fullRank": LORA_CONFIG["FULL_RANK"],
+                       "rankTiers": LORA_CONFIG["RANK_TIERS"], "weightByRank": LORA_CONFIG["WEIGHT_BY_RANK"]}
     }
+    if HF_ENABLED: metadata["huggingface"] = {"repoId": HF_REPO_ID, "enabled": True}
+    metadata["tokenizerConfig"] = {"name": "Qwen/Qwen3-0.6B", "vocabSize": MODEL_CONFIG["vocabSize"]}
     metadata_json = json.dumps(metadata).encode('utf-8')
     metadata_length = struct.pack('<I', len(metadata_json))
     
     if skip_weights:
         log.info(f"📤 task {task_id} shard={shard_id} chunk={shard['chunkIdx']} mode={shard_mode} ip={client_ip} (skipping weights)")
-        return Response(
-            content=metadata_length + metadata_json,
-            media_type="application/octet-stream",
-            headers={
-                "X-Task-Id": task_id, "X-Shard-Id": shard_id, "X-Chunk-Idx": str(shard["chunkIdx"]),
-                "X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE), "X-Quantized": format
-            }
-        )
+        return Response(content=metadata_length + metadata_json, media_type="application/octet-stream",
+            headers={"X-Task-Id": task_id, "X-Shard-Id": shard_id, "X-Chunk-Idx": str(shard["chunkIdx"]),
+                     "X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE), "X-Quantized": format})
 
     weights_np = global_weights.cpu().numpy()
     if format == "fp8": compressed = compress_weights_fp8(weights_np)
@@ -531,14 +603,9 @@ async def get_task(request: Request, mode: str = "quick", format: str = "bf16", 
     else: compressed = compress_weights_bf16(weights_np)
     
     log.info(f"📤 task {task_id} shard={shard_id} chunk={shard['chunkIdx']} mode={shard_mode} ip={client_ip} (sending {len(compressed)/(1024*1024):.0f}MB)")
-    return Response(
-        content=metadata_length + metadata_json + compressed, 
-        media_type="application/octet-stream",
-        headers={
-            "X-Task-Id": task_id, "X-Shard-Id": shard_id, "X-Chunk-Idx": str(shard["chunkIdx"]),
-            "X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE), "X-Quantized": format
-        }
-    )
+    return Response(content=metadata_length + metadata_json + compressed, media_type="application/octet-stream",
+        headers={"X-Task-Id": task_id, "X-Shard-Id": shard_id, "X-Chunk-Idx": str(shard["chunkIdx"]),
+                 "X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE), "X-Quantized": format})
 
 @app.post("/fl/submit")
 async def submit_delta(request: Request):
@@ -672,22 +739,17 @@ async def list_checkpoints(secret: str = ""):
 async def reload_checkpoint(step: int = -1, secret: str = ""):
     global global_weights, global_step
     if secret != ADMIN_SECRET: raise HTTPException(403, "Invalid secret")
-    
     if step == -1:
-        if not load_latest_checkpoint():
-            raise HTTPException(404, "No checkpoint found")
+        if not load_latest_checkpoint(): raise HTTPException(404, "No checkpoint found")
         target_step = global_step
     else:
         cp_file = CHECKPOINT_DIR / f"model_step_{step}.bin"
-        if not cp_file.exists():
-            raise HTTPException(404, f"Checkpoint step {step} not found")
+        if not cp_file.exists(): raise HTTPException(404, f"Checkpoint step {step} not found")
         buf = np.fromfile(cp_file, dtype=np.float32)
-        if len(buf) != MODEL_SIZE:
-            raise HTTPException(400, f"Checkpoint size mismatch: {len(buf)} vs {MODEL_SIZE}")
+        if len(buf) != MODEL_SIZE: raise HTTPException(400, f"Checkpoint size mismatch: {len(buf)} vs {MODEL_SIZE}")
         global_weights = torch.from_numpy(buf.copy())
         global_step = step
         target_step = step
-    
     log.warning(f"🔄 ADMIN RELOAD to step {target_step}")
     save_latest_checkpoint()
     return {"status": "reloaded", "step": target_step, "weight_norm": float(torch.norm(global_weights).item())}
@@ -714,36 +776,37 @@ async def admin_reset(secret: str = ""):
 
 # ============ PUBLIC STATS & LEADERBOARD ============
 @app.get("/api/stats")
-async def get_stats(request: Request = None):
+async def get_stats(request: Request):
     recent = global_stats["lossHistory"][-10:]
     avg_loss = sum(recent)/len(recent) if recent else 0.0
     
-    # Calculate training loss change (percentage)
     loss_history = global_stats["lossHistory"]
     if len(loss_history) >= 2:
         first_loss = loss_history[0]
         last_loss = loss_history[-1]
-        if first_loss > 0:
-            training_loss_change = round(((last_loss - first_loss) / first_loss) * 100, 1)
-        else:
-            training_loss_change = -4.3
+        training_loss_change = round(((last_loss - first_loss) / first_loss) * 100, 1) if first_loss > 0 else 0.0
     else:
-        training_loss_change = -4.3  # Default fallback
+        training_loss_change = 0.0
         
     with users_lock: 
         total_users = len(users_db["users"])
         
     active_gpus = _active_ip_count()
     
+    auth_user = get_current_user(request)
+    your_contribution = 0.0
+    if auth_user:
+        total_tokens = global_stats["totalTokens"]
+        user_tokens = auth_user["stats"].get("totalTokens", 0)
+        if total_tokens > 0:
+            your_contribution = round((user_tokens / total_tokens) * 100, 4)
+    
     return {
-        # New homepage stats
-        "totalParticipants": total_users if total_users > 0 else 4281,
-        "activeGpus": active_gpus if active_gpus > 0 else 73,
+        "totalParticipants": total_users,
+        "activeGpus": active_gpus,
         "totalTokens": global_stats["totalTokens"],
         "trainingLossChange": training_loss_change,
-        "yourContribution": 0.004,  # Default mock for anonymous visitors
-        
-        # Existing stats (kept for compatibility with other views)
+        "yourContribution": your_contribution,
         "activeNow": active_gpus, 
         "totalSteps": global_stats["totalSteps"], 
         "globalStep": global_step,
@@ -816,6 +879,7 @@ async def startup():
     log.info(f"👥 Users loaded: {len(users_db['users'])}")
     if HF_ENABLED:
         log.info(f"🤗 HF uploads: {HF_REPO_ID} every {HF_UPLOAD_INTERVAL_HOURS}h")
+        log.info(f"📊 HF status.json updates: every 5 minutes")
     else:
         log.warning("⚠️ HF uploads disabled")
     log.info(f"🛡️  Admin watchdog: active (secret={ADMIN_SECRET[:8]}...)")
