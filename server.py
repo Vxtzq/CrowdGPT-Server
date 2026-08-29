@@ -609,6 +609,10 @@ def handle_checkpoints():
                 del chunk
         gc.collect()
         
+        # 🚨 CRITICAL FIX: Update the "latest" files so server loads them on restart!
+        save_model_weights()
+        save_engram_weights()
+        
         with open(CHECKPOINT_DIR / f"model_step_{global_step}.json", 'w', encoding='utf-8') as f:
             json.dump({"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(), "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS}, f, indent=2)
             
@@ -780,8 +784,19 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
     def weight_stream():
         yield metadata_length + metadata_json
         chunk_size = 10_000_000
+        
+        # Stream base weights
         for i in range(0, MODEL_SIZE, chunk_size):
             chunk = global_weights[i:i+chunk_size].cpu()
+            if format == "bf16":
+                yield chunk.view(torch.uint16).numpy().tobytes()
+            else:
+                yield chunk.float().numpy().astype(np.float16).tobytes()
+            del chunk
+            
+        # 🚨 CRITICAL FIX: Stream engram weights too!
+        for i in range(0, ENG_PARAMS, chunk_size):
+            chunk = global_engram_weights[i:i+chunk_size].cpu()
             if format == "bf16":
                 yield chunk.view(torch.uint16).numpy().tobytes()
             else:
