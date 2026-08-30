@@ -159,14 +159,14 @@ round_state = {
 }
 
 FL_CONFIG = {
-    "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1, "MAX_CHECKPOINTS": 10,
+    "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1, "MAX_CHECKPOINTS": 5,
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
     "MAX_WEIGHT_NORM": 1000.0, "WEIGHT_DECAY": 0.0001, "SERVER_LR": 0.1,
     "IP_TIMEOUT_S": 900, "SHARD_TIMEOUT_S": 1800, "CLEANUP_INTERVAL_S": 60,
 }
 
 ROUND_CONFIG = {
-    "MAX_ROUND_HOURS": 2.0, "MIN_CLIENTS_TO_AGGREGATE": 1, "CLIENT_TIMEOUT_HOURS": 2.5,
+    "MAX_ROUND_HOURS": 2.0, "MIN_CLIENTS_TO_AGGREGATE": 9999, "CLIENT_TIMEOUT_HOURS": 2.5,
     "AGGREGATION_COOLDOWN_SEC": 120, "ULTIMATUM_THRESHOLD": 0.90, "ULTIMATUM_TIMEOUT_MIN": 5,
 }
 
@@ -653,6 +653,11 @@ def cleanup_loop():
 def round_watchdog():
     while True:
         time.sleep(30)
+        
+        should_end_round = False
+        pending_deltas = []
+        current_round_ending = 1
+        
         with shard_lock:
             round_elapsed_hours = (time.time() - round_state["round_start_time"]) / 3600
             round_elapsed_fraction = round_elapsed_hours / round_state["round_duration_hours"]
@@ -683,16 +688,23 @@ def round_watchdog():
             )
             
             if should_end_round:
-                round_state["is_aggregating"] = True  # 🚨 LOCK CLIENTS OUT
-                log.info(f"⏰ Round {round_state['current_round']} complete! Aggregating and uploading to HF...")
-                
-                if round_state["pending_deltas"]:
-                    apply_round_aggregation(round_state["pending_deltas"])
-                    round_state["pending_deltas"] = []
-                
-                if HF_ENABLED:
-                    upload_to_huggingface()
-                
+                # 🚨 CRITICAL FIX: Lock out clients, extract state, but DO NOT hold the lock during heavy work!
+                round_state["is_aggregating"] = True
+                pending_deltas = round_state["pending_deltas"]
+                round_state["pending_deltas"] = []
+                current_round_ending = round_state["current_round"]
+                log.info(f"⏰ Round {current_round_ending} complete! Aggregating and uploading to HF...")
+
+        # 🚨 OUTSIDE THE LOCK: Heavy lifting happens here so clients can still poll /fl/round_status
+        if should_end_round:
+            if pending_deltas:
+                apply_round_aggregation(pending_deltas)
+            
+            if HF_ENABLED:
+                upload_to_huggingface()
+            
+            # Re-acquire lock to safely update round state for the next round
+            with shard_lock:
                 round_state["current_round"] += 1
                 round_state["round_start_time"] = time.time()
                 round_state["participating_clients"] = {}
@@ -700,7 +712,6 @@ def round_watchdog():
                 round_state["last_aggregation_time"] = time.time()
                 round_state["is_aggregating"] = False  # 🚨 UNLOCK
                 log.info(f"🚀 Started round {round_state['current_round']}")
-
 def aggregation_watchdog():
     while True: time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
 
