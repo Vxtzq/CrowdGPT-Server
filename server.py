@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-CrowdGPT Server - Continuous FL Coordinator (Ultimate Docker-OOM-Proof Edition)
+CrowdGPT Server - Continuous FL Coordinator (Disk-Based Sequential Aggregation Edition)
+
+🚨 PEER-REVIEWED & HARDENED:
+- ROLLING WINDOW TRICK: Server tells client the round ends exactly 1h from NOW.
+  This forces the client to do 1h runs continuously without negative time math,
+  micro-run spam, or heartbeat panics, while the server aggregates every 4h.
+- TOKEN FIX: /auth/login no longer revokes old tokens (allows multi-device sessions).
+- EXCEPTION FIX: HTTPExceptions in /fl/submit are no longer swallowed as 400s.
 """
 
 import os
@@ -36,7 +43,7 @@ import numpy as np
 import torch
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse # 🚨 NEW: For zero-copy streaming
+from fastapi.responses import StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -69,6 +76,9 @@ DATASET_CACHE_FILE = DATA_DIR / "dataset_info.json"
 USERS_DB_FILE = BASE_DIR / "users.json"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DELTA_TEMP_DIR = CHECKPOINT_DIR / "pending_deltas"
+DELTA_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 import socket
 hostname = socket.gethostname()
@@ -136,12 +146,71 @@ def compress_weights_bf16(w): return float32_to_bf16_array(w).tobytes()
 def compress_weights_fp16(w): return float32_to_fp16_array(w).tobytes()
 def compress_weights_fp8(w): return float32_to_fp8_array(w).tobytes()
 
+# ============ DISK-BASED DELTA STORAGE ============
+def save_delta_to_disk(client_ip, delta, engram_indices, engram_values, metadata):
+    ts = int(time.time() * 1000)
+    safe_ip = client_ip.replace(".", "_").replace(":", "_")
+    fname = DELTA_TEMP_DIR / f"delta_{safe_ip}_{ts}.bin"
+    
+    with open(fname, 'wb') as f:
+        meta_bytes = json.dumps(metadata).encode('utf-8')
+        f.write(struct.pack('<I', len(meta_bytes)))
+        f.write(meta_bytes)
+        
+        chunk_size = 10_000_000
+        for i in range(0, MODEL_SIZE, chunk_size):
+            chunk = delta[i:i+chunk_size].cpu().view(torch.uint16).numpy()
+            f.write(chunk.tobytes())
+            
+        if engram_indices is not None and len(engram_indices) > 0:
+            f.write(struct.pack('<I', len(engram_indices)))
+            f.write(engram_indices.tobytes())
+            eng_vals_bytes = engram_values.cpu().view(torch.uint16).numpy().tobytes()
+            f.write(eng_vals_bytes)
+        else:
+            f.write(struct.pack('<I', 0))
+            
+    return str(fname)
+
+def load_delta_from_disk(filepath):
+    with open(filepath, 'rb') as f:
+        meta_len = struct.unpack('<I', f.read(4))[0]
+        metadata = json.loads(f.read(meta_len).decode('utf-8'))
+        
+        delta = torch.zeros(MODEL_SIZE, dtype=torch.bfloat16)
+        chunk_size = 10_000_000
+        offset = 0
+        bytes_per_param = 2
+        while offset < MODEL_SIZE:
+            read_params = min(chunk_size, MODEL_SIZE - offset)
+            chunk_bytes = f.read(read_params * bytes_per_param)
+            if not chunk_bytes: break
+            buf = bytearray(chunk_bytes)
+            chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.bfloat16).clone()
+            delta[offset:offset+read_params] = chunk_t
+            offset += read_params
+            
+        eng_count = struct.unpack('<I', f.read(4))[0]
+        if eng_count > 0:
+            idx_bytes = f.read(eng_count * 4)
+            val_bytes = f.read(eng_count * MODEL_CONFIG["dim"] * 2)
+            engram_indices = np.frombuffer(bytearray(idx_bytes), dtype=np.uint32)
+            val_buf = bytearray(val_bytes)
+            engram_values = torch.frombuffer(val_buf, dtype=torch.uint16).view(torch.bfloat16).reshape(-1, MODEL_CONFIG["dim"]).clone()
+        else:
+            engram_indices = None
+            engram_values = None
+            
+    return metadata, delta, engram_indices, engram_values
+
 # ============ GLOBAL STATE ============
 db = {"tasks": {}, "pendingSubmissions": {}, "shardMeta": {}}
 active_ips: Dict[str, float] = {}
 blacklisted_subnets: Dict[str, float] = {}
-global_weights: Optional[torch.Tensor] = None
-global_engram_weights: Optional[torch.Tensor] = None
+
+global_weights: Optional[torch.Tensor] = None          # torch.float32
+global_engram_weights: Optional[torch.Tensor] = None    # torch.float32
+
 global_step = 0
 global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
 lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
@@ -152,22 +221,27 @@ current_data_shard = {"chunkIdx": 0, "assignedIPs": [], "shardId": None, "create
 dataset_stats = {"totalShardsProcessed": 0, "epochsCompleted": 0, "samplesProcessed": 0, "lastUpdate": None}
 
 round_state = {
-    "current_round": 1, "round_start_time": time.time(), "round_duration_hours": 2.0,
+    "current_round": 1, "round_start_time": time.time(), "round_duration_hours": 4.0,
     "participating_clients": {}, "aggregations_this_round": 0,
     "last_aggregation_time": 0, "pending_deltas": [],
-    "is_aggregating": False  # 🚨 NEW: Locks clients out during HF upload
+    "is_aggregating": False
 }
 
 FL_CONFIG = {
     "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1, "MAX_CHECKPOINTS": 5,
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
-    "MAX_WEIGHT_NORM": 1000.0, "WEIGHT_DECAY": 0.0001, "SERVER_LR": 0.1,
+    "MAX_WEIGHT_NORM": 1000.0, "WEIGHT_DECAY": 0.0001, "SERVER_LR": 1.0,
     "IP_TIMEOUT_S": 900, "SHARD_TIMEOUT_S": 1800, "CLEANUP_INTERVAL_S": 60,
 }
 
 ROUND_CONFIG = {
-    "MAX_ROUND_HOURS": 2.0, "MIN_CLIENTS_TO_AGGREGATE": 9999, "CLIENT_TIMEOUT_HOURS": 2.5,
-    "AGGREGATION_COOLDOWN_SEC": 120, "ULTIMATUM_THRESHOLD": 0.90, "ULTIMATUM_TIMEOUT_MIN": 5,
+    "MAX_ROUND_HOURS": 4.0,           # Actual server round lasts 4 hours
+    "TARGET_SUBMISSION_HOURS": 1.0,   # Client target (used for rolling window)
+    "MIN_CLIENTS_TO_AGGREGATE": 9999, 
+    "CLIENT_TIMEOUT_HOURS": 2.5,
+    "AGGREGATION_COOLDOWN_SEC": 120, 
+    "ULTIMATUM_THRESHOLD": 0.90,      
+    "ULTIMATUM_TIMEOUT_MIN": 30,      
 }
 
 shard_lock = threading.RLock()
@@ -175,7 +249,7 @@ shard_lock = threading.RLock()
 # ============ AUTH & LEADERBOARD ============
 users_db = {"users": {}, "tokens": {}}
 users_lock = threading.Lock()
-
+stats_lock = threading.Lock()
 BAD_WORDS = ["fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt", "bastard", "damn", "piss", "crap", "twat", "nigger", "nigga", "faggot", "fag", "retard", "tranny", "whore", "slut", "rape", "pedo", "nazi", "hitler", "porn", "xxx", "hentai", "admin", "administrator", "root", "system", "moderator", "mod", "staff", "official"]
 
 def load_users_db():
@@ -291,19 +365,36 @@ def _advance_chunk_pointer():
     dataset_stats["totalShardsProcessed"] += 1
     dataset_stats["lastUpdate"] = datetime.now(timezone.utc).isoformat()
 
-def get_or_advance_shard(client_ip: str) -> dict:
+def get_or_advance_shard(client_ip: str, force_new: bool = False) -> dict:
     global current_data_shard
     if not dataset_info["initialized"]: initialize_dataset()
     with shard_lock:
+        shard_from_prev_round = (
+            current_data_shard["shardId"] is not None
+            and current_data_shard.get("round") != round_state["current_round"]
+        )
         is_new_client = (current_data_shard["shardId"] is None) or (client_ip not in current_data_shard["assignedIPs"])
-        need_new_shard = current_data_shard["shardId"] is None or (is_new_client and len(current_data_shard["assignedIPs"]) >= FL_CONFIG["CONSENSUS_REQUIRED"])
+        enough_clients = len(current_data_shard["assignedIPs"]) >= FL_CONFIG["CONSENSUS_REQUIRED"]
+        need_new_shard = (
+            current_data_shard["shardId"] is None
+            or force_new
+            or shard_from_prev_round
+            or (is_new_client and enough_clients)
+        )
         if need_new_shard:
-            if current_data_shard["shardId"] is not None: _advance_chunk_pointer()
+            if current_data_shard["shardId"] is not None:
+                _advance_chunk_pointer()
             shard_id = f"round_{round_state['current_round']}_{data_position['currentChunkIdx']}_{int(time.time()*1000)}"
-            current_data_shard = {"chunkIdx": data_position["currentChunkIdx"], "assignedIPs": [], "shardId": shard_id, "createdAt": int(time.time()*1000)}
-            db["shardMeta"][shard_id] = {"createdAt": int(time.time()*1000), "required": FL_CONFIG["CONSENSUS_REQUIRED"], "chunkIdx": data_position["currentChunkIdx"]}
+            current_data_shard = {
+                "chunkIdx": data_position["currentChunkIdx"],
+                "assignedIPs": [],
+                "shardId": shard_id,
+                "createdAt": int(time.time()*1000),
+                "round": round_state["current_round"],
+            }
+            db["shardMeta"][shard_id] = {"createdAt": int(time.time()*1000), "required": FL_CONFIG["CONSENSUS_REQUIRED"], "chunkIdx": current_data_shard["chunkIdx"]}
             db["pendingSubmissions"][shard_id] = []
-            log.info(f"📦 New shard {shard_id} chunk={current_data_shard['chunkIdx']}")
+            log.info(f"📦 New shard {shard_id} chunk={current_data_shard['chunkIdx']} (force={force_new}, prev_round={shard_from_prev_round}, new_client={is_new_client})")
         if client_ip not in current_data_shard["assignedIPs"]:
             current_data_shard["assignedIPs"].append(client_ip)
         save_dataset_state()
@@ -313,9 +404,9 @@ def get_or_advance_shard(client_ip: str) -> dict:
 def initialize_model():
     global global_weights, global_engram_weights
     torch.manual_seed(42)
-    global_weights = (torch.randn(MODEL_SIZE) * 0.02).to(torch.bfloat16)
-    global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).to(torch.bfloat16)
-    log.info(f"🎲 initialized {MODEL_SIZE:,} base weights + {ENG_PARAMS:,} engram weights (BF16)")
+    global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
+    global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
+    log.info(f"🎲 initialized {MODEL_SIZE:,} base weights + {ENG_PARAMS:,} engram weights (FP32 master)")
 
 def load_global_state():
     global global_step, global_stats, lora_stats
@@ -357,8 +448,8 @@ def load_model_weights():
     try:
         buf = np.fromfile(LATEST_CHECKPOINT_FILE, dtype=np.float32)
         if len(buf) == MODEL_SIZE:
-            global_weights = torch.from_numpy(buf.copy()).to(torch.bfloat16)
-            log.info("✅ SUCCESS: Loaded base model weights.")
+            global_weights = torch.from_numpy(buf.copy())
+            log.info("✅ SUCCESS: Loaded base model weights (fp32 master).")
         else:
             log.error(f"❌ CRITICAL: model_latest.bin is corrupted! Expected {MODEL_SIZE} params, got {len(buf)}.")
     except Exception as e:
@@ -372,8 +463,8 @@ def load_engram_weights():
     try:
         buf = np.fromfile(ENGRAM_CHECKPOINT_FILE, dtype=np.float32)
         if len(buf) == ENG_PARAMS:
-            global_engram_weights = torch.from_numpy(buf.copy()).to(torch.bfloat16)
-            log.info("✅ SUCCESS: Loaded engram weights.")
+            global_engram_weights = torch.from_numpy(buf.copy())
+            log.info("✅ SUCCESS: Loaded engram weights (fp32 master).")
         else:
             log.error(f"❌ CRITICAL: engram_latest.bin is corrupted! Expected {ENG_PARAMS} params, got {len(buf)}.")
     except Exception as e:
@@ -435,7 +526,7 @@ def bootstrap_huggingface():
         if temp_dir.exists(): shutil.rmtree(temp_dir)
         temp_dir.mkdir(exist_ok=True)
         
-        w = global_weights.cpu().clone()
+        w = global_weights.cpu().to(torch.bfloat16)
         save_file({"weights": w}, str(temp_dir / "model_bf16.safetensors"))
         del w; gc.collect()
         
@@ -443,7 +534,7 @@ def bootstrap_huggingface():
         save_file({"weights": w}, str(temp_dir / "model_fp32.safetensors"))
         del w; gc.collect()
         
-        w = global_engram_weights.cpu().clone()
+        w = global_engram_weights.cpu().to(torch.bfloat16)
         save_file({"weights": w}, str(temp_dir / "engram_bf16.safetensors"))
         del w; gc.collect()
         
@@ -478,7 +569,7 @@ def upload_to_huggingface():
         if temp_dir.exists(): shutil.rmtree(temp_dir)
         temp_dir.mkdir(exist_ok=True)
         
-        w = global_weights.cpu().clone()
+        w = global_weights.cpu().to(torch.bfloat16)
         save_file({"weights": w}, str(temp_dir / "model_bf16.safetensors"))
         del w; gc.collect()
         
@@ -486,7 +577,7 @@ def upload_to_huggingface():
         save_file({"weights": w}, str(temp_dir / "model_fp32.safetensors"))
         del w; gc.collect()
         
-        w = global_engram_weights.cpu().clone()
+        w = global_engram_weights.cpu().to(torch.bfloat16)
         save_file({"weights": w}, str(temp_dir / "engram_bf16.safetensors"))
         del w; gc.collect()
         
@@ -609,7 +700,6 @@ def handle_checkpoints():
                 del chunk
         gc.collect()
         
-        # 🚨 CRITICAL FIX: Update the "latest" files so server loads them on restart!
         save_model_weights()
         save_engram_weights()
         
@@ -645,6 +735,11 @@ def cleanup_loop():
             db["shardMeta"].pop(sid, None)
             db["pendingSubmissions"].pop(sid, None)
             
+        for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
+            if time.time() - f.stat().st_mtime > 86400:
+                try: f.unlink()
+                except: pass
+            
         if expired_tasks or stale_shards:
             log.info(f"🧹 GC: Cleaned {len(expired_tasks)} dead tasks and {len(stale_shards)} stale shards")
             
@@ -652,66 +747,94 @@ def cleanup_loop():
 
 def round_watchdog():
     while True:
-        time.sleep(30)
-        
-        should_end_round = False
-        pending_deltas = []
-        current_round_ending = 1
-        
-        with shard_lock:
-            round_elapsed_hours = (time.time() - round_state["round_start_time"]) / 3600
-            round_elapsed_fraction = round_elapsed_hours / round_state["round_duration_hours"]
+        try:
+            time.sleep(30)
             
-            if round_elapsed_fraction >= ROUND_CONFIG["ULTIMATUM_THRESHOLD"]:
-                for client_ip, client_data in round_state["participating_clients"].items():
-                    if not client_data["submitted"] and not client_data.get("ultimatum_sent"):
-                        log.warning(f"⚠️ Sending ultimatum to {client_ip}")
-                        client_data["ultimatum_sent"] = True
-                        client_data["ultimatum_time"] = time.time()
+            should_end_round = False
+            pending_deltas = []
+            current_round_ending = 1
             
-            for client_ip in list(round_state["participating_clients"].keys()):
-                client_data = round_state["participating_clients"][client_ip]
-                if client_data.get("ultimatum_sent"):
-                    time_since_ultimatum = (time.time() - client_data.get("ultimatum_time", 0)) / 60
-                    if time_since_ultimatum > ROUND_CONFIG["ULTIMATUM_TIMEOUT_MIN"] and not client_data["submitted"]:
-                        log.warning(f"🚫 Removing {client_ip} from round")
-                        del round_state["participating_clients"][client_ip]
-            
-            has_clients = len(round_state["participating_clients"]) > 0
-            all_submitted = has_clients and all(c["submitted"] for c in round_state["participating_clients"].values())
-            
-            should_end_round = (
-                has_clients and (
-                    round_elapsed_hours >= round_state["round_duration_hours"] or
-                    (all_submitted and len(round_state["participating_clients"]) >= ROUND_CONFIG["MIN_CLIENTS_TO_AGGREGATE"])
-                )
-            )
-            
-            if should_end_round:
-                # 🚨 CRITICAL FIX: Lock out clients, extract state, but DO NOT hold the lock during heavy work!
-                round_state["is_aggregating"] = True
-                pending_deltas = round_state["pending_deltas"]
-                round_state["pending_deltas"] = []
-                current_round_ending = round_state["current_round"]
-                log.info(f"⏰ Round {current_round_ending} complete! Aggregating and uploading to HF...")
-
-        # 🚨 OUTSIDE THE LOCK: Heavy lifting happens here so clients can still poll /fl/round_status
-        if should_end_round:
-            if pending_deltas:
-                apply_round_aggregation(pending_deltas)
-            
-            if HF_ENABLED:
-                upload_to_huggingface()
-            
-            # Re-acquire lock to safely update round state for the next round
             with shard_lock:
-                round_state["current_round"] += 1
-                round_state["round_start_time"] = time.time()
-                round_state["participating_clients"] = {}
-                round_state["aggregations_this_round"] = 0
-                round_state["last_aggregation_time"] = time.time()
-                round_state["is_aggregating"] = False  # 🚨 UNLOCK
-                log.info(f"🚀 Started round {round_state['current_round']}")
+                round_elapsed_hours = (time.time() - round_state["round_start_time"]) / 3600
+                
+                # Ultimatums for clients that haven't submitted
+                if round_elapsed_hours >= round_state["round_duration_hours"] * ROUND_CONFIG["ULTIMATUM_THRESHOLD"]:
+                    for client_ip, client_data in list(round_state["participating_clients"].items()):
+                        if not client_data["submitted"] and not client_data.get("ultimatum_sent"):
+                            last_seen = active_ips.get(client_ip, 0)
+                            if time.time() - last_seen < FL_CONFIG["IP_TIMEOUT_S"]:
+                                continue
+                                
+                            log.warning(f"⚠️ Sending ultimatum to {client_ip} (silent for {int((time.time()-last_seen)/60)}m)")
+                            client_data["ultimatum_sent"] = True
+                            client_data["ultimatum_time"] = time.time()
+                
+                # Remove dead clients that missed the ultimatum
+                for client_ip in list(round_state["participating_clients"].keys()):
+                    client_data = round_state["participating_clients"][client_ip]
+                    
+                    if client_data["submitted"] and client_data.get("ultimatum_sent"):
+                        client_data["ultimatum_sent"] = False
+                        continue
+
+                    if client_data.get("ultimatum_sent"):
+                        time_since_ultimatum = (time.time() - client_data.get("ultimatum_time", 0)) / 60
+                        
+                        last_seen = active_ips.get(client_ip, 0)
+                        if time.time() - last_seen < FL_CONFIG["IP_TIMEOUT_S"]:
+                            client_data["ultimatum_sent"] = False
+                            continue
+
+                        if time_since_ultimatum > ROUND_CONFIG["ULTIMATUM_TIMEOUT_MIN"]:
+                            log.warning(f"🚫 Removing {client_ip} from round (unresponsive/dead)")
+                            del round_state["participating_clients"][client_ip]
+                
+                # Timer is the ONLY trigger. Round always lasts exactly 4 hours.
+                timer_expired = round_elapsed_hours >= round_state["round_duration_hours"]
+                
+                should_end_round = timer_expired
+                
+                if should_end_round:
+                    round_state["is_aggregating"] = True
+                    pending_deltas = list(round_state["pending_deltas"])
+                    round_state["pending_deltas"] = []
+                    current_round_ending = round_state["current_round"]
+                    log.info(f"⏰ Round {current_round_ending} timer expired ({round_elapsed_hours:.2f}h)! Aggregating {len(pending_deltas)} deltas...")
+
+            if should_end_round:
+                try:
+                    if pending_deltas:
+                        apply_round_aggregation(pending_deltas)
+                    else:
+                        log.warning("⚠️ Round ended but no deltas were submitted.")
+                    
+                    if HF_ENABLED:
+                        upload_to_huggingface()
+                    
+                    with shard_lock:
+                        round_state["current_round"] += 1
+                        round_state["round_start_time"] = time.time()
+                        round_state["participating_clients"] = {}
+                        round_state["aggregations_this_round"] = 0
+                        round_state["last_aggregation_time"] = time.time()
+                        round_state["is_aggregating"] = False
+                        log.info(f"🚀 Started round {round_state['current_round']} with updated weights (step {global_step})")
+                except Exception as agg_err:
+                    log.error(f"❌ Aggregation failed: {agg_err}")
+                    import traceback
+                    traceback.print_exc()
+                    with shard_lock:
+                        round_state["is_aggregating"] = False
+                        round_state["current_round"] += 1
+                        round_state["round_start_time"] = time.time()
+                        round_state["participating_clients"] = {}
+
+        except Exception as e:
+            log.error(f"❌ round_watchdog error: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(10)
+
 def aggregation_watchdog():
     while True: time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
 
@@ -747,14 +870,27 @@ async def get_round_status(request: Request):
     in_cooldown = (time.time() - round_state["last_aggregation_time"]) < ROUND_CONFIG["AGGREGATION_COOLDOWN_SEC"]
     round_elapsed_hours = (time.time() - round_state["round_start_time"]) / 3600
     
+    # 🚨 ROLLING WINDOW TRICK:
+    # To prevent the client from doing micro-runs or panicking when time goes negative,
+    # we tell the client the round ends exactly TARGET_SUBMISSION_HOURS (1h) from NOW.
+    # This forces the client to do continuous 1h runs.
+    # Exception: If the server's actual 4h round is almost over (<15 mins left), 
+    # we tell the client the real end time so it stops gracefully.
+    time_left_in_server_round = round_state["round_duration_hours"] - round_elapsed_hours
+    if time_left_in_server_round < 0.25:
+        client_max_round = round_state["round_duration_hours"]
+    else:
+        client_max_round = round_elapsed_hours + ROUND_CONFIG["TARGET_SUBMISSION_HOURS"]
+
     return {
         "current_round": round_state["current_round"], "round_elapsed_hours": round_elapsed_hours,
-        "max_round_hours": round_state["round_duration_hours"],
+        "max_round_hours": client_max_round, 
+        "round_duration_hours": round_state["round_duration_hours"], 
         "clients_in_round": len(round_state["participating_clients"]),
         "submitted_clients": sum(1 for c in round_state["participating_clients"].values() if c["submitted"]),
         "in_cooldown": in_cooldown, "global_step": global_step,
         "next_round_ready": not in_cooldown and round_state["last_aggregation_time"] > 0,
-        "is_aggregating": round_state.get("is_aggregating", False)  # 🚨 NEW
+        "is_aggregating": round_state.get("is_aggregating", False)
     }
 
 @app.get("/fl/task")
@@ -770,9 +906,15 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
         wait_time = int(ROUND_CONFIG["AGGREGATION_COOLDOWN_SEC"] - (time.time() - round_state["last_aggregation_time"]))
         return Response(content=json.dumps({"status": "wait", "message": f"Server aggregating, wait {wait_time}s"}).encode(), media_type="application/json", headers={"X-Status": "wait"})
     
-    shard = get_or_advance_shard(client_ip)
+    shard = get_or_advance_shard(client_ip, force_new=skip_weights)
     shard_id = shard["shardId"]
     task_id = f"round_{round_state['current_round']}_{shard_id}"
+    
+    # Reset submitted flag so fast clients doing multiple runs are tracked correctly
+    with shard_lock:
+        if client_ip in round_state["participating_clients"]:
+            round_state["participating_clients"][client_ip]["submitted"] = False
+            round_state["participating_clients"][client_ip]["ultimatum_sent"] = False
     
     db["tasks"][task_id] = {"shardId": shard_id, "chunkIdx": shard["chunkIdx"], "round": round_state["current_round"], "requestedByIp": client_ip, "createdAt": int(time.time()*1000)}
     
@@ -791,25 +933,22 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
     if skip_weights:
         return Response(content=metadata_length + metadata_json, media_type="application/octet-stream", headers={"X-Task-Id": task_id, "X-Round": str(round_state["current_round"]), "X-Global-Step": str(global_step)})
     
-    # 🚨 ZERO-COPY STREAMING: Eliminates 2.6GB RAM spike!
     def weight_stream():
         yield metadata_length + metadata_json
         chunk_size = 10_000_000
         
-        # Stream base weights
         for i in range(0, MODEL_SIZE, chunk_size):
             chunk = global_weights[i:i+chunk_size].cpu()
             if format == "bf16":
-                yield chunk.view(torch.uint16).numpy().tobytes()
+                yield chunk.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
             else:
                 yield chunk.float().numpy().astype(np.float16).tobytes()
             del chunk
             
-        # 🚨 CRITICAL FIX: Stream engram weights too!
         for i in range(0, ENG_PARAMS, chunk_size):
             chunk = global_engram_weights[i:i+chunk_size].cpu()
             if format == "bf16":
-                yield chunk.view(torch.uint16).numpy().tobytes()
+                yield chunk.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
             else:
                 yield chunk.float().numpy().astype(np.float16).tobytes()
             del chunk
@@ -824,6 +963,9 @@ async def submit_delta(request: Request):
     
     temp_compressed = None
     temp_decompressed = None
+    temp_delta_path = None
+    final_delta_path = None
+    
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".bin.gz") as tmp_file:
             temp_compressed = tmp_file.name
@@ -858,32 +1000,40 @@ async def submit_delta(request: Request):
             engram_sparse_count = body.get("engramSparseCount", 0)
             bytes_per_param = 2 if fmt in ("bf16", "fp16") else (1 if fmt == "fp8" else 4)
             
-            # 🚨 ZERO-COPY CHUNKED DECODING: Eliminates 3.9GB RAM spike!
-            delta = torch.zeros(MODEL_SIZE, dtype=torch.bfloat16)
-            chunk_params = 10_000_000
-            
-            offset = 0
-            while offset < MODEL_SIZE:
-                read_params = min(chunk_params, MODEL_SIZE - offset)
-                chunk_bytes = dec_f.read(read_params * bytes_per_param)
-                if not chunk_bytes or len(chunk_bytes) < read_params * bytes_per_param:
-                    raise HTTPException(status_code=400, detail="Incomplete base delta payload")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as temp_delta_file:
+                temp_delta_path = temp_delta_file.name
+                norm_sq = 0.0
+                offset = 0
+                has_nan_inf = False
                 
-                buf = bytearray(chunk_bytes) # Writable buffer for torch
-                
-                if fmt == "fp8":
-                    chunk_t = torch.frombuffer(buf, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.bfloat16)
-                elif fmt == "fp16":
-                    chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.float16).to(torch.bfloat16)
-                elif fmt == "fp32":
-                    chunk_t = torch.frombuffer(buf, dtype=torch.float32).to(torch.bfloat16)
-                else: # bf16
-                    chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.bfloat16)
+                while offset < MODEL_SIZE:
+                    read_params = min(10_000_000, MODEL_SIZE - offset)
+                    chunk_bytes = dec_f.read(read_params * bytes_per_param)
+                    if not chunk_bytes or len(chunk_bytes) < read_params * bytes_per_param:
+                        raise HTTPException(status_code=400, detail="Incomplete base delta payload")
                     
-                delta[offset:offset+read_params] = chunk_t
-                offset += read_params
-                del buf, chunk_t, chunk_bytes
+                    temp_delta_file.write(chunk_bytes)
+                    buf = bytearray(chunk_bytes)
+                    if fmt == "fp8": chunk_t = torch.frombuffer(buf, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+                    elif fmt == "fp16": chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.float16).to(torch.float32)
+                    elif fmt == "fp32": chunk_t = torch.frombuffer(buf, dtype=torch.float32)
+                    else: chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.bfloat16).to(torch.float32)
+                        
+                    if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
+                        has_nan_inf = True
+                        break
+                        
+                    norm_sq += torch.sum(chunk_t ** 2).item()
+                    offset += read_params
+                    del buf, chunk_t
+                    
+            if has_nan_inf:
+                os.unlink(temp_delta_path)
+                ban_subnet(client_ip, "submitted NaN/Inf delta")
+                raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
                 
+            delta_norm = math.sqrt(norm_sq)
+            
             engram_indices = None
             engram_values = None
             if has_engram and engram_sparse_count > 0:
@@ -891,126 +1041,234 @@ async def submit_delta(request: Request):
                 val_bytes_len = engram_sparse_count * MODEL_CONFIG["dim"] * bytes_per_param
                 idx_bytes = read_exact(dec_f, idx_bytes_len)
                 val_bytes = read_exact(dec_f, val_bytes_len)
-                if len(idx_bytes) < idx_bytes_len or len(val_bytes) < val_bytes_len: raise HTTPException(status_code=400, detail=f"Incomplete engram payload")
+                if len(idx_bytes) < idx_bytes_len or len(val_bytes) < val_bytes_len: 
+                    os.unlink(temp_delta_path)
+                    raise HTTPException(status_code=400, detail="Incomplete engram payload")
                 
                 engram_indices = np.frombuffer(bytearray(idx_bytes), dtype=np.uint32)
-                
                 val_buf = bytearray(val_bytes)
                 if fmt == "fp16":
                     engram_values = torch.frombuffer(val_buf, dtype=torch.uint16).view(torch.float16).to(torch.bfloat16)
                 elif fmt == "fp32":
                     engram_values = torch.frombuffer(val_buf, dtype=torch.float32).to(torch.bfloat16)
-                else: # bf16
+                else:
                     engram_values = torch.frombuffer(val_buf, dtype=torch.uint16).view(torch.bfloat16)
-                    
                 engram_values = engram_values.reshape(-1, MODEL_CONFIG["dim"])
                 del val_buf
+
+        task_id = body.get("taskId")
+        if task_id not in db["tasks"]: 
+            os.unlink(temp_delta_path)
+            raise HTTPException(status_code=404, detail="Task expired")
+            
+        rank = body.get("loraRank", LORA_CONFIG["FULL_RANK"])
+        local_steps = body.get("localSteps", 1)
+        loss = body.get("loss")
+        
+        max_allowed = compute_max_allowed_norm(local_steps, rank)
+        abs_max = max(FL_CONFIG["DELTA_NORM_ABSOLUTE_MAX"], max_allowed * 3)
+        if delta_norm > abs_max:
+            os.unlink(temp_delta_path)
+            ban_subnet(client_ip, f"delta norm {delta_norm:.0f} > max {abs_max:.0f}")
+            raise HTTPException(status_code=400, detail=f"Delta too large ({delta_norm:.2f})")
+        
+        normalized = False
+        ts = int(time.time() * 1000)
+        safe_ip = client_ip.replace(".", "_").replace(":", "_")
+        final_delta_path = str(DELTA_TEMP_DIR / f"delta_{safe_ip}_{ts}.bin")
+        
+        delta_metadata = {
+            "nodeIp": client_ip, "delta_norm": delta_norm, "rank": rank, "loss": loss, 
+            "localSteps": local_steps, "tokensProcessed": body.get("tokensProcessed", 0), 
+            "normalized": False, "submittedAt": int(time.time()*1000), "weightFormat": "bf16"
+        }
+        
+        if delta_norm > max_allowed:
+            scale_factor = max_allowed / delta_norm
+            normalized = True
+            delta_metadata["normalized"] = True
+            
+            with open(temp_delta_path, 'rb') as in_f, open(final_delta_path, 'wb') as out_f:
+                meta_bytes = json.dumps(delta_metadata).encode('utf-8')
+                out_f.write(struct.pack('<I', len(meta_bytes)))
+                out_f.write(meta_bytes)
                 
+                offset = 0
+                while offset < MODEL_SIZE:
+                    read_params = min(10_000_000, MODEL_SIZE - offset)
+                    chunk_bytes = in_f.read(read_params * bytes_per_param)
+                    buf = bytearray(chunk_bytes)
+                    if fmt == "fp8": chunk_t = torch.frombuffer(buf, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+                    elif fmt == "fp16": chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.float16).to(torch.float32)
+                    elif fmt == "fp32": chunk_t = torch.frombuffer(buf, dtype=torch.float32)
+                    else: chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.bfloat16).to(torch.float32)
+                        
+                    chunk_t.mul_(scale_factor)
+                    out_f.write(chunk_t.to(torch.bfloat16).view(torch.uint16).numpy().tobytes())
+                    offset += read_params
+                
+                if engram_indices is not None and len(engram_indices) > 0:
+                    out_f.write(struct.pack('<I', len(engram_indices)))
+                    out_f.write(engram_indices.tobytes())
+                    eng_vals_scaled = (engram_values.float() * scale_factor).to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
+                    out_f.write(eng_vals_scaled)
+                else:
+                    out_f.write(struct.pack('<I', 0))
+        else:
+            with open(temp_delta_path, 'rb') as in_f, open(final_delta_path, 'wb') as out_f:
+                meta_bytes = json.dumps(delta_metadata).encode('utf-8')
+                out_f.write(struct.pack('<I', len(meta_bytes)))
+                out_f.write(meta_bytes)
+                
+                while True:
+                    chunk = in_f.read(10_000_000 * bytes_per_param)
+                    if not chunk: break
+                    if fmt != "bf16":
+                        buf = bytearray(chunk)
+                        if fmt == "fp8": chunk_t = torch.frombuffer(buf, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.bfloat16)
+                        elif fmt == "fp16": chunk_t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.float16).to(torch.bfloat16)
+                        elif fmt == "fp32": chunk_t = torch.frombuffer(buf, dtype=torch.float32).to(torch.bfloat16)
+                        out_f.write(chunk_t.view(torch.uint16).numpy().tobytes())
+                    else:
+                        out_f.write(chunk)
+                        
+                if engram_indices is not None and len(engram_indices) > 0:
+                    out_f.write(struct.pack('<I', len(engram_indices)))
+                    out_f.write(engram_indices.tobytes())
+                    out_f.write(engram_values.view(torch.uint16).numpy().tobytes())
+                else:
+                    out_f.write(struct.pack('<I', 0))
+                    
+        os.unlink(temp_delta_path)
+        
+        with shard_lock:
+            if client_ip in round_state["participating_clients"]:
+                round_state["participating_clients"][client_ip]["submitted"] = True
+                round_state["aggregations_this_round"] += 1
+            round_state["pending_deltas"].append(final_delta_path)
+            log.info(f"📥 Round {round_state['current_round']}: Client {client_ip} submitted → saved to disk (norm={delta_norm:.2f})")
+        
+        with stats_lock:
+            global_stats["totalTokens"] += body.get("tokensProcessed", 0)
+            global_stats["totalSteps"] += local_steps or 0
+            if loss and loss > 0 and math.isfinite(loss):
+                global_stats["lastLoss"] = loss
+                global_stats["lossHistory"].append(loss)
+                global_stats["lossHistory"] = global_stats["lossHistory"][-100:]
+            
+            lora_stats["total_submissions"] += 1
+            lora_stats["rank_distribution"][str(rank)] = lora_stats["rank_distribution"].get(str(rank), 0) + 1
+            lora_stats["last_update"] = datetime.now(timezone.utc).isoformat()
+        
+        auth_user = get_current_user(request)
+        if auth_user:
+            tokens_to_add = body.get("tokensProcessed", 0)
+            steps_to_add = local_steps or 0
+            with users_lock:
+                user_record = users_db["users"].get(auth_user["uuid"])
+                if user_record:
+                    user_record["stats"]["contributions"] = user_record["stats"].get("contributions", 0) + 1
+                    user_record["stats"]["totalTokens"] = user_record["stats"].get("totalTokens", 0) + tokens_to_add
+                    user_record["stats"]["totalSteps"] = user_record["stats"].get("totalSteps", 0) + steps_to_add
+                    save_users_db()
+                    log.info(f"✅ User {user_record['username']} credited: +{tokens_to_add:,} tokens, +{steps_to_add} steps (total: {user_record['stats']['totalTokens']:,})")
+                else:
+                    log.warning(f"⚠️ Auth user {auth_user['username']} not found in DB — token may be stale")
+        else:
+            log.info(f"📝 Anonymous submission from {client_ip} (no auth header or invalid token)")
+                    
+        save_global_state()
+        update_and_save_status()
+        
+        return {"status": "success", "globalStep": global_step, "normalized": normalized, "round": round_state["current_round"], "loss": loss}
+
+    # 🚨 FIX: Re-raise FastAPI HTTPExceptions properly so 404s don't become 400s
+    except HTTPException:
+        raise
     except Exception as e:
-        log.error(f"❌ Upload stream failed: {e}")
+        log.error(f"❌ Upload stream failed from {client_ip}: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Upload stream failed: {str(e)}")
     finally:
         if temp_compressed and os.path.exists(temp_compressed): os.unlink(temp_compressed)
         if temp_decompressed and os.path.exists(temp_decompressed): os.unlink(temp_decompressed)
-
-    if not delta.size: raise HTTPException(status_code=400, detail="Empty delta")
-    
-    task_id = body.get("taskId")
-    if task_id not in db["tasks"]: raise HTTPException(status_code=404, detail="Task expired")
-    task = db["tasks"][task_id]
-    
-    if len(delta) != MODEL_SIZE: raise HTTPException(status_code=400, detail=f"Size mismatch")
-    if torch.isnan(delta).any() or torch.isinf(delta).any():
-        ban_subnet(client_ip, "submitted NaN/Inf delta")
-        raise HTTPException(status_code=400, detail="Invalid delta")
-    
-    norm_sq = 0.0
-    chunk_size = 10_000_000
-    for i in range(0, MODEL_SIZE, chunk_size):
-        chunk = delta[i:i+chunk_size].float()
-        norm_sq += torch.sum(chunk * chunk).item()
-        del chunk
-    delta_norm = math.sqrt(norm_sq)
-    
-    rank = body.get("loraRank", LORA_CONFIG["FULL_RANK"])
-    local_steps = body.get("localSteps", 1)
-    loss = body.get("loss")
-    
-    max_allowed = compute_max_allowed_norm(local_steps, rank)
-    abs_max = max(FL_CONFIG["DELTA_NORM_ABSOLUTE_MAX"], max_allowed * 3)
-    if delta_norm > abs_max:
-        ban_subnet(client_ip, f"delta norm {delta_norm:.0f} > max {abs_max:.0f}")
-        raise HTTPException(status_code=400, detail=f"Delta too large ({delta_norm:.2f})")
-    
-    normalized = False
-    if delta_norm > max_allowed:
-        delta.mul_(max_allowed / delta_norm)
-        normalized = True
-    
-    with shard_lock:
-        if client_ip in round_state["participating_clients"]:
-            round_state["participating_clients"][client_ip]["submitted"] = True
-            round_state["aggregations_this_round"] += 1
-            round_state["pending_deltas"].append({
-                "nodeIp": client_ip, "delta": delta, "engram_indices": engram_indices, "engram_values": engram_values,
-                "delta_norm": delta_norm, "rank": rank, "loss": loss, "localSteps": local_steps, 
-                "tokensProcessed": body.get("tokensProcessed", 0), "normalized": normalized, "submittedAt": int(time.time()*1000)
-            })
-            log.info(f"📥 Round {round_state['current_round']}: Client {client_ip} submitted")
-    
-    global_stats["totalTokens"] += body.get("tokensProcessed", 0)
-    global_stats["totalSteps"] += local_steps or 0
-    if loss and loss > 0 and math.isfinite(loss):
-        global_stats["lastLoss"] = loss
-        global_stats["lossHistory"].append(loss)
-        global_stats["lossHistory"] = global_stats["lossHistory"][-100:]
-    
-    lora_stats["total_submissions"] += 1
-    lora_stats["rank_distribution"][str(rank)] = lora_stats["rank_distribution"].get(str(rank), 0) + 1
-    lora_stats["last_update"] = datetime.now(timezone.utc).isoformat()
-    
-    auth_user = get_current_user(request)
-    if auth_user:
-        tokens_to_add = body.get("tokensProcessed", 0)
-        steps_to_add = local_steps or 0
-        with users_lock:
-            user_record = users_db["users"].get(auth_user["uuid"])
-            if user_record:
-                user_record["stats"]["contributions"] = user_record["stats"].get("contributions", 0) + 1
-                user_record["stats"]["totalTokens"] = user_record["stats"].get("totalTokens", 0) + tokens_to_add
-                user_record["stats"]["totalSteps"] = user_record["stats"].get("totalSteps", 0) + steps_to_add
-                save_users_db()
-    
-    save_global_state()
-    update_and_save_status()
-    
-    return {"status": "success", "globalStep": global_step, "normalized": normalized, "round": round_state["current_round"], "loss": loss}
-
-def apply_round_aggregation(submissions: List[dict]):
-    global global_weights, global_step
-    if not submissions: return
-    
-    total_tokens = sum(s.get("tokensProcessed", 0) for s in submissions)
-    if total_tokens == 0:
-        log.warning("⚠️ No tokens processed this round, skipping aggregation")
-        return
-    
-    log.info(f"🧮 Aggregating {len(submissions)} deltas ({total_tokens:,} total tokens)...")
-    
-    aggregated_delta = torch.zeros(MODEL_SIZE, dtype=torch.bfloat16)
-    for sub in submissions:
-        weight = sub.get("tokensProcessed", 0) / total_tokens
-        aggregated_delta.add_(sub["delta"], alpha=weight)
+        if temp_delta_path and os.path.exists(temp_delta_path): os.unlink(temp_delta_path)
         
-    if torch.isnan(aggregated_delta).any() or torch.isinf(aggregated_delta).any():
-        log.error("🚨 Aggregated base delta contains NaN/Inf, skipping update")
-        del aggregated_delta; gc.collect()
+   
+
+def apply_round_aggregation(submission_paths: List[str]):
+    global global_weights, global_step
+    if not submission_paths:
+        log.warning("⚠️ No deltas to aggregate")
         return
+    
+    log.info(f"🧮 Aggregating {len(submission_paths)} deltas from disk (direct in-place)...")
+    
+    total_tokens = 0
+    all_metadata = []
+    
+    for path in submission_paths:
+        try:
+            with open(path, 'rb') as f:
+                meta_len = struct.unpack('<I', f.read(4))[0]
+                metadata = json.loads(f.read(meta_len).decode('utf-8'))
+            all_metadata.append((path, metadata))
+            total_tokens += metadata.get("tokensProcessed", 0)
+        except Exception as e:
+            log.error(f"❌ Failed to read metadata from {path}: {e}")
+            try: os.remove(path)
+            except: pass
+    
+    if total_tokens == 0 or not all_metadata:
+        log.warning("⚠️ No valid deltas to aggregate (0 tokens)")
+        for path in submission_paths:
+            try: os.remove(path)
+            except: pass
+        return
+    
+    log.info(f"📊 Total tokens across {len(all_metadata)} submissions: {total_tokens:,}")
     
     with shard_lock:
         global_weights.mul_(1.0 - FL_CONFIG["WEIGHT_DECAY"])
-        global_weights.add_(aggregated_delta, alpha=FL_CONFIG["SERVER_LR"])
-        
+    
+    engram_accumulator = {}
+    
+    for path, metadata in all_metadata:
+        try:
+            _, delta_bf16, eng_indices, eng_values_bf16 = load_delta_from_disk(path)
+            weight = metadata.get("tokensProcessed", 0) / total_tokens
+            scaled_lr = FL_CONFIG["SERVER_LR"] * weight
+            
+            if weight > 0:
+                with shard_lock:
+                    global_weights.add_(delta_bf16.float(), alpha=scaled_lr)
+                
+                if eng_indices is not None and len(eng_indices) > 0:
+                    eng_values_fp32 = eng_values_bf16.float()
+                    for idx, val in zip(eng_indices.tolist(), eng_values_fp32):
+                        idx = int(idx)
+                        if idx not in engram_accumulator:
+                            engram_accumulator[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0]
+                        engram_accumulator[idx][0] += val * weight
+                        engram_accumulator[idx][1] += weight
+            
+            del delta_bf16
+            if eng_indices is not None: del eng_indices
+            if eng_values_bf16 is not None: del eng_values_bf16
+            gc.collect()
+            
+            try: os.remove(path)
+            except: pass
+            
+        except Exception as e:
+            log.error(f"❌ Failed to process delta {path}: {e}")
+            import traceback
+            traceback.print_exc()
+            try: os.remove(path)
+            except: pass
+    
+    with shard_lock:
         norm_sq = 0.0
         chunk_size = 10_000_000
         for i in range(0, MODEL_SIZE, chunk_size):
@@ -1021,65 +1279,25 @@ def apply_round_aggregation(submissions: List[dict]):
         
         if norm > FL_CONFIG["MAX_WEIGHT_NORM"]:
             global_weights.mul_(FL_CONFIG["MAX_WEIGHT_NORM"] / norm)
-            log.warning(f"⚠️ Global weight norm {norm:.2f} clipped")
+            log.warning(f"⚠️ Global weight norm {norm:.2f} clipped to {FL_CONFIG['MAX_WEIGHT_NORM']}")
         
-        del aggregated_delta
-        gc.collect()
+        if engram_accumulator:
+            log.info(f"🧠 Updating {len(engram_accumulator)} engram buckets")
+            for idx, (val_sum, weight_sum) in engram_accumulator.items():
+                if weight_sum > 0:
+                    avg_val = val_sum / weight_sum
+                    start_p = idx * MODEL_CONFIG["dim"]
+                    end_p = start_p + MODEL_CONFIG["dim"]
+                    global_engram_weights[start_p:end_p] += avg_val * FL_CONFIG["SERVER_LR"]
+            del engram_accumulator
+            gc.collect()
+        with stats_lock:
+            global_step += 1
         
-        all_indices = []
-        all_values = []
-        token_weights = []
-        
-        for sub in submissions:
-            if sub.get("engram_indices") is not None and len(sub["engram_indices"]) > 0:
-                all_indices.append(sub["engram_indices"])
-                all_values.append(sub["engram_values"])
-                token_weights.append(sub.get("tokensProcessed", 0) / total_tokens)
-                
-        if all_indices:
-            indices_t = torch.from_numpy(np.concatenate(all_indices).astype(np.int64))
-            
-            weighted_values = []
-            for vals, w in zip(all_values, token_weights):
-                weighted_values.append(vals * w)
-            values_t = torch.cat(weighted_values, dim=0)
-            del all_indices, all_values, weighted_values, token_weights
-            gc.collect()
-            
-            unique_buckets = torch.unique(indices_t)
-            
-            engram_update = torch.zeros(ENG_PARAMS, dtype=torch.bfloat16)
-            bucket_indices = indices_t * MODEL_CONFIG["dim"]
-            dim_offsets = torch.arange(MODEL_CONFIG["dim"], dtype=torch.int64)
-            flat_indices = (bucket_indices.unsqueeze(1) + dim_offsets.unsqueeze(0)).flatten()
-            values_flat = values_t.flatten()
-            
-            engram_update.scatter_add_(0, flat_indices, values_flat)
-            del flat_indices, values_flat, bucket_indices, dim_offsets, indices_t, values_t
-            gc.collect()
-            
-            tensor_indices = (unique_buckets * MODEL_CONFIG["dim"]).unsqueeze(1) + torch.arange(MODEL_CONFIG["dim"])
-            tensor_indices = tensor_indices.flatten().to(torch.long)
-            
-            agg_values = engram_update[tensor_indices]
-            del engram_update
-            gc.collect()
-            
-            current_vals = global_engram_weights[tensor_indices]
-            current_vals.mul_(1.0 - FL_CONFIG["WEIGHT_DECAY"])
-            current_vals.add_(agg_values, alpha=FL_CONFIG["SERVER_LR"])
-            global_engram_weights[tensor_indices] = current_vals
-            
-            num_buckets = len(unique_buckets)
-            del tensor_indices, agg_values, current_vals, unique_buckets
-            gc.collect()
-            
-            log.info(f"🧠 Engram updated: {num_buckets} buckets modified (token-weighted)")
-        
-        global_step += 1
     
-    avg_loss = sum(s["loss"] * s.get("tokensProcessed", 0) for s in submissions if s.get("loss")) / max(total_tokens, 1)
-    log.info(f"✅ Aggregated step {global_step} from {len(submissions)} clients (tokens={total_tokens:,}, avg_loss={avg_loss:.4f})")
+    avg_loss = sum(m.get("loss", 0) * m.get("tokensProcessed", 0) for _, m in all_metadata if m.get("loss")) / max(total_tokens, 1)
+    log.info(f"✅ Aggregated step {global_step} from {len(all_metadata)} submissions (tokens={total_tokens:,}, avg_loss={avg_loss:.4f})")
+    
     handle_checkpoints()
     gc.collect()
 
@@ -1099,10 +1317,17 @@ async def register(request: Request):
             if u.get("email", "").lower() == email.lower(): raise HTTPException(400, "Email registered")
         user_uuid = str(uuid.uuid4())
         salt = secrets.token_hex(16)
-        users_db["users"][user_uuid] = {"uuid": user_uuid, "username": username, "username_lower": username.lower(), "email": email, "password_hash": hash_password(password, salt), "salt": salt, "created_at": datetime.now(timezone.utc).isoformat(), "stats": {"contributions": 0, "totalTokens": 0, "totalSteps": 0}}
-        users_db["tokens"][generate_token()] = user_uuid
+        token = generate_token()
+        users_db["users"][user_uuid] = {
+            "uuid": user_uuid, "username": username, "username_lower": username.lower(),
+            "email": email, "password_hash": hash_password(password, salt), "salt": salt,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "stats": {"contributions": 0, "totalTokens": 0, "totalSteps": 0}
+        }
+        users_db["tokens"][token] = user_uuid
         save_users_db()
-    return {"token": generate_token(), "uuid": user_uuid, "username": username}
+        log.info(f"✅ New user registered: {username} ({user_uuid[:8]}...)")
+    return {"token": token, "uuid": user_uuid, "username": username}
 
 @app.post("/auth/login")
 async def auth_login(request: Request):
@@ -1112,17 +1337,28 @@ async def auth_login(request: Request):
         user = next((u for u in users_db["users"].values() if u["username_lower"] == username.lower()), None)
         if not user: raise HTTPException(401, "Invalid credentials")
         if hash_password(password, user["salt"]) != user["password_hash"]: raise HTTPException(401, "Invalid credentials")
+        user_uuid = user["uuid"]
+        
+        # 🚨 FIX: Removed old_tokens deletion. Allows multiple devices/sessions to stay logged in.
         token = generate_token()
-        users_db["tokens"][token] = user["uuid"]
+        users_db["tokens"][token] = user_uuid
         save_users_db()
+        log.info(f"✅ User logged in: {username}")
     return {"token": token, "uuid": user["uuid"], "username": user["username"]}
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
     user = get_current_user(request)
-    if not user: raise HTTPException(401, "Unauthorized")
-    return {"uuid": user["uuid"], "username": user["username"], "email": user.get("email"), "stats": user["stats"], "trustScore": compute_trust_score(user["stats"]), "globalRank": compute_global_rank(user["uuid"])}
-
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return {
+        "uuid": user["uuid"], 
+        "username": user["username"], 
+        "email": user.get("email"), 
+        "stats": user["stats"], 
+        "trustScore": compute_trust_score(user["stats"]), 
+        "globalRank": compute_global_rank(user["uuid"])
+    }
 # ============ ADMIN ROUTES ============
 @app.get("/api/checkpoints")
 async def list_checkpoints(secret: str = ""):
@@ -1145,11 +1381,11 @@ async def reload_checkpoint(step: int = -1, secret: str = ""):
         if not cp_file.exists(): raise HTTPException(404, "Not found")
         buf = np.fromfile(cp_file, dtype=np.float32)
         if len(buf) != MODEL_SIZE: raise HTTPException(400, "Size mismatch")
-        global_weights = torch.from_numpy(buf.copy()).to(torch.bfloat16)
+        global_weights = torch.from_numpy(buf.copy())
         cp_eng_file = CHECKPOINT_DIR / f"engram_step_{step}.bin"
         if cp_eng_file.exists():
             buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
-            if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy()).to(torch.bfloat16)
+            if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
         global_step = step
     save_latest_checkpoint(); update_and_save_status()
     return {"status": "reloaded", "step": global_step}
@@ -1167,8 +1403,8 @@ async def admin_reset(secret: str = ""):
     global global_weights, global_engram_weights, global_step, global_stats, lora_stats
     if secret != ADMIN_SECRET: raise HTTPException(403, "Invalid secret")
     torch.manual_seed(42)
-    global_weights = (torch.randn(MODEL_SIZE) * 0.02).to(torch.bfloat16)
-    global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).to(torch.bfloat16)
+    global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
+    global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
     global_step = 0
     global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
     lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
@@ -1229,8 +1465,8 @@ async def reset_weights(secret: str = ""):
     if secret != ADMIN_SECRET: raise HTTPException(403, "Invalid secret")
     global global_weights, global_engram_weights, global_step, global_stats, lora_stats
     torch.manual_seed(42)
-    global_weights = (torch.randn(MODEL_SIZE) * 0.02).to(torch.bfloat16)
-    global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).to(torch.bfloat16)
+    global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
+    global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
     global_step = 0
     global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
     lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
@@ -1249,13 +1485,22 @@ async def startup():
     initialize_dataset()
     round_state["round_start_time"] = time.time()
     round_state["current_round"] = global_step + 1
+    
+    try:
+        for f in DELTA_TEMP_DIR.glob("*.bin"):
+            f.unlink()
+        log.info("🧹 Cleared old pending delta files.")
+    except Exception: pass
+
     bootstrap_huggingface()
     update_and_save_status()
     
     log.info("="*60)
     log.info(f"🚀 CrowdGPT Continuous FL Coordinator on port {PORT}")
-    log.info(f"⚡ Mode: CONTINUOUS AGGREGATION (Round duration: {round_state['round_duration_hours']}h)")
-    log.info(f"🧠 RAM Optimizations: Zero-Copy Streaming + Chunked Math + PyTorch Scatter")
+    log.info(f"⚡ Mode: UPLOAD-SAFE CONTINUOUS AGGREGATION (Rolling Window)")
+    log.info(f"⏱️  Server round: {round_state['round_duration_hours']}h | Client target: {ROUND_CONFIG['TARGET_SUBMISSION_HOURS']}h rolling")
+    log.info(f"🧠 RAM Optimizations: Zero-Copy Streaming + Disk-Based Aggregation + Chunked Math")
+    log.info(f"🧮 Master weights: FP32 in-memory accumulation (bf16 only at wire/export boundaries)")
     log.info(f"🛡️  Admin watchdog: active (secret={ADMIN_SECRET[:8]}...)")
     log.info(f"🔄 Initialized round {round_state['current_round']}")
     log.info("="*60)
