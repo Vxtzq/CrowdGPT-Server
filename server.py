@@ -1,3 +1,91 @@
+# ==================================================================
+# VOCAB DIAGNOSTIC — read-only. Remove after diagnosis.
+# ==================================================================
+import os as _dg_os
+import json as _dg_json
+from pathlib import Path as _dg_Path
+
+_DG_BASE = _dg_Path(__file__).resolve().parent
+_DG_CKPT = _DG_BASE / "checkpoints"
+
+# Must match server's MODEL_CONFIG:
+_DG_DIM = 1536
+_DG_N_LAYERS = 24
+_DG_N_HEADS = 16
+_DG_N_KV_HEADS = 4
+_DG_HEAD_DIM = 96
+_DG_MLP_HIDDEN = 2560
+_DG_ENG_BUCKETS = 227865
+
+def _dg_rest_params():
+    d = _DG_DIM; r = 0
+    for _ in range(_DG_N_LAYERS):
+        r += d*2 + d*(_DG_N_HEADS*_DG_HEAD_DIM) + d*(_DG_N_KV_HEADS*_DG_HEAD_DIM)*2 + d*d + d*2
+        r += d*_DG_MLP_HIDDEN*2 + _DG_MLP_HIDDEN*d
+    return r + d*2
+
+_DG_REST = _dg_rest_params()
+_DG_ENG_PARAMS = _DG_ENG_BUCKETS * _DG_DIM
+
+def _dg_vocab_from_params(p):
+    v = (p - _DG_REST) / _DG_DIM
+    return int(v) if v == int(v) and v > 0 else None
+
+def _dg_log(msg): print(f"[VOCAB-DIAG] {msg}", flush=True)
+
+_dg_log("=" * 72)
+_dg_log(f"rest_params (non-vocab)     = {_DG_REST:,}")
+_dg_log(f"engram_params               = {_DG_ENG_PARAMS:,}")
+_dg_log(f"fp32 bytes @151643          = {(_DG_REST + 151643*_DG_DIM)*4:,}")
+_dg_log(f"fp32 bytes @151669          = {(_DG_REST + 151669*_DG_DIM)*4:,}")
+_dg_log("=" * 72)
+
+def _dg_check(path, is_engram=False):
+    if not path.exists():
+        _dg_log(f"MISSING: {path.name}")
+        return
+    b = path.stat().st_size
+    _dg_log(f"{path.name}: {b:,} bytes")
+    if is_engram:
+        if b == _DG_ENG_PARAMS * 4:
+            _dg_log(f"  -> fp32 engram OK")
+        elif b == _DG_ENG_PARAMS * 2:
+            _dg_log(f"  -> bf16 engram OK")
+        else:
+            _dg_log(f"  -> UNEXPECTED (fp32={_DG_ENG_PARAMS*4:,}, bf16={_DG_ENG_PARAMS*2:,})")
+        return
+    for db, lbl in ((4, "fp32"), (2, "bf16")):
+        if b % db: continue
+        v = _dg_vocab_from_params(b // db)
+        if v is not None:
+            tag = "OK" if v == 151669 else "STALE — needs migration"
+            _dg_log(f"  -> {lbl}, inferred vocab = {v}  [{tag}]")
+            return
+    _dg_log("  -> cannot infer vocab from size")
+
+if _DG_CKPT.exists():
+    _dg_log("-- latest --")
+    _dg_check(_DG_CKPT / "model_latest.bin")
+    _dg_check(_DG_CKPT / "engram_latest.bin", is_engram=True)
+    _dg_log("-- step checkpoints --")
+    for f in sorted(_DG_CKPT.glob("model_step_*.bin")):
+        _dg_check(f)
+    for f in sorted(_DG_CKPT.glob("engram_step_*.bin")):
+        _dg_check(f, is_engram=True)
+    gs = _DG_CKPT / "global_state.json"
+    if gs.exists():
+        try:
+            j = _dg_json.loads(gs.read_text())
+            _dg_log(f"global_state.json: modelSize={j.get('modelSize')}, "
+                    f"stored vocab={j.get('modelConfig', {}).get('vocabSize')}")
+        except Exception as e:
+            _dg_log(f"global_state parse error: {e}")
+else:
+    _dg_log(f"checkpoint dir not found: {_DG_CKPT}")
+
+_dg_log("=" * 72)
+# ==================================================================
+
 #!/usr/bin/env python3
 """
 CrowdGPT Server - Continuous FL Coordinator
@@ -105,12 +193,12 @@ print(f"🌐 Container local IP: {local_ip}")
 print(f"🌐 Listening on: 0.0.0.0:{PORT}")
 print("=" * 60)
 
-HF_TOKEN = os.getenv("HF_TOKEN", "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")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = "crowdgpt-admin-9f3k2m8x"
+ADMIN_SECRET = "Put An Admin Secret Here"
 
 HF_WEIGHT_FILES = [
     "model_bf16.safetensors",
@@ -157,7 +245,7 @@ LORA_CONFIG = {
 
 DATASET_CONFIG = {
     "repoId": DATASET_REPO_ID,
-    "totalChunks": 260,
+    "totalChunks": 5482,
     "subChunkMB": 10,
     "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1,
     "tokenBytes": 4,
@@ -365,9 +453,7 @@ users_lock = threading.Lock()
 stats_lock = threading.Lock()
 
 BAD_WORDS = [
-    "fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt", "bastard", "damn", "piss", "crap", "twat",
-    "nigger", "nigga", "faggot", "fag", "retard", "tranny", "whore", "slut", "rape", "pedo", "nazi", "hitler",
-    "porn", "xxx", "hentai", "admin", "administrator", "root", "system", "moderator", "mod", "staff", "official"
+    "very bad words go here"
 ]
 
 
