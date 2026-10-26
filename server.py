@@ -416,9 +416,7 @@ users_lock = threading.Lock()
 stats_lock = threading.Lock()
 
 BAD_WORDS = [
-    "fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt", "bastard", "damn", "piss", "crap", "twat",
-    "nigger", "nigga", "faggot", "fag", "retard", "tranny", "whore", "slut", "rape", "pedo", "nazi", "hitler",
-    "porn", "xxx", "hentai", "admin", "administrator", "root", "system", "moderator", "mod", "staff", "official"
+    "PUT BAD WORDS HERE TO PREVENT THEIR USAGE IN NAMES"
 ]
 
 
