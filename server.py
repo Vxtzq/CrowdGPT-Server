@@ -64,20 +64,6 @@ _dg_log("=" * 72)
 #!/usr/bin/env python3
 """
 CrowdGPT Server - Continuous FL Coordinator (Matchmaking Pools)
-
-Optimizer:
-  Client: AdamW   Server: SGD + weight decay on token-weighted deltas
-
-Matchmaking:
-  - Clients are grouped into pools of MATCHMAKING["POOL_SIZE"] (default 3),
-    hardware-matched (backend + batch-size bucket).
-  - All clients in a pool train the SAME shard with the SAME seed.
-  - When the pool completes (all submitted or timeout with >=2), deltas are
-    cross-checked pairwise; outliers are rejected; survivors are merged into
-    one weighted delta per pool.
-  - Clients are freed the moment they submit; they can be matched again.
-  - Pool deltas accumulate in `ready_pools` and are merged into the global
-    model at the 4-hour round boundary only.
 """
 
 import os
@@ -119,6 +105,12 @@ import ipaddress
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 try:
     from huggingface_hub import HfApi, login, hf_hub_download, CommitOperationAdd
@@ -183,7 +175,7 @@ HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = "YOUR CROWDGPT SECRET HERE"
+ADMIN_SECRET = "PUT YOUR ADMIN SECRET HERE"
 
 os.environ.setdefault("CROWDGPT_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 
@@ -231,6 +223,29 @@ log.info(f"🧮 SotaGPT size: {MODEL_SIZE:,} params (~{MODEL_SIZE*4/1024/1024:.2
 ENG_NUM_BUCKETS = 227865
 ENG_PARAMS = ENG_NUM_BUCKETS * MODEL_CONFIG["dim"]
 log.info(f"🧠 Engram size: {ENG_PARAMS:,} params (~{ENG_PARAMS*4/1024/1024:.2f} MB FP32)")
+
+
+# ============ MEMORY GUARDS ============
+def _avail_mem_gb() -> float:
+    if _HAS_PSUTIL:
+        return psutil.virtual_memory().available / (1024 ** 3)
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    return 999.0
+
+def _mem_guard(min_gb: float, context: str) -> bool:
+    avail = _avail_mem_gb()
+    if avail < min_gb:
+        log.warning(f"⚠️ Memory guard: '{context}' needs ~{min_gb:.1f} GB, "
+                    f"only {avail:.1f} GB free — SKIPPING")
+        return False
+    log.info(f"✅ Memory guard: '{context}' has {avail:.1f} GB free (need {min_gb:.1f} GB)")
+    return True
 
 
 # ============ QUANTIZATION ============
@@ -356,7 +371,15 @@ FL_CONFIG = {
     "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1,
     "MAX_CHECKPOINTS": int(os.getenv("CROWDGPT_MAX_CHECKPOINTS", "5")),
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
-    "MAX_WEIGHT_NORM": 1000.0, "WEIGHT_DECAY": 0.0001, "SERVER_LR": 1.0,
+
+    # --- Server-side aggregation dynamics ---
+    "SERVER_LR": 0.5,
+    "WEIGHT_DECAY": 0.01,
+    "MAX_WEIGHT_NORM": 500.0,
+    "MAX_DELTA_APPLY_NORM": 1.0,
+    "LR_DECAY_STEPS": 50_000,
+    "MIN_LR_MULT": 0.05,
+
     "IP_TIMEOUT_S": 900, "SHARD_TIMEOUT_S": 1800, "CLEANUP_INTERVAL_S": 60,
     "SHUFFLE_CHUNKS": True,
 }
@@ -433,7 +456,7 @@ CROSS_CHECK = {
     "TARGET_BATCH_SIZE": _env_int("CROWDGPT_TARGET_BATCH_SIZE", 2),
     "TARGET_ACCUM_STEPS": _env_int("CROWDGPT_TARGET_ACCUM_STEPS", 32),
     "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 500),
-    "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "bf16").strip().lower(),
+    "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "any").strip().lower(),
     "DISTANCE_THRESHOLD_RATIO": _env_float("CROWDGPT_CROSS_CHECK_THRESHOLD", 2.0),
     "BAN_THRESHOLD": _env_int("CROWDGPT_BYZANTINE_BAN_THRESHOLD", 3),
 }
@@ -451,7 +474,10 @@ MATCHMAKING = {
     "POOL_SIZE":         _env_int("CROWDGPT_POOL_SIZE", 3),
     "POOL_TIMEOUT_S":    _env_int("CROWDGPT_POOL_TIMEOUT_S", 4 * 60 * 60),
     "FORMING_TIMEOUT_S": _env_int("CROWDGPT_FORMING_TIMEOUT_S", 30 * 60),
-    "HW_BS_TOLERANCE":   _env_float("CROWDGPT_HW_BS_TOLERANCE", 2.0),
+    "HW_BS_TOLERANCE":   _env_float("CROWDGPT_HW_BS_TOLERANCE", 1.0),
+    "TIER0_ENABLED": os.getenv("CROWDGPT_TIER0", "1") == "1",
+    "TIER1_ENABLED": os.getenv("CROWDGPT_TIER1", "1") == "1",
+    "TIER2_ENABLED": os.getenv("CROWDGPT_TIER2", "1") == "1",
 }
 if MATCHMAKING["POOL_SIZE"] < 2:
     MATCHMAKING["POOL_SIZE"] = 2
@@ -468,11 +494,12 @@ client_last_submit: Dict[str, float] = {}
 upload_slots = threading.BoundedSemaphore(max(1, HARDEN["MAX_CONCURRENT_UPLOADS"]))
 _commit_lock = threading.Lock()
 shard_lock = threading.RLock()
+_cross_check_lock = threading.Lock()
 
 # ============ MATCHMAKING STATE ============
-pools: Dict[str, dict] = {}           # pool_id -> pool dict
-client_pool_map: Dict[str, str] = {}  # client_key -> pool_id
-ready_pools: List[dict] = []          # completed pools queued for round-end merge
+pools: Dict[str, dict] = {}
+client_pool_map: Dict[str, str] = {}
+ready_pools: List[dict] = []
 pool_lock = threading.RLock()
 
 
@@ -482,7 +509,7 @@ users_lock = threading.Lock()
 stats_lock = threading.Lock()
 
 BAD_WORDS = [
-    "PUT BAD WORDS HERE"
+    "PUT BAD WORDS HERE TO PREVENT MALCIOUS CLIENT NAMES"
 ]
 
 
@@ -613,6 +640,53 @@ def _banned_reason(request: Request) -> Optional[str]:
         if _is_user_banned(uid): return f"account suspended ({uid})"
     if is_blacklisted(get_client_ip(request)): return "subnet temporarily blacklisted"
     return None
+
+
+# ============ MINIMUM CLIENT VERSION ============
+MIN_CLIENT_VERSION_FILE = CHECKPOINT_DIR / "min_client_version.json"
+_min_client_version = ""
+_block_unversioned = os.getenv("CROWDGPT_BLOCK_UNVERSIONED", "0") == "1"
+
+
+def _vtuple(v) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v).strip().split("-")[0].split(".")[:4])
+    except Exception:
+        return ()
+
+
+def _load_min_client_version() -> str:
+    try:
+        return str(json.loads(MIN_CLIENT_VERSION_FILE.read_text()).get("min", "")) if MIN_CLIENT_VERSION_FILE.exists() else ""
+    except Exception:
+        return ""
+
+
+def _set_min_client_version(v: str) -> None:
+    global _min_client_version
+    _min_client_version = v
+    tmp = MIN_CLIENT_VERSION_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"min": v, "set_at": time.time()})); os.replace(tmp, MIN_CLIENT_VERSION_FILE)
+
+
+_min_client_version = _load_min_client_version()
+
+
+def _version_gate(request: Request):
+    if not _min_client_version:
+        return None
+    hdr = request.headers.get("X-Client-Version")
+    if hdr is None:
+        if not _block_unversioned: return None
+        cv = (0,)
+    else:
+        cv = _vtuple(hdr)
+        if not cv: cv = (0,)
+    if cv >= _vtuple(_min_client_version):
+        return None
+    return Response(content=json.dumps({"status": "update_required", "minVersion": _min_client_version,
+                                        "message": f"Client {hdr or 'unknown'} is too old; update to {_min_client_version}+"}).encode(),
+                    status_code=426, media_type="application/json", headers={"X-Status": "update"})
 
 
 # ============ SUBNET HELPERS ============
@@ -813,28 +887,51 @@ def _active_client_count() -> int:
     return sum(1 for ts in active_clients.values() if now - ts < FL_CONFIG["IP_TIMEOUT_S"])
 
 
-# ============ MATCHMAKING ENGINE ============
+# ============ MATCHMAKING ENGINE (v1.8 tiered) ============
 def _hw_signature(client_key: str) -> tuple:
     hw = client_hardware.get(client_key) or {}
-    backend = (hw.get("backend") or "?").upper()
-    bs = int(hw.get("bs") or 0)
-    bucket = (1 << (bs.bit_length() - 1)) if bs > 0 else 0
-    return (backend, bucket)
+    backend  = (hw.get("backend")  or "?").upper()
+    bs       = int(hw.get("bs") or 0)
+    bucket   = (1 << (bs.bit_length() - 1)) if bs > 0 else 0
+    autocast = (hw.get("autocast") or "any").lower()
+    optim    = (hw.get("optim")    or "any").lower()
+    return (backend, bucket, autocast, optim)
 
 
-def _pools_compatible(a: tuple, b: tuple) -> bool:
+def _pools_compatible(a: tuple, b: tuple, tier: int = 0) -> bool:
     if a[0] and b[0] and a[0] != "?" and b[0] != "?" and a[0] != b[0]:
         return False
-    ba, bb = a[1], b[1]
-    if ba > 0 and bb > 0:
-        tol = MATCHMAKING["HW_BS_TOLERANCE"]
-        if ba > tol * bb or bb > tol * ba:
+    if tier <= 1:
+        if a[2] != "any" and b[2] != "any" and a[2] != b[2]:
+            return False
+    if tier == 0:
+        if a[3] != "any" and b[3] != "any" and a[3] != b[3]:
             return False
     return True
 
 
+def _pool_target_autocast(pool: dict) -> str:
+    precisions: set = set()
+    has_unknown = False
+    for c in pool["clients"]:
+        hw = client_hardware.get(c) or {}
+        ac = (hw.get("autocast") or "any").lower()
+        if ac in ("bf16", "fp32"):
+            precisions.add(ac)
+        else:
+            has_unknown = True
+
+    if len(precisions) == 1 and not has_unknown:
+        return precisions.pop()
+    if len(precisions) == 2:
+        log.warning(f"⚠️ Pool {pool['pool_id']} is mixed precision ({sorted(precisions)}) — forcing fp32")
+        return "fp32"
+    if len(precisions) == 1:
+        return precisions.pop()
+    return "any"
+
+
 def _activate_pool(pool: dict):
-    """Called with pool_lock held. Allocates a chunk + task for the pool."""
     global current_data_shard
     with shard_lock:
         if not dataset_info["initialized"]:
@@ -848,24 +945,43 @@ def _activate_pool(pool: dict):
     task_id = f"round_{round_state['current_round']}_{pool_id}"
     target_seed = _cohort_seed(pool_id)
 
+    BASE_STEPS = 500
+    slowest_client = min(
+        pool["clients"],
+        key=lambda c: client_hardware.get(c, {}).get("vram_gb", 100.0)
+    )
+    hw = client_hardware.get(slowest_client, {})
+    vram_gb = hw.get("vram_gb", 8.0)
+    client_bs = max(1, hw.get("bs", 1))
+    hw_multiplier = max(0.25, vram_gb / 8.0)
+    scaled_steps = int(BASE_STEPS * hw_multiplier)
+    target_steps = max(100, min(2500, scaled_steps))
+
+    pool_autocast = _pool_target_autocast(pool)
+    pool["target_autocast"] = pool_autocast
+
+    log.info(f"⚙️ Pool {pool_id} pacing: Slowest VRAM={vram_gb:.1f}GB, bs={client_bs} → "
+             f"targetLocalSteps={target_steps} (~1 hour target); targetAutocast={pool_autocast}")
+
     pool.update({
         "status": "training",
         "chunk_idx": chunk_idx,
         "task_id": task_id,
         "target_seed": target_seed,
         "activated_at": time.time(),
+        "target_steps": target_steps,
     })
 
     db["tasks"][task_id] = {
         "poolId": pool_id, "shardId": pool_id, "chunkIdx": chunk_idx,
         "round": round_state["current_round"],
-        "createdAt": int(time.time() * 1000),      # ← THE FIX
-        "poolClients": list(pool["clients"]),      # ← for ban_user + diagnostics
+        "createdAt": int(time.time() * 1000),
+        "poolClients": list(pool["clients"]),
         "targetSeed": target_seed,
-        "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
+        "targetLocalSteps": target_steps,
         "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
-        "targetAutocast": CROSS_CHECK["TARGET_AUTOCAST"],
+        "targetAutocast": pool_autocast,
     }
 
     with shard_lock:
@@ -878,11 +994,11 @@ def _activate_pool(pool: dict):
         })
 
     log.info(f"🎯 Pool {pool_id} activated → chunk {chunk_idx}, "
-             f"{len(pool['clients'])} clients, seed {target_seed}")
+             f"{len(pool['clients'])} clients, seed {target_seed}, "
+             f"steps={target_steps}, autocast={pool_autocast}")
 
 
 def _matchmake(client_key: str) -> dict:
-    """Returns the client's pool (may be 'forming' or 'training')."""
     hw_sig = _hw_signature(client_key)
     with pool_lock:
         pid = client_pool_map.get(client_key)
@@ -892,25 +1008,38 @@ def _matchmake(client_key: str) -> dict:
                     and pool["status"] in ("forming", "training")
                     and pool.get("round", round_state["current_round"]) == round_state["current_round"]):
                 return pool
-            # Stale pool from a previous round — release and re-match fresh
             client_pool_map.pop(client_key, None)
 
+        enabled_tiers = []
+        if MATCHMAKING.get("TIER0_ENABLED", True): enabled_tiers.append(0)
+        if MATCHMAKING.get("TIER1_ENABLED", True): enabled_tiers.append(1)
+        if MATCHMAKING.get("TIER2_ENABLED", True): enabled_tiers.append(2)
+
         best = None
-        for pool in pools.values():
-            if pool["status"] != "forming":
-                continue
-            if len(pool["clients"]) >= MATCHMAKING["POOL_SIZE"]:
-                continue
-            if not _pools_compatible(hw_sig, pool["hardware_sig"]):
-                continue
-            if best is None or len(pool["clients"]) > len(best["clients"]):
-                best = pool
+        best_tier = None
+        for tier in enabled_tiers:
+            for pool in pools.values():
+                if pool["status"] != "forming":
+                    continue
+                if len(pool["clients"]) >= MATCHMAKING["POOL_SIZE"]:
+                    continue
+                if not _pools_compatible(hw_sig, pool["hardware_sig"], tier=tier):
+                    continue
+                if best is None or len(pool["clients"]) > len(best["clients"]):
+                    best = pool
+                    best_tier = tier
+            if best is not None:
+                break
 
         if best is not None:
             best["clients"].append(client_key)
             best["last_activity"] = time.time()
             client_pool_map[client_key] = best["pool_id"]
-            if len(best["clients"]) >= MATCHMAKING["POOL_SIZE"]:
+            n = len(best["clients"])
+            log.info(f"👥 {client_key} → pool {best['pool_id']} "
+                     f"({n}/{MATCHMAKING['POOL_SIZE']}, tier={best_tier}, "
+                     f"backend={hw_sig[0]}, autocast={hw_sig[2]}, optim={hw_sig[3]})")
+            if n >= MATCHMAKING["POOL_SIZE"]:
                 _activate_pool(best)
             return best
 
@@ -925,11 +1054,15 @@ def _matchmake(client_key: str) -> dict:
             "chunk_idx": None,
             "task_id": None,
             "target_seed": None,
+            "target_autocast": None,
             "round": round_state["current_round"],
             "deltas": {},
         }
         pools[pool_id] = new_pool
         client_pool_map[client_key] = pool_id
+        log.info(f"🆕 {client_key} → NEW pool {pool_id} "
+                 f"(backend={hw_sig[0]}, bs_bucket={hw_sig[1]}, "
+                 f"autocast={hw_sig[2]}, optim={hw_sig[3]})")
         return new_pool
 
 
@@ -954,7 +1087,7 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
         "shardConfig": {
             "shardId": pool["pool_id"],
             "slot": pool["clients"].index(client_key),
-            "total": MATCHMAKING["POOL_SIZE"],
+            "total": len(pool["clients"]),
         },
         "roundConfig": {
             "maxHours": round_state["round_duration_hours"],
@@ -962,19 +1095,20 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
         },
         "crossCheck": {
             "enabled": True,
-            "cohortSize": MATCHMAKING["POOL_SIZE"],
+            "cohortSize": len(pool["clients"]),
             "cohortPosition": pool["clients"].index(client_key),
             "targetSeed": pool["target_seed"],
-            "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
+            "targetLocalSteps": pool.get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
             "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
-            "targetAutocast": CROSS_CHECK["TARGET_AUTOCAST"],
+            "targetAutocast": pool.get("target_autocast") or CROSS_CHECK["TARGET_AUTOCAST"],
             "harmonizeMode": "strict" if CROSS_CHECK["TARGET_BATCH_SIZE"] > 0 else "per_client_bs",
             "instruction": (
                 "Train on the assigned shard with EXACTLY: "
                 "seed=targetSeed, micro_steps=targetLocalSteps, "
                 "batch_size=min(your_max_bs, targetBatchSize), "
-                "accum_steps=targetAccumSteps, autocast=targetAutocast."
+                "accum_steps=targetAccumSteps, autocast=targetAutocast. "
+                "A targetAutocast of 'fp32' means disable AMP even if your backend supports it."
             ),
         },
     }
@@ -1013,13 +1147,10 @@ def _maybe_complete_pool(pool: dict) -> bool:
     n = len(pool["deltas"])
     age = time.time() - pool.get("activated_at", time.time())
     timed_out = age > MATCHMAKING["POOL_TIMEOUT_S"]
-    if n >= MATCHMAKING["POOL_SIZE"]:
+    if n >= len(pool["clients"]):
         pool["status"] = "completing"
         return True
     if timed_out and n >= 1:
-        # Accept 1 or 2 survivors on timeout. Cross-check degrades gracefully
-        # (n=1 → trust 1.0, n=2 → 10% divergence gate) — better than throwing
-        # away a legit survivor's GPU hours.
         pool["status"] = "completing"
         return True
     return False
@@ -1032,10 +1163,8 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
         log.warning(f"⚠️ Pool {pool_id}: 0 deltas — nothing to merge")
         return None
     if len(client_paths) == 1:
-        # Solo survivor: accept at weight 1.0, no trust credit (no redundancy).
         log.info(f"📥 Pool {pool_id}: 1 delta (solo, no redundancy, no trust)")
         return [(client_paths[0][1], 1.0)]
-    # ≥2 deltas: fall through to normal cross-check path
 
     paths = [p for _, p in client_paths]
 
@@ -1049,7 +1178,20 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
         total = sum(toks) or len(toks)
         return list(zip(paths, [t / total for t in toks]))
 
-    kept, weights, flagged, discarded = _cross_check_cohort(paths, MODEL_SIZE)
+    with _cross_check_lock:
+        if not _mem_guard(0.8, f"pool {pool_id} cross-check"):
+            log.warning(f"⚠️ Pool {pool_id}: skipping cross-check under memory pressure — "
+                        f"falling back to token-weight merge")
+            toks = []
+            for p in paths:
+                try:
+                    df = open_delta(p, MODEL_SIZE); toks.append(max(1, df.tokens)); del df
+                except Exception:
+                    toks.append(1)
+            total = sum(toks) or len(toks)
+            return list(zip(paths, [t / total for t in toks]))
+
+        kept, weights, flagged, discarded = _cross_check_cohort(paths, MODEL_SIZE)
 
     for fp in flagged:
         _flag_byzantine_from_delta(fp, f"cross-check outlier in pool {pool_id}")
@@ -1069,7 +1211,7 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
     if not kept:
         return None
 
-    if len(paths) >= MATCHMAKING["POOL_SIZE"]:
+    if len(paths) >= 3:
         for kp in kept:
             try:
                 with open(kp, 'rb') as f:
@@ -1127,21 +1269,25 @@ def _pool_cleanup_tick():
                 age = now - pool.get("created_at", now)
                 alive = [c for c in pool["clients"]
                          if now - active_clients.get(c, 0) < FL_CONFIG["IP_TIMEOUT_S"]]
-                # Prune dead members
                 if len(alive) != len(pool["clients"]):
                     for c in pool["clients"]:
                         if c not in alive and client_pool_map.get(c) == pid:
                             client_pool_map.pop(c, None)
                     pool["clients"] = alive
-                # Dissolve under-filled pools past forming timeout so a lone
-                # straggler can't hold a slot forever
-                if age > MATCHMAKING["FORMING_TIMEOUT_S"] and len(alive) < MATCHMAKING["POOL_SIZE"]:
-                    log.info(f"🧹 Dissolving under-filled forming pool {pid} "
-                             f"(age={age:.0f}s, alive={len(alive)})")
-                    for c in pool["clients"]:
-                        if client_pool_map.get(c) == pid:
-                            client_pool_map.pop(c, None)
-                    pools.pop(pid, None)
+
+                if age > MATCHMAKING["FORMING_TIMEOUT_S"]:
+                    if len(alive) >= 2:
+                        log.info(f"⏱️ Activating {len(alive)}-client pool {pid} "
+                                 f"(forming timeout reached, could not fill to "
+                                 f"{MATCHMAKING['POOL_SIZE']})")
+                        _activate_pool(pool)
+                    elif len(alive) == 1:
+                        log.info(f"🧹 Dissolving solo forming pool {pid} "
+                                 f"(age={age:.0f}s, alive=1)")
+                        for c in pool["clients"]:
+                            if client_pool_map.get(c) == pid:
+                                client_pool_map.pop(c, None)
+                        pools.pop(pid, None)
             elif pool["status"] == "training":
                 age = now - pool.get("activated_at", now)
                 n_deltas = len(pool["deltas"])
@@ -1355,12 +1501,20 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                 log.info(f"🤗 Uploading to HF (attempt {attempt}/{retries})")
                 api = HfApi(token=HF_TOKEN)
                 temp_dir = Path(tempfile.mkdtemp(prefix="hf_upload_", dir=str(CHECKPOINT_DIR)))
-                for fn, dtype in (("model_bf16.safetensors", torch.bfloat16), ("model_fp32.safetensors", torch.float32),
-                                  ("engram_bf16.safetensors", torch.bfloat16), ("engram_fp32.safetensors", torch.float32)):
+
+                _save_fp32 = _avail_mem_gb() > 8.0
+                formats = [("model_bf16.safetensors", torch.bfloat16), ("engram_bf16.safetensors", torch.bfloat16)]
+                if _save_fp32:
+                    formats.extend([("model_fp32.safetensors", torch.float32), ("engram_fp32.safetensors", torch.float32)])
+                else:
+                    log.info("⚠️ Skipping FP32 HF uploads to preserve RAM")
+
+                for fn, dtype in formats:
                     src = global_weights if fn.startswith("model_") else global_engram_weights
                     w = src.cpu().to(dtype)
                     save_file({"weights": w}, str(temp_dir / fn))
                     del w; gc.collect()
+
                 config_data = {
                     "architecture": MODEL_CONFIG["architecture"], "vocabSize": MODEL_CONFIG["vocabSize"],
                     "dim": MODEL_CONFIG["dim"], "nLayers": MODEL_CONFIG["nLayers"],
@@ -1393,7 +1547,7 @@ def sync_huggingface_state():
     try:
         api = HfApi(token=HF_TOKEN)
         files = set(api.list_repo_files(HF_REPO_ID, repo_type="model"))
-        required = HF_WEIGHT_FILES + ["model_fp32.safetensors", "engram_fp32.safetensors", "config.json"]
+        required = HF_WEIGHT_FILES + ["config.json"]
         missing = [f for f in required if f not in files]
         if missing:
             log.warning(f"⚠️ Missing HF files: {missing}"); upload_to_huggingface(); return
@@ -1525,6 +1679,15 @@ def emergency_save():
 
 atexit.register(emergency_save)
 
+def _server_lr(step: int) -> float:
+    base = FL_CONFIG["SERVER_LR"]
+    floor = FL_CONFIG.get("MIN_LR_MULT", 0.05)
+    total = FL_CONFIG.get("LR_DECAY_STEPS", 50_000)
+    if total <= 0:
+        return base
+    progress = min(1.0, max(0.0, step / total))
+    mult = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base * mult
 
 # ============ VECTOR MATH ============
 def compute_max_allowed_norm(local_steps, rank=None):
@@ -1726,9 +1889,6 @@ def cleanup_loop():
                 del banned_users[k]
 
         task_timeout_ms = 72 * 60 * 60 * 1000
-        # Tasks without createdAt are treated as freshly-created (defensive:
-        # never delete a task we can't timestamp, because a missing field would
-        # make it look infinitely old and cause "Task expired" 404s on submit).
         expired_tasks = [tid for tid, meta in db["tasks"].items()
                          if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
         for tid in expired_tasks: del db["tasks"][tid]
@@ -1750,6 +1910,10 @@ def cleanup_loop():
 
 
 def _bg_hf_upload_and_status():
+    if not _mem_guard(8.0, "HF weights upload"):
+        log.warning("⚠️ Skipping HF weights upload — memory pressure. "
+                    "Will retry next round or via admin push.")
+        return
     try:
         if upload_to_huggingface(retries=3):
             log.info("✅ HF weights synced (bg)")
@@ -1803,17 +1967,13 @@ def round_watchdog():
 
             if should_end_round:
                 try:
-                    # Force-complete any still-training pools with >= 2 deltas
                     to_force = []
                     with pool_lock:
                         for pool in pools.values():
                             if pool["status"] == "training" and len(pool["deltas"]) >= 1:
                                 pool["status"] = "completing"
                                 to_force.append(pool)
-                        # Clear any still-forming pools (clients get re-matched next round)
-                        # Clear forming pools AND training pools that never
-                        # gathered enough deltas — otherwise their clients would
-                        # keep retraining a stale task for up to 45 minutes.
+
                         for pid in list(pools.keys()):
                             pool = pools[pid]
                             should_drop = (
@@ -1830,10 +1990,9 @@ def round_watchdog():
                                 pools.pop(pid, None)
                     for p in to_force:
                         log.info(f"⏱️ Force-completing pool {p['pool_id']} "
-                                 f"({len(p['deltas'])}/{MATCHMAKING['POOL_SIZE']} deltas)")
+                                 f"({len(p['deltas'])}/{len(p['clients'])} deltas)")
                         _complete_pool_sync(p)
 
-                    # Drain ready_pools
                     with pool_lock:
                         ready = list(ready_pools)
                         ready_pools.clear()
@@ -2005,6 +2164,14 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             cc_actual_steps = body.get("actualSteps")
             cc_actual_bs = body.get("actualBatchSize")
 
+            tgt_autocast = task_meta.get("targetAutocast")
+            if tgt_autocast and tgt_autocast != "any" and cc_used:
+                hw = client_hardware.get(client_key) or {}
+                native_ac = (hw.get("autocast") or "any").lower()
+                if native_ac in ("bf16", "fp32") and native_ac != tgt_autocast:
+                    log.info(f"ℹ️ {client_key}: pool forced {tgt_autocast}, client native {native_ac} "
+                             f"(must honor targetAutocast or will be flagged)")
+
             cc_matches_ticket = False
             if cc_used and CROSS_CHECK["ENABLED"]:
                 tgt_steps = task_meta.get("targetLocalSteps")
@@ -2145,7 +2312,6 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if temp_delta_path and os.path.exists(temp_delta_path): os.unlink(temp_delta_path)
             temp_delta_path = None
 
-            # ---- Matchmaking pool submission ----
             submitted_path = None
             pool_for_completion = None
             with pool_lock:
@@ -2173,7 +2339,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 pool["deltas"][client_key] = final_delta_path
                 submitted_path = final_delta_path
                 final_delta_path = None
-                client_pool_map.pop(client_key, None)  # client freed
+                client_pool_map.pop(client_key, None)
 
                 entry = round_state["participating_clients"].get(client_key)
                 if entry is None:
@@ -2187,7 +2353,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     entry["poolId"] = pool_id
 
                 n_sub = len(pool["deltas"])
-                n_need = MATCHMAKING["POOL_SIZE"]
+                n_need = len(pool["clients"])
                 log.info(f"📥 {client_key} → pool {pool_id} "
                          f"({n_sub}/{n_need}, chunk={pool['chunk_idx']}, "
                          f"norm={delta_norm:.2f}, cc={cc_used}, tokens={delta_metadata['tokensProcessed']:,})")
@@ -2331,6 +2497,10 @@ def _log_cross_check_summary():
              f"targetLocalSteps={CROSS_CHECK['TARGET_LOCAL_STEPS']}")
     log.info(f"   → distance threshold={CROSS_CHECK['DISTANCE_THRESHOLD_RATIO']}x (2% absolute floor)")
     log.info(f"   → ban at {CROSS_CHECK['BAN_THRESHOLD']} subnet strikes")
+    log.info(f"   → matching tiers: "
+             f"strict={MATCHMAKING.get('TIER0_ENABLED', True)}, "
+             f"precision={MATCHMAKING.get('TIER1_ENABLED', True)}, "
+             f"backend={MATCHMAKING.get('TIER2_ENABLED', True)}")
 
 
 def process_compressed_payload(compressed_path: str, client_ip: str, client_key: str, request: Request, init_meta: Optional[dict] = None):
@@ -2439,17 +2609,25 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
     _reason = _banned_reason(request)
     if _reason:
         raise HTTPException(status_code=403, detail=_reason)
+    _gate = _version_gate(request)
+    if _gate is not None: return _gate
 
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
     active_clients[client_key] = time.time()
 
     client_hardware[client_key] = {
-        "backend": (request.headers.get("X-Client-Backend") or "").upper(),
-        "bs": int(request.headers.get("X-Client-Batch-Size") or 0),
-        "vram_gb": float(request.headers.get("X-Client-Vram-Gb") or 0.0),
-        "gpu": request.headers.get("X-Client-Gpu-Name") or "",
+        "backend":  (request.headers.get("X-Client-Backend")    or "").upper(),
+        "bs":        int(request.headers.get("X-Client-Batch-Size") or 0),
+        "vram_gb":   float(request.headers.get("X-Client-Vram-Gb")   or 0.0),
+        "gpu":       request.headers.get("X-Client-Gpu-Name")      or "",
+        "autocast": (request.headers.get("X-Client-Autocast")   or "any").lower(),
+        "optim":    (request.headers.get("X-Client-Optim")      or "any").lower(),
     }
+    hw = client_hardware[client_key]
+    log.info(f"📡 /fl/task from {client_key} ({client_ip}) "
+             f"backend={hw['backend']} bs={hw['bs']} vram={hw['vram_gb']:.1f}GB "
+             f"autocast={hw['autocast']} optim={hw['optim']}")
 
     if _free_disk_bytes() < HARDEN["MIN_FREE_DISK_TASK_BYTES"]:
         return Response(content=json.dumps({"status": "wait", "message": "Server storage full"}).encode(),
@@ -2517,6 +2695,8 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
 async def submit_delta(request: Request):
     _reason = _banned_reason(request)
     if _reason: raise HTTPException(status_code=403, detail=_reason)
+    _gate = _version_gate(request)
+    if _gate is not None: return _gate
     if round_state.get("is_aggregating", False):
         raise HTTPException(status_code=503, detail="Server aggregating", headers={"Retry-After": "120"})
 
@@ -2551,6 +2731,8 @@ async def submit_delta(request: Request):
 async def submit_init(request: Request):
     _reason = _banned_reason(request)
     if _reason: raise HTTPException(status_code=403, detail=_reason)
+    _gate = _version_gate(request)
+    if _gate is not None: return _gate
     if round_state.get("is_aggregating", False):
         raise HTTPException(status_code=503, detail="Server aggregating", headers={"Retry-After": "120"})
 
@@ -2861,41 +3043,66 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         log.warning("⚠️ No pool results to aggregate")
         return
 
-    log.info(f"🧮 Merging {len(ready_pool_list)} pool result(s)")
+    lr  = _server_lr(global_step)
+    wd  = FL_CONFIG["WEIGHT_DECAY"]
+    cap = FL_CONFIG["MAX_DELTA_APPLY_NORM"]
+    mxn = FL_CONFIG["MAX_WEIGHT_NORM"]
+
+    log.info(f"🧮 Merging {len(ready_pool_list)} pool result(s) "
+             f"(lr={lr:.4f}, wd={wd}, delta_cap={cap}, max_norm={mxn})")
+
+    if not _mem_guard(1.5, "pool aggregation"):
+        log.error("❌ Skipping aggregation — memory pressure. "
+                  "Round advances WITHOUT model update.")
+        for pool_result in ready_pool_list:
+            for path, _weight in pool_result.get("deltas", []):
+                try: os.remove(path)
+                except Exception: pass
+        return
 
     with shard_lock:
-        global_weights.mul_(1.0 - FL_CONFIG["SERVER_LR"] * FL_CONFIG["WEIGHT_DECAY"])
+        global_weights.mul_(1.0 - lr * wd)
 
     engram_accumulator = {}
     row_lim = HARDEN["ENGRAM_ROW_NORM_MAX"]
     total_applied = 0
     total_tokens = 0
+    clipped_count = 0
 
     for pool_result in ready_pool_list:
         pool_id = pool_result["pool_id"]
         for path, weight in pool_result["deltas"]:
             try:
+                md    = _delta_metadata(path)
+                dnorm = float((md or {}).get("delta_norm", 0.0))
+                scale = (cap / dnorm) if (dnorm > cap > 0) else 1.0
+                if scale < 1.0:
+                    clipped_count += 1
+
                 df = open_delta(path, MODEL_SIZE)
                 if weight > 0:
                     with shard_lock:
                         stream_add_base_delta(global_weights, df,
-                                              FL_CONFIG["SERVER_LR"] * weight)
+                                              lr * weight * scale)
                     eng_idx, eng_val = read_engram_tail(df, MODEL_CONFIG["dim"])
                     if eng_idx is not None and len(eng_idx) > 0:
                         evf = eng_val.float()
-                        rn = evf.norm(dim=1)
-                        ok = torch.isfinite(rn)
-                        scale = torch.where(ok,
-                                            torch.clamp(row_lim / rn.clamp_min(1e-12), max=1.0),
-                                            torch.zeros_like(rn))
-                        evf = torch.where(ok.unsqueeze(1), evf, torch.zeros_like(evf)) * scale.unsqueeze(1)
+                        rn  = evf.norm(dim=1)
+                        ok  = torch.isfinite(rn)
+                        rscale = torch.where(
+                            ok,
+                            torch.clamp(row_lim / rn.clamp_min(1e-12), max=1.0),
+                            torch.zeros_like(rn),
+                        )
+                        evf = (torch.where(ok.unsqueeze(1), evf, torch.zeros_like(evf))
+                               * rscale.unsqueeze(1))
                         for idx, val, okk in zip(eng_idx.tolist(), evf, ok.tolist()):
                             if not okk or not (0 <= idx < ENG_NUM_BUCKETS):
                                 continue
                             if idx not in engram_accumulator:
                                 engram_accumulator[idx] = [
                                     torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0]
-                            engram_accumulator[idx][0] += val * weight
+                            engram_accumulator[idx][0] += val * weight * scale
                             engram_accumulator[idx][1] += weight
                 total_applied += 1
                 total_tokens += df.tokens
@@ -2915,9 +3122,10 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
             norm_sq += torch.sum(chunk * chunk).item()
             del chunk
         norm = math.sqrt(norm_sq)
-        if norm > FL_CONFIG["MAX_WEIGHT_NORM"]:
-            global_weights.mul_(FL_CONFIG["MAX_WEIGHT_NORM"] / norm)
-            log.warning(f"⚠️ Weight norm {norm:.2f} clipped to {FL_CONFIG['MAX_WEIGHT_NORM']}")
+        if norm > mxn:
+            global_weights.mul_(mxn / norm)
+            log.warning(f"⚠️ Weight norm {norm:.2f} clipped to {mxn}")
+
         if engram_accumulator:
             log.info(f"🧠 Updating {len(engram_accumulator)} engram buckets")
             ftw = HARDEN["ENGRAM_FULL_TRUST_WEIGHT"]
@@ -2927,14 +3135,16 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     avg = vs / ws
                     sp = idx * MODEL_CONFIG["dim"]
                     ep = sp + MODEL_CONFIG["dim"]
-                    global_engram_weights[sp:ep] += avg * (FL_CONFIG["SERVER_LR"] * trust)
+                    global_engram_weights[sp:ep] += avg * (lr * trust)
             del engram_accumulator
             gc.collect()
+
         with stats_lock:
             global_step += 1
 
     log.info(f"✅ SGD step {global_step}: applied {total_applied} pool delta(s), "
-             f"tokens={total_tokens:,}, norm={norm:.2f}")
+             f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, "
+             f"clipped={clipped_count}/{total_applied}")
     if HARDEN["LOSS_CHECK_MODE"] == "off":
         handle_checkpoints()
     gc.collect()
@@ -3009,6 +3219,46 @@ async def list_checkpoints(secret: str = ""):
             except Exception: continue
     return {"current_step": global_step, "checkpoints": sorted(checkpoints, key=lambda x: x["step"], reverse=True)}
 
+@app.get("/api/admin/clients")
+async def admin_list_clients(secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    now = time.time()
+    with pool_lock:
+        client_to_pool = {}
+        for pool in pools.values():
+            for c in pool["clients"]:
+                client_to_pool[c] = {
+                    "poolId": pool["pool_id"],
+                    "status": pool["status"],
+                    "poolSize": len(pool["clients"]),
+                    "chunk": pool["chunk_idx"],
+                    "ageS": int(now - pool["created_at"]),
+                }
+        clients = []
+        for ck, last_seen in sorted(active_clients.items(), key=lambda x: -x[1]):
+            age = now - last_seen
+            if age > FL_CONFIG["IP_TIMEOUT_S"]: continue
+            hw = client_hardware.get(ck, {})
+            clients.append({
+                "clientKey": ck,
+                "lastSeenS": int(age),
+                "hardware": {
+                    "backend":  hw.get("backend", "?"),
+                    "bs":       hw.get("bs", 0),
+                    "vram_gb":  hw.get("vram_gb", 0.0),
+                    "gpu":      hw.get("gpu", ""),
+                    "autocast": hw.get("autocast", "any"),
+                    "optim":    hw.get("optim", "any"),
+                },
+                "pool": client_to_pool.get(ck),
+            })
+    return {
+        "now": datetime.now(timezone.utc).isoformat(),
+        "activeClients": len(clients),
+        "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
+        "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
+        "clients": clients,
+    }
 
 @app.get("/api/chunk_state")
 async def chunk_state(secret: str = ""):
@@ -3022,6 +3272,7 @@ async def chunk_state(secret: str = ""):
                 "chunkIdx": p["chunk_idx"],
                 "deltas": len(p["deltas"]),
                 "ageS": int(time.time() - p["created_at"]),
+                "targetAutocast": p.get("target_autocast"),
             }
             for p in pools.values()
         ]
@@ -3184,6 +3435,31 @@ async def admin_cancel_force_round_end(secret: str = ""):
     }
 
 
+@app.post("/api/admin/force_update")
+async def admin_force_update(secret: str = "", min_version: str = "", end_round: bool = True):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if min_version and not _vtuple(min_version):
+        raise HTTPException(400, "min_version must look like 1.9")
+    _set_min_client_version(min_version)
+    ended = "skipped"
+    if end_round:
+        with shard_lock:
+            if round_state.get("is_aggregating"):
+                ended = "already_ending"
+            else:
+                round_state["force_end_at"] = time.time()
+                ended = "scheduled_now"
+    log.warning(f"⬆️ Admin force_update: min_version={min_version or '(none)'} round_end={ended}")
+    return {"status": "ok", "minClientVersion": min_version or None, "roundEnd": ended,
+            "blockUnversioned": _block_unversioned}
+
+
+@app.get("/api/admin/force_update")
+async def admin_force_update_status(secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    return {"minClientVersion": _min_client_version or None, "blockUnversioned": _block_unversioned}
+
+
 def _delta_metadata(path: str) -> Optional[dict]:
     try:
         with open(path, "rb") as f:
@@ -3216,7 +3492,6 @@ async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
                 ban_subnet(ip, f"user {user['username']} banned", hours or 24)
         save_users_db()
     if purge_pending:
-        # Legacy pending list
         with shard_lock:
             kept = []
             for p in round_state["pending_deltas"]:
@@ -3228,7 +3503,6 @@ async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
                 else:
                     kept.append(p)
             round_state["pending_deltas"] = kept
-        # Pools
         with pool_lock:
             for pool in pools.values():
                 for ck in list(pool["deltas"].keys()):
@@ -3400,6 +3674,11 @@ async def get_model_info():
             "poolTimeoutS": MATCHMAKING["POOL_TIMEOUT_S"],
             "formingTimeoutS": MATCHMAKING["FORMING_TIMEOUT_S"],
             "hwBsTolerance": MATCHMAKING["HW_BS_TOLERANCE"],
+            "tiers": {
+                "strict":    MATCHMAKING.get("TIER0_ENABLED", True),
+                "precision": MATCHMAKING.get("TIER1_ENABLED", True),
+                "backend":   MATCHMAKING.get("TIER2_ENABLED", True),
+            },
         },
         "huggingface": {
             "repoId": HF_REPO_ID, "enabled": HF_ENABLED, "revision": current_hf_revision,
@@ -3408,6 +3687,115 @@ async def get_model_info():
         } if HF_ENABLED else {},
     }
 
+@app.post("/api/admin/restore_from_hf")
+async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int = -1):
+    global global_weights, global_engram_weights, global_step
+
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not HF_ENABLED: raise HTTPException(503, "HF disabled")
+    if not revision: raise HTTPException(400, "revision required (commit SHA or tag)")
+
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    hf_cache = CHECKPOINT_DIR / "hf_cache"
+    hf_cache.mkdir(parents=True, exist_ok=True)
+
+    log.warning(f"🔧 Restore-from-HF: revision={revision[:12]} requested_step={step}")
+
+    try:
+        cfg_path = hf_hub_download(
+            repo_id=HF_REPO_ID, filename="config.json",
+            revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache),
+        )
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            hf_cfg = json.load(f)
+        hf_step = int(hf_cfg.get("globalStep", -1))
+        if hf_step < 0: raise ValueError("no globalStep in config.json")
+    except Exception as e:
+        raise HTTPException(500, f"config.json at {revision}: {e}")
+
+    if step < 0: step = hf_step
+    elif step != hf_step:
+        log.warning(f"⚠️ Requested step={step} but config.json says {hf_step}; using requested")
+
+    try:
+        st_path = hf_hub_download(
+            repo_id=HF_REPO_ID, filename="model_bf16.safetensors",
+            revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache),
+        )
+        tensors = load_file(st_path)
+        if "weights" not in tensors:
+            raise ValueError(f"no 'weights' key; keys={list(tensors.keys())[:5]}")
+        w = tensors["weights"]
+        if w.numel() != MODEL_SIZE:
+            raise ValueError(f"numel mismatch: {w.numel():,} vs {MODEL_SIZE:,}")
+        arr = w.float().numpy().astype(np.float32)
+        del w, tensors; gc.collect()
+    except Exception as e:
+        raise HTTPException(500, f"weights at {revision}: {e}")
+
+    step_bin = CHECKPOINT_DIR / f"model_step_{step}.bin"
+    tmp = step_bin.with_suffix('.bin.tmp')
+    try:
+        with open(tmp, 'wb') as f:
+            for i in range(0, len(arr), 10_000_000):
+                arr[i:i + 10_000_000].tofile(f)
+        os.replace(tmp, step_bin)
+        log.info(f"💾 Wrote {step_bin} ({step_bin.stat().st_size / 1024**2:.1f} MB)")
+    except Exception as e:
+        try: tmp.unlink(missing_ok=True)
+        except: pass
+        raise HTTPException(500, f"write .bin: {e}")
+
+    try:
+        new_w = np.fromfile(step_bin, dtype=np.float32)
+        if len(new_w) != MODEL_SIZE:
+            raise ValueError(f"size {len(new_w):,} != {MODEL_SIZE:,}")
+        with shard_lock:
+            global_weights = torch.from_numpy(new_w.copy())
+            with stats_lock:
+                global_step = step
+        log.warning(f"🔧 global_weights ← step {step} (revision {revision[:12]})")
+    finally:
+        del arr; gc.collect()
+
+    try:
+        eng_path = hf_hub_download(
+            repo_id=HF_REPO_ID, filename="engram_bf16.safetensors",
+            revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache),
+        )
+        et = load_file(eng_path)
+        if "weights" in et:
+            ew = et["weights"]
+            if ew.numel() == ENG_PARAMS:
+                with shard_lock:
+                    global_engram_weights = ew.float().cpu()
+                step_eng = CHECKPOINT_DIR / f"engram_step_{step}.bin"
+                tmp_e = step_eng.with_suffix('.bin.tmp')
+                with open(tmp_e, 'wb') as f:
+                    for i in range(0, ENG_PARAMS, 10_000_000):
+                        global_engram_weights[i:i+10_000_000].float().numpy().astype(np.float32).tofile(f)
+                os.replace(tmp_e, step_eng)
+                log.info(f"🧠 Restored engram step {step}")
+    except Exception as e:
+        log.warning(f"⚠️ Engram restore skipped: {e}")
+
+    save_latest_checkpoint()
+    pushed = upload_to_huggingface()
+    try: update_and_save_status(push_hf=True)
+    except Exception as e: log.error(f"status: {e}")
+
+    wte_norm = float(
+        global_weights[:MODEL_CONFIG["vocabSize"] * MODEL_CONFIG["dim"]].float().norm().item()
+    )
+    return {
+        "status": "restored", "revision": revision,
+        "step": step, "hf_step": hf_step,
+        "model_size": MODEL_SIZE,
+        "wte_norm": wte_norm,
+        "pushed_to_hf": pushed,
+    }
 
 # ============ STARTUP ============
 @app.on_event("startup")
@@ -3446,7 +3834,7 @@ async def startup():
     update_and_save_status(push_hf=True)
 
     log.info("=" * 60)
-    log.info(f"🚀 CrowdGPT Coordinator on port {PORT} (Matchmaking Pools)")
+    log.info(f"🚀 CrowdGPT Coordinator on port {PORT} (Matchmaking Pools) [v1.8]")
     log.info(f"⏱️  Round: {round_state['round_duration_hours']}h")
     log.info(f"🎲 Shuffle: {FL_CONFIG['SHUFFLE_CHUNKS']} | epoch={data_position['epoch']} | "
              f"pos={data_position['permutationPos']}/{len(data_position['permutation'])}")
@@ -3462,4 +3850,17 @@ async def startup():
 
 if __name__ == "__main__":
     import uvicorn
+
+    from logging.handlers import RotatingFileHandler
+    log_file = BASE_DIR / "server.log"
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=50 * 1024 * 1024, backupCount=5
+    )
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    logging.getLogger().addHandler(file_handler)
+    logging.getLogger().setLevel(logging.INFO)
+
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=False)
