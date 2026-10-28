@@ -2380,12 +2380,28 @@ app.add_middleware(
 )
 
 
+def _task_alive_for(task_id: str, client_key: str) -> bool:
+    """True while task_id belongs to a training pool this client is a member of."""
+    meta = db["tasks"].get(task_id)
+    if not meta or meta.get("round") != round_state["current_round"]:
+        return False
+    with pool_lock:
+        pool = pools.get(meta.get("poolId"))
+        return bool(pool) and pool["status"] == "training" and client_key in pool["clients"]
+
+
 @app.get("/fl/heartbeat")
-async def heartbeat(request: Request):
+async def heartbeat(request: Request, taskId: Optional[str] = None):
     if _banned_reason(request):
         return Response(content='{"status":"blocked"}', media_type="application/json")
-    active_clients[get_client_key(request)] = time.time()
-    return Response(content='{"status":"ok"}', media_type="application/json")
+    client_key = get_client_key(request)
+    active_clients[client_key] = time.time()
+    if not taskId:
+        return Response(content='{"status":"ok"}', media_type="application/json")
+    # Lets a training client stop early when its task is gone (e.g. after a
+    # server restart) instead of finding out at upload time.
+    task = "active" if _task_alive_for(taskId, client_key) else "gone"
+    return Response(content=json.dumps({"status": "ok", "task": task}), media_type="application/json")
 
 
 @app.get("/fl/round_status")
