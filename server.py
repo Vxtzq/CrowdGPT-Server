@@ -170,7 +170,7 @@ HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = ""
+ADMIN_SECRET = "PUT A SECRET HERE"
 os.environ.setdefault("CROWDGPT_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 HF_WEIGHT_FILES = ["model_bf16.safetensors", "engram_bf16.safetensors"]
 
@@ -555,21 +555,47 @@ def get_client_ip(request: Request) -> str:
                 except Exception: continue
     return request.client.host if request.client else "unknown"
 
+# ============ v2.4: MULTI-DEVICE ============
+# A single account can run training on multiple devices. Each device sends a
+# stable X-Client-Device header (persisted client-side as device_id.json). The
+# server keys every per-client dict on "user:<uuid>:dev:<device>" so two
+# devices are treated as distinct training clients (separate pools, separate
+# delta slots, separate quotas, separate hardware sigs). User-level operations
+# (bans, flags, trust credit, token accounting) still key on the bare UUID.
+_DEVICE_ID_RE = re.compile(r'[^A-Za-z0-9_-]')
+
+def _sanitize_device_id(raw: Optional[str]) -> Optional[str]:
+    if not raw: return None
+    s = _DEVICE_ID_RE.sub('', str(raw))[:32]
+    return s or None
+
+def _user_id_from_key(client_key: str) -> Optional[str]:
+    """Extract user UUID from 'user:<uuid>' or 'user:<uuid>:dev:<device>'.
+    Returns None for 'ip:<ip>' or anything else."""
+    if not client_key or not client_key.startswith("user:"):
+        return None
+    rest = client_key[5:]
+    if ":dev:" in rest:
+        return rest.split(":dev:", 1)[0] or None
+    return rest or None
+
 def get_client_key(request: Request) -> str:
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
         with users_lock:
             user_uuid = users_db["tokens"].get(token)
-            if user_uuid: return f"user:{user_uuid}"
+            if user_uuid:
+                dev = _sanitize_device_id(request.headers.get("X-Client-Device"))
+                return f"user:{user_uuid}:dev:{dev}" if dev else f"user:{user_uuid}"
+    # Anonymous clients stay ip-keyed — no device suffix, keeps NAT ambiguity intact
     return f"ip:{get_client_ip(request)}"
 
 def _banned_reason(request: Request) -> Optional[str]:
     ck = get_client_key(request)
     if _is_client_banned(ck): return f"client banned ({ck})"
-    if ck.startswith("user:"):
-        uid = ck.replace("user:", "")
-        if _is_user_banned(uid): return f"account suspended ({uid})"
+    uid = _user_id_from_key(ck)
+    if uid and _is_user_banned(uid): return f"account suspended ({uid})"
     if is_blacklisted(get_client_ip(request)): return "subnet temporarily blacklisted"
     return None
 
@@ -625,7 +651,7 @@ def ban_subnet(ip: str, reason: str, hours: int = 24):
 def _flag_byzantine(client_key: str, client_ip: str, reason: str):
     log.warning(f"🚩 BYZANTINE FLAG: {client_key} ({client_ip}) — {reason}")
     with users_lock:
-        uid = client_key.replace("user:", "") if client_key.startswith("user:") else None
+        uid = _user_id_from_key(client_key)
         if uid and uid in users_db["users"]:
             u = users_db["users"][uid]
             u["stats"]["byzantine_flags"] = u["stats"].get("byzantine_flags", 0) + 1
@@ -938,7 +964,77 @@ def _activate_pool(pool: dict):
     log.info(f"🎯 Pool {pool_id} activated → chunk {chunk_idx}, {len(pool['clients'])} clients, "
              f"seed {target_seed}, steps={target_steps}, autocast={pool_autocast}")
 
-def _matchmake(client_key: str) -> dict:
+# ============ POWER USERS ============
+# Admin-designated accounts (see /api/admin/power_user).  They behave exactly like everybody else when a pool is
+# available, but never have to wait for peers: with no suitable pool they train SOLO immediately and can submit
+# back-to-back.  Solo deltas skip the cohort cross-check (there is nobody to compare with), so they are fenced:
+#   * only logged-in accounts can be power users (never anonymous ip: clients),
+#   * the usual submit-time checks still apply (finite, norm clamp, token clamp, ban/quota),
+#   * the aggregation re-checks norms, clips, and the loss ratchet can still roll everything back,
+#   * ALL solo power deltas of a round are merged into ONE pseudo-pool, so however often a power user submits,
+#     the group counts once, scaled by POWER_SOLO_WEIGHT (default 0.5 = half a cross-checked pool).
+POWER = {
+    "SOLO_WEIGHT": min(1.0, max(0.05, _env_float("CROWDGPT_POWER_SOLO_WEIGHT", 0.5))),
+    "SOLO_ENABLED": os.getenv("CROWDGPT_POWER_SOLO_ENABLED", "1") == "1",
+    # 1 (default): a power user joins ANY compatible forming pool that already has someone in it.
+    # 0: only join a pool that their arrival completes; otherwise train solo right away (never waits).
+    "JOIN_ANY_POOL": os.getenv("CROWDGPT_POWER_JOIN_ANY_POOL", "1") == "1",
+}
+POWER_POOL_ID = "power_solo"
+
+def _is_power_client(client_key: str) -> bool:
+    uid = _user_id_from_key(client_key)
+    if not uid: return False
+    with users_lock:
+        u = users_db["users"].get(uid)
+        return bool(u and u.get("power"))
+
+def _power_solo_start(client_key: str, pool: dict) -> dict:
+    """Called under pool_lock. A power user alone in a forming pool starts training right now."""
+    if (POWER["SOLO_ENABLED"] and pool["status"] == "forming"
+            and pool["clients"] == [client_key] and pools.get(pool["pool_id"]) is pool):
+        pool["power"] = True
+        log.info(f"⚡ {client_key}: power user, no pool available → training solo in {pool['pool_id']}")
+        _activate_pool(pool)
+    return pool
+
+def _run_power_solo_check(pool: dict) -> Optional[list]:
+    """Solo pool of a power user: no cohort to compare with, so only sanity checks."""
+    pool_id = pool["pool_id"]
+    items = list(pool["deltas"].items())
+    survivors = []
+    for ck, path in items:
+        if _compute_norm_server(path, MODEL_SIZE) <= 0:      # 0.0 == unreadable / NaN / Inf
+            log.warning(f"🚫 Power solo {ck}: delta unreadable or non-finite — discarded")
+            try: os.remove(path)
+            except Exception: pass
+            continue
+        survivors.append((ck, path))
+        uid = _user_id_from_key(ck)
+        if uid:
+            with users_lock:
+                u = users_db["users"].get(uid)
+                if u:
+                    u["stats"]["contributions"] = u["stats"].get("contributions", 0) + 1
+                    save_users_db()
+    if not survivors: return None
+    log.info(f"⚡ Pool {pool_id}: power solo delta accepted (no cohort cross-check)")
+    return [(p, 1.0) for _, p in survivors]
+
+def _merge_power_solo(pool: dict, survivors: list):
+    """Fold solo power deltas into the single shared 'power_solo' entry of ready_pools (call under pool_lock)."""
+    entry = next((e for e in ready_pools if e.get("pool_id") == POWER_POOL_ID), None)
+    if entry is None:
+        entry = {"pool_id": POWER_POOL_ID, "chunk_idx": pool.get("chunk_idx"), "deltas": [], "_tokens": {}}
+        ready_pools.append(entry)
+    for path, _w in survivors:
+        try: tok = max(1, int(open_delta(path, MODEL_SIZE).tokens))
+        except Exception: tok = 1
+        entry["_tokens"][path] = tok
+    total = sum(entry["_tokens"].values()) or 1
+    entry["deltas"] = [(p, POWER["SOLO_WEIGHT"] * t / total) for p, t in entry["_tokens"].items()]
+
+def _matchmake(client_key: str, power: bool = False) -> dict:
     """Strict matching, FP32-first, with solo-pool re-matching (v2.3).
 
     Locked states:
@@ -981,6 +1077,8 @@ def _matchmake(client_key: str) -> dict:
             if pool["status"] != "forming": continue
             if len(pool["clients"]) >= MATCHMAKING["POOL_SIZE"]: continue
             if not _pools_compatible(hw_sig, pool["hardware_sig"]): continue
+            # optional strict mode: power users only join a pool that their arrival completes
+            if power and not POWER["JOIN_ANY_POOL"] and len(pool["clients"]) + 1 < MATCHMAKING["POOL_SIZE"]: continue
             candidates.append(pool)
 
         best = None
@@ -1090,6 +1188,8 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
     pool_id = pool["pool_id"]
     client_paths = list(pool["deltas"].items())
 
+    if pool.get("power") and len(pool["clients"]) == 1:
+        return _run_power_solo_check(pool)
     # ── Mandatory: need 2+ deltas ──
     if len(client_paths) < 2:
         log.warning(f"🚫 Pool {pool_id}: {len(client_paths)} delta(s) — cross-check MANDATORY, DISCARDING all")
@@ -1131,8 +1231,8 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
                 ml = struct.unpack('<I', f.read(4))[0]
                 md = json.loads(f.read(ml).decode('utf-8'))
             nk = md.get("nodeKey", "")
-            if nk.startswith("user:"):
-                uid = nk.replace("user:", "")
+            uid = _user_id_from_key(nk)
+            if uid:
                 with users_lock:
                     u = users_db["users"].get(uid)
                     if u:
@@ -1149,7 +1249,9 @@ def _complete_pool_sync(pool: dict):
     try:
         survivors = _run_pool_cross_check(pool)
         with pool_lock:
-            if survivors:
+            if survivors and pool.get("power") and len(pool["clients"]) == 1:
+                _merge_power_solo(pool, survivors)
+            elif survivors:
                 ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
             pools.pop(pool_id, None)
     except Exception as e:
@@ -1435,7 +1537,8 @@ def update_and_save_status(push_hf: bool = True):
             "totalTokens": u["stats"].get("totalTokens", 0),
             "totalSteps": u["stats"].get("totalSteps", 0),
             "trustScore": compute_trust_score(u["stats"]),
-            "byzantineFlags": u["stats"].get("byzantine_flags", 0)} for u in users_db["users"].values()]
+            "byzantineFlags": u["stats"].get("byzantine_flags", 0),
+            "power": bool(u.get("power", False))} for u in users_db["users"].values()]
     leaderboard_sorted = sorted(users_list, key=lambda x: x["totalTokens"], reverse=True)
     with pool_lock:
         mm_snapshot = {"poolSize": MATCHMAKING["POOL_SIZE"], "activePools": len(pools),
@@ -2527,7 +2630,11 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
         wait_time = int(ROUND_CONFIG["AGGREGATION_COOLDOWN_SEC"] - (time.time() - round_state["last_aggregation_time"]))
         return Response(content=json.dumps({"status": "wait", "message": f"Aggregating, wait {wait_time}s"}).encode(),
                         media_type="application/json", headers={"X-Status": "wait"})
-    pool = _matchmake(client_key)
+    if _is_power_client(client_key):
+        with pool_lock:      # atomic: nobody can slip into the pool between creation and solo activation
+            pool = _power_solo_start(client_key, _matchmake(client_key, power=True))
+    else:
+        pool = _matchmake(client_key)
     if pool["status"] == "forming":
         return Response(
             content=json.dumps({"status": "wait",
@@ -2843,6 +2950,7 @@ async def admin_list_clients(secret: str = ""):
                     "arch": _gpu_arch_class(hw.get("gpu") or ""),
                     "card": _gpu_card_class(hw.get("gpu") or ""),
                     "force_fp32": _force_fp32_arch(hw.get("gpu") or "")},
+                "power": _is_power_client(ck),
                 "pool": client_to_pool.get(ck)})
     return {"now": datetime.now(timezone.utc).isoformat(), "activeClients": len(clients),
         "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
@@ -2954,7 +3062,7 @@ async def admin_loss_ratchet(secret: str = "", mode: str = ""):
 async def admin_clear_byzantine(secret: str = "", client_key: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if client_key:
-        uid = client_key.replace("user:", "") if client_key.startswith("user:") else None
+        uid = _user_id_from_key(client_key)
         if uid:
             with users_lock:
                 if uid in users_db["users"]:
@@ -3055,6 +3163,44 @@ def _delta_metadata(path: str) -> Optional[dict]:
             return json.loads(f.read(n))
     except Exception: return None
 
+def _find_user_uuid(user_id: str = "", username: str = "") -> Optional[str]:
+    if user_id and user_id in users_db["users"]: return user_id
+    if username:
+        for u in users_db["users"].values():
+            if u.get("username_lower") == username.lower(): return u["uuid"]
+    return None
+
+@app.post("/api/admin/power_user")
+async def admin_power_user(secret: str = "", user_id: str = "", username: str = "",
+                           enabled: bool = True, note: str = ""):
+    """Make an account a power user (enabled=true, default) or remove it (enabled=false).
+    Identify the account by user_id (uuid) or username."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not user_id and not username: raise HTTPException(400, "user_id or username required")
+    with users_lock:
+        uid = _find_user_uuid(user_id, username)
+        if not uid: raise HTTPException(404, "User not found")
+        u = users_db["users"][uid]
+        if enabled:
+            u["power"] = True; u["power_since"] = datetime.now(timezone.utc).isoformat()
+            if note: u["power_note"] = note[:200]
+        else:
+            u.pop("power", None); u.pop("power_since", None); u.pop("power_note", None)
+        save_users_db()
+        name = u["username"]
+    log.warning(f"⚡ Admin {'granted' if enabled else 'removed'} power user: {name} ({uid})")
+    try: update_and_save_status(push_hf=False)       # refresh leaderboard.json so the shield shows up
+    except Exception as e: log.error(f"status refresh after power_user: {e}")
+    return {"status": "power_enabled" if enabled else "power_removed", "user_id": uid, "username": name}
+
+@app.get("/api/admin/power_users")
+async def admin_list_power_users(secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    with users_lock:
+        out = [{"user_id": u["uuid"], "username": u["username"], "since": u.get("power_since"),
+                "note": u.get("power_note", "")} for u in users_db["users"].values() if u.get("power")]
+    return {"count": len(out), "soloWeight": POWER["SOLO_WEIGHT"], "soloEnabled": POWER["SOLO_ENABLED"], "joinAnyPool": POWER["JOIN_ANY_POOL"], "powerUsers": out}
+
 @app.post("/api/admin/ban_user")
 async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
     hours: int = 0, ban_ip: bool = False, purge_pending: bool = True):
@@ -3078,7 +3224,7 @@ async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
             kept = []
             for p in round_state["pending_deltas"]:
                 m = _delta_metadata(p)
-                if m and m.get("nodeKey") == f"user:{user_id}":
+                if m and _user_id_from_key(m.get("nodeKey", "")) == user_id:
                     try: os.remove(p)
                     except Exception: pass
                     purged += 1
@@ -3087,7 +3233,7 @@ async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
         with pool_lock:
             for pool in pools.values():
                 for ck in list(pool["deltas"].keys()):
-                    if ck == f"user:{user_id}":
+                    if _user_id_from_key(ck) == user_id:
                         try: os.remove(pool["deltas"][ck])
                         except Exception: pass
                         del pool["deltas"][ck]
@@ -3200,7 +3346,8 @@ async def get_leaderboard():
             "totalTokens": u["stats"].get("totalTokens", 0),
             "totalSteps": u["stats"].get("totalSteps", 0),
             "trustScore": compute_trust_score(u["stats"]),
-            "byzantineFlags": u["stats"].get("byzantine_flags", 0)} for u in users_db["users"].values()]
+            "byzantineFlags": u["stats"].get("byzantine_flags", 0),
+            "power": bool(u.get("power", False))} for u in users_db["users"].values()]
     return sorted(users_list, key=lambda x: x["totalTokens"], reverse=True)
 
 @app.get("/api/checkpoint")
