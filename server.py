@@ -2,7 +2,7 @@
 """
 CrowdGPT Server - Continuous FL Coordinator (Matchmaking Pools)
 
-v2.3 — strict pooling, mandatory cross-check, FP32-first, solo-pool re-matching:
+v2.4 - Public logs + Better optimization + strict pooling, mandatory cross-check, FP32-first, solo-pool re-matching:
   - Pools require EXACT backend match.
   - Optimizer matching normalizes aliases (adamw32/adamw_fp32/adamw → adamw_fp32,
     adamw8/adamw_8bit/8bit → adamw8bit) and allows fp32/8bit AdamW to mix
@@ -130,6 +130,7 @@ def read_exact(file_obj, num_bytes):
     return bytes(data)
 
 from krum_stream import plan_round, stream_add_base_delta, read_engram_tail, open_delta, streaming_pairwise_sq_l2
+from public_log import PUB   # public event log + loss history
 
 # ============ CONFIGURATION ============
 PORT = 5006
@@ -463,8 +464,9 @@ pool_lock = threading.RLock()
 # ============ AUTH ============
 users_db = {"users": {}, "tokens": {}}
 users_lock = threading.Lock()
+PUB.resolver = lambda uid: (users_db["users"].get(uid) or {}).get("username")
 stats_lock = threading.Lock()
-BAD_WORDS = ["PUT BAD WORDS HERE TO PREVENT BAD USERNAMES"]
+BAD_WORDS = ["PUT BAD WORDS HERE"]
 
 def load_users_db():
     global users_db
@@ -644,11 +646,13 @@ def is_blacklisted(ip: str) -> bool:
         del blacklisted_subnets[subnet]
     return False
 def ban_subnet(ip: str, reason: str, hours: int = 24):
+    PUB.event("subnet_ban", hours=hours, reason=reason)
     subnet = get_subnet(ip)
     blacklisted_subnets[subnet] = time.time() + hours * 3600
     log.warning(f"🔨 BANNED {subnet} for {hours}h — {reason}")
 
 def _flag_byzantine(client_key: str, client_ip: str, reason: str):
+    PUB.event("flag", user=PUB.who(client_key), reason=reason)
     log.warning(f"🚩 BYZANTINE FLAG: {client_key} ({client_ip}) — {reason}")
     with users_lock:
         uid = _user_id_from_key(client_key)
@@ -961,6 +965,7 @@ def _activate_pool(pool: dict):
         current_data_shard.update({"chunkIdx": chunk_idx, "shardId": pool_id,
             "assignedClients": list(pool["clients"]), "createdAt": int(time.time() * 1000),
             "round": round_state["current_round"], "consumed": False})
+    PUB.event("pool_start", pool=pool_id, clients=len(pool["clients"]), chunk=chunk_idx, steps=target_steps, autocast=pool_autocast, power_solo=bool(pool.get("power")))
     log.info(f"🎯 Pool {pool_id} activated → chunk {chunk_idx}, {len(pool['clients'])} clients, "
              f"seed {target_seed}, steps={target_steps}, autocast={pool_autocast}")
 
@@ -1021,8 +1026,117 @@ def _run_power_solo_check(pool: dict) -> Optional[list]:
     log.info(f"⚡ Pool {pool_id}: power solo delta accepted (no cohort cross-check)")
     return [(p, 1.0) for _, p in survivors]
 
+def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_000) -> Optional[str]:
+    """Merge multiple delta files into one weighted-average delta to save disk space."""
+    if len(survivors) <= 1:
+        return survivors[0][0] if survivors else None
+    merged_path = str(DELTA_TEMP_DIR / f"merged_{pool_id}_{int(time.time()*1000)}.bin")
+    tmp_path = str(DELTA_TEMP_DIR / f"tmp_{pool_id}_{int(time.time()*1000)}.bin")
+    fds = []
+    try:
+        # Open all source files
+        dfs = []
+        for path, _ in survivors:
+            try:
+                f = open(path, 'rb')
+                df = open_delta(path, MODEL_SIZE)
+                fds.append(f)
+                dfs.append(df)
+            except Exception as e:
+                log.error(f"Merge: cannot open {path}: {e}")
+                return None
+        
+        total_tokens = sum(df.tokens for df in dfs)
+        weights = [w for _, w in survivors]
+        wsum = sum(weights)
+        if wsum <= 0: wsum = 1.0
+        weights = [w / wsum for w in weights]
+        
+        norm_sq = 0.0
+        engram_acc = {}
+        
+        with open(tmp_path, 'wb') as out_f:
+            # Merge base delta
+            for offset in range(0, MODEL_SIZE, chunk_size):
+                read_size = min(chunk_size, MODEL_SIZE - offset)
+                sum_chunk = torch.zeros(read_size, dtype=torch.float32)
+                for f, df, w in zip(fds, dfs, weights):
+                    f.seek(df.base_offset + offset * 2)
+                    raw = f.read(read_size * 2)
+                    if len(raw) < read_size * 2:
+                        raise RuntimeError(f"Short read from {df.path}")
+                    arr = torch.from_numpy(np.frombuffer(raw, dtype=np.int16).copy()).view(torch.bfloat16).to(torch.float32)
+                    sum_chunk += arr * w
+                out_f.write(sum_chunk.to(torch.bfloat16).view(torch.uint16).numpy().tobytes())
+                norm_sq += float((sum_chunk * sum_chunk).sum().item())
+            
+            # Merge engram tail
+            for f, df, w in zip(fds, dfs, weights):
+                f.seek(df.base_offset + MODEL_SIZE * 2)
+                eng_count_bytes = f.read(4)
+                if len(eng_count_bytes) < 4: continue
+                eng_count = struct.unpack('<I', eng_count_bytes)[0]
+                if eng_count > 0:
+                    idx_bytes = f.read(eng_count * 4)
+                    val_bytes = f.read(eng_count * MODEL_CONFIG["dim"] * 2)
+                    if len(idx_bytes) < eng_count * 4 or len(val_bytes) < eng_count * MODEL_CONFIG["dim"] * 2:
+                        continue
+                    eng_idx = np.frombuffer(idx_bytes, dtype=np.uint32)
+                    eng_val = torch.frombuffer(bytearray(val_bytes), dtype=torch.uint16).view(torch.bfloat16).reshape(-1, MODEL_CONFIG["dim"]).to(torch.float32)
+                    for idx, val in zip(eng_idx.tolist(), eng_val):
+                        if idx not in engram_acc:
+                            engram_acc[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0]
+                        engram_acc[idx][0] += val * w
+                        engram_acc[idx][1] += w
+            
+            # Write engram tail
+            if engram_acc:
+                indices = sorted(engram_acc.keys())
+                vals = []
+                for idx in indices:
+                    sum_val, sum_w = engram_acc[idx]
+                    avg = sum_val / sum_w if sum_w > 0 else sum_val
+                    vals.append(avg)
+                eng_idx_arr = np.array(indices, dtype=np.uint32)
+                eng_val_arr = torch.stack(vals).to(torch.bfloat16).view(torch.uint16).numpy()
+                out_f.write(struct.pack('<I', len(eng_idx_arr)))
+                out_f.write(eng_idx_arr.tobytes())
+                out_f.write(eng_val_arr.tobytes())
+            else:
+                out_f.write(struct.pack('<I', 0))
+        
+        # Build final file with header
+        norm = math.sqrt(norm_sq)
+        meta = {"delta_norm": norm, "tokensProcessed": total_tokens, "tokens": total_tokens}
+        meta_bytes = json.dumps(meta).encode('utf-8')
+        with open(merged_path, 'wb') as f:
+            f.write(struct.pack('<I', len(meta_bytes)))
+            f.write(meta_bytes)
+            with open(tmp_path, 'rb') as tmp_f:
+                shutil.copyfileobj(tmp_f, f)
+        
+        # Delete originals
+        for path, _ in survivors:
+            try: os.remove(path)
+            except Exception: pass
+        
+        return merged_path
+    except Exception as e:
+        log.error(f"Merge failed for pool {pool_id}: {e}")
+        try:
+            if os.path.exists(tmp_path): os.remove(tmp_path)
+            if os.path.exists(merged_path): os.remove(merged_path)
+        except Exception: pass
+        return None
+    finally:
+        for f in fds:
+            try: f.close()
+            except Exception: pass
+        try:
+            if os.path.exists(tmp_path): os.remove(tmp_path)
+        except Exception: pass
+
 def _merge_power_solo(pool: dict, survivors: list):
-    """Fold solo power deltas into the single shared 'power_solo' entry of ready_pools (call under pool_lock)."""
     entry = next((e for e in ready_pools if e.get("pool_id") == POWER_POOL_ID), None)
     if entry is None:
         entry = {"pool_id": POWER_POOL_ID, "chunk_idx": pool.get("chunk_idx"), "deltas": [], "_tokens": {}}
@@ -1032,8 +1146,19 @@ def _merge_power_solo(pool: dict, survivors: list):
         except Exception: tok = 1
         entry["_tokens"][path] = tok
     total = sum(entry["_tokens"].values()) or 1
-    entry["deltas"] = [(p, POWER["SOLO_WEIGHT"] * t / total) for p, t in entry["_tokens"].items()]
-
+    paths_weights = [(p, POWER["SOLO_WEIGHT"] * t / total) for p, t in entry["_tokens"].items()]
+    total_w = sum(w for _, w in paths_weights)
+    if len(paths_weights) > 1:
+        merged = _merge_pool_deltas(POWER_POOL_ID, paths_weights)
+        if merged:
+            entry["deltas"] = [(merged, total_w)]
+            entry["_tokens"] = {merged: total}
+            log.info(f"📦 Power solo: merged {len(paths_weights)} deltas into 1")
+        else:
+            entry["deltas"] = paths_weights
+    else:
+        entry["deltas"] = paths_weights
+        
 def _matchmake(client_key: str, power: bool = False) -> dict:
     """Strict matching, FP32-first, with solo-pool re-matching (v2.3).
 
@@ -1244,15 +1369,53 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
     log.info(f"✅ Pool {pool_id}: {len(paths)}→{len(kept)} survivor(s), cross-check PASSED")
     return list(zip(kept, weights))
 
+# ============ PUBLIC LOG HELPERS ============
+def _pub_pool_result(pool: dict, survivors) -> None:
+    """Called right after the cross-check, BEFORE the early merge (merged files lose per-client loss)."""
+    try:
+        pid = pool["pool_id"]; n_cl = len(pool["clients"]); n_sub = len(pool.get("deltas", {}))
+        if not survivors:
+            PUB.event("pool_discarded", pool=pid, clients=n_cl, submitted=n_sub, power_solo=bool(pool.get("power")))
+            return
+        samples = []
+        for item in survivors:
+            md = _delta_metadata(item[0]) or {}
+            samples.append((md.get("loss"), md.get("tokensProcessed") or md.get("tokens") or 1))
+        PUB.note_pool_losses(round_state["current_round"], pid, samples, global_step)
+        PUB.event("pool_passed", pool=pid, clients=n_cl, submitted=n_sub, survivors=len(survivors),
+                  power_solo=bool(pool.get("power")))
+    except Exception: pass
+
+def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -> None:
+    try:
+        held = loss_ratchet_state.get("lastAcceptedLoss") if HARDEN["LOSS_CHECK_MODE"] != "off" else None
+        row = PUB.end_round(rnd, global_step, bool(success), heldout=held)
+        PUB.event("round_end", round=rnd, step=global_step, pools=n_pools, applied=bool(success),
+                  rolled_back=bool(loss_rejected), loss=row.get("loss"), heldout=held)
+        PUB.event("round_start", round=rnd + 1, step=global_step)
+        PUB.export_static()
+    except Exception: pass
+
+
 def _complete_pool_sync(pool: dict):
     pool_id = pool["pool_id"]
     try:
         survivors = _run_pool_cross_check(pool)
+        _pub_pool_result(pool, survivors)
         with pool_lock:
             if survivors and pool.get("power") and len(pool["clients"]) == 1:
                 _merge_power_solo(pool, survivors)
             elif survivors:
-                ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
+                if len(survivors) > 1:
+                    merged = _merge_pool_deltas(pool_id, survivors)
+                    if merged:
+                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": [(merged, 1.0)]})
+                        log.info(f"📦 Pool {pool_id}: merged {len(survivors)} deltas into 1")
+                    else:
+                        log.warning(f"⚠️ Pool {pool_id}: merge failed, keeping {len(survivors)} deltas")
+                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
+                else:
+                    ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
             pools.pop(pool_id, None)
     except Exception as e:
         log.error(f"❌ Pool {pool_id} completion failed: {e}")
@@ -1496,6 +1659,7 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                 rev = _extract_commit_sha(commit) or _latest_hf_revision()
                 if rev and _set_hf_revision(rev, global_step):
                     last_hf_upload_time = time.time()
+                    PUB.event("hf_upload", step=global_step)
                     log.info(f"✅ Uploaded to HF at step {global_step}")
                     return True
             except Exception as e:
@@ -1563,6 +1727,7 @@ def update_and_save_status(push_hf: bool = True):
         with open(BASE_DIR / "status.json", 'w', encoding='utf-8') as f: json.dump(status_data, f, indent=2)
         with open(BASE_DIR / "leaderboard.json", 'w', encoding='utf-8') as f: json.dump(leaderboard_sorted, f, indent=2)
     except Exception as e: log.error(f"❌ Failed to save json files: {e}")
+    PUB.export_static()
     if not (push_hf and HF_ENABLED): return
     if not status_upload_lock.acquire(blocking=False): return
     temp_dir = None
@@ -1584,6 +1749,7 @@ def update_and_save_status(push_hf: bool = True):
             CommitOperationAdd(path_in_repo="leaderboard.json", path_or_fileobj=str(temp_dir / "leaderboard.json")),
             CommitOperationAdd(path_in_repo="badge_tokens.json", path_or_fileobj=str(temp_dir / "badge_tokens.json")),
         ]
+        operations += PUB.hf_operations(temp_dir, CommitOperationAdd)
         api.create_commit(repo_id=HF_REPO_ID, repo_type="model", operations=operations,
             commit_message=f"chore: update stats ({badge_data['message']} tokens)")
         log.info("✅ Uploaded status/leaderboard/badge to HF")
@@ -1732,6 +1898,7 @@ def _finish_with_loss_check(step_before: int) -> bool:
     loss_ratchet_state["history"].append({"step": step, "loss": loss, "verdict": verdict, "mode": mode,
                                           "reason": reason, "at": datetime.now(timezone.utc).isoformat()})
     if verdict == "reject" and mode == "enforce":
+        PUB.event("loss_ratchet_reject", step=step, loss=loss, reason=reason)
         log.warning(f"🛑 LOSS RATCHET: step {step} REJECTED; rolling back to {step_before}")
         with shard_lock:
             load_model_weights(); load_engram_weights()
@@ -1892,6 +2059,7 @@ def round_watchdog():
                         round_state["is_aggregating"] = False
                         round_state["force_end_at"] = None
                     if success or loss_rejected: save_dataset_state()
+                    _pub_round_end(current_round_ending, success, loss_rejected, len(ready))
                     log.info(f"🚀 Round {round_state['current_round']} started (step {global_step})")
                     try: update_and_save_status(push_hf=False)
                     except Exception as e: log.error(f"❌ Status write error: {e}")
@@ -2141,6 +2309,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 n_sub = len(pool["deltas"]); n_need = len(pool["clients"])
                 log.info(f"📥 {client_key} → pool {pool_id} ({n_sub}/{n_need}, chunk={pool['chunk_idx']}, "
                          f"norm={delta_norm:.2f}, cc={cc_used}, opt={cc_actual_opt or '?'}, tokens={delta_metadata['tokensProcessed']:,})")
+                PUB.event("submission", user=PUB.who(client_key), tokens=delta_metadata["tokensProcessed"], pool=pool_id, filled=f"{n_sub}/{n_need}", cross_check=bool(cc_used))
                 if _maybe_complete_pool(pool): pool_for_completion = pool
                 client_last_submit[client_key] = time.time()
             if pool_for_completion is not None: _spawn_pool_completion(pool_for_completion)
@@ -2498,6 +2667,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         if pre_norm > 0 and norm > 0:
             ratio = norm / pre_norm
             if ratio < 0.70 or ratio > 1.50:
+                PUB.event("aggregation_reverted", step=step_before, norm_before=pre_norm, norm_after=norm, ratio=ratio)
                 log.error(f"🚨🚨 AGGREGATION SANITY FAIL: norm {pre_norm:.1f} → {norm:.1f} (ratio={ratio:.3f}). Reverting from disk, NOT advancing step.")
                 load_model_weights(); load_engram_weights()
                 with stats_lock: global_step = step_before
@@ -2523,6 +2693,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
             del engram_accumulator
             gc.collect()
         with stats_lock: global_step += 1
+    PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr)
     log.info(f"✅ SGD step {global_step}: applied {total_applied}, rejected {rejected_count}, "
              f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}")
     if HARDEN["LOSS_CHECK_MODE"] == "off": handle_checkpoints()
@@ -3124,6 +3295,7 @@ async def admin_force_round_end(secret: str = "", minutes: float = 0):
         if round_state.get("is_aggregating"): raise HTTPException(409, "Round is already ending — wait for the next round")
         round_state["force_end_at"] = time.time() + minutes * 60
         ends_at, current = round_state["force_end_at"], round_state["current_round"]
+    PUB.event("admin", action="force_round_end", minutes=minutes)
     log.warning(f"⏱️ Admin scheduled end of round {current} in {minutes:.1f} min")
     return {"status": "scheduled", "round": current, "minutes": minutes,
         "endsAt": datetime.fromtimestamp(ends_at, tz=timezone.utc).isoformat()}
@@ -3147,6 +3319,7 @@ async def admin_force_update(secret: str = "", min_version: str = "", end_round:
             else:
                 round_state["force_end_at"] = time.time()
                 ended = "scheduled_now"
+    PUB.event("admin", action="force_update", min_version=min_version or "", round_end=ended)
     log.warning(f"⬆️ Admin force_update: min_version={min_version or '(none)'} round_end={ended}")
     return {"status": "ok", "minClientVersion": min_version or None, "roundEnd": ended,
             "blockUnversioned": _block_unversioned}
@@ -3238,6 +3411,7 @@ async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
                         except Exception: pass
                         del pool["deltas"][ck]
                         purged += 1
+    PUB.event("admin_ban", user=PUB.who(user_id), hours=hours, reason=reason)
     log.warning(f"🔨 Admin banned {user['username']} ({user_id}) for {hours or 'permanent'}h — {reason} (ips={list(ips)}, purged={purged})")
     return {"status": "banned", "user_id": user_id, "username": user["username"],
         "until": datetime.fromtimestamp(until, tz=timezone.utc).isoformat() if until else "permanent",
@@ -3250,6 +3424,7 @@ async def admin_unban_user(secret: str = "", user_id: str = ""):
     with users_lock:
         had = banned_users.pop(user_id, None)
         banned_client_keys.pop(f"user:{user_id}", None)
+    if had: PUB.event("admin_unban", user=PUB.who(user_id))
     return {"status": "unbanned" if had else "not_banned", "user_id": user_id}
 
 @app.post("/api/admin/ban_ip")
@@ -3332,6 +3507,19 @@ async def get_stats(request: Request):
             "uploadIntervalHours": HF_UPLOAD_INTERVAL_HOURS,
             "revision": current_hf_revision, "revisionStep": hf_revision_global_step,
             "directDownloads": bool(_build_hf_weights_metadata("bf16"))} if HF_ENABLED else {}}
+
+# ============ PUBLIC LOG ENDPOINTS (no secret needed, no private data inside) ============
+@app.get("/api/public_log")
+async def api_public_log(limit: int = 200, type: str = "", since: int = 0):
+    return {"events": PUB.tail(limit, type, since)}
+
+@app.get("/api/loss_history")
+async def api_loss_history(rounds: int = 2000, pools: int = 2000):
+    with PUB._lock:
+        r = list(PUB.rounds)[-max(1, min(rounds, 20000)):]
+        p = list(PUB.pools)[-max(1, min(pools, 2000)):]
+    return {"rounds": r, "pools": p, "note": "loss = token-weighted client-reported training loss of cross-checked deltas; "
+            "heldoutLoss (when present) is the server-side evaluator's loss"}
 
 @app.get("/api/leaderboard")
 async def get_leaderboard():
@@ -3494,6 +3682,7 @@ async def startup():
     log.info(f"🔄 Initialized round {round_state['current_round']}")
     _log_hardening_summary()
     _log_cross_check_summary()
+    PUB.event("server_start", step=global_step, round=round_state["current_round"], users=len(users_db["users"]))
     log.info("=" * 60)
 
 if __name__ == "__main__":
