@@ -2,7 +2,7 @@
 """
 CrowdGPT Server - Continuous FL Coordinator (Matchmaking Pools)
 
-v2.4 - Public logs + Better optimization + strict pooling, mandatory cross-check, FP32-first, solo-pool re-matching:
+v2.3 — strict pooling, mandatory cross-check, FP32-first, solo-pool re-matching:
   - Pools require EXACT backend match.
   - Optimizer matching normalizes aliases (adamw32/adamw_fp32/adamw → adamw_fp32,
     adamw8/adamw_8bit/8bit → adamw8bit) and allows fp32/8bit AdamW to mix
@@ -149,13 +149,15 @@ DELTA_TEMP_DIR = CHECKPOINT_DIR / "pending_deltas"
 DELTA_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR = BASE_DIR / "pending_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+WORK_TMP = BASE_DIR / "work_tmp"; WORK_TMP.mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(WORK_TMP)   # NamedTemporaryFile(...) now lands here: swept at startup and by the cleanup loop
 
 MAX_CHUNK_BYTES = 80 * 1024 * 1024
 MAX_DIRECT_BODY_BYTES = 90 * 1024 * 1024
 MAX_TOTAL_UPLOAD_BYTES = 3 * 1024 * 1024 * 1024
 MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_CHUNKS = 512
-UPLOAD_TTL_SECONDS = 6 * 60 * 60
+UPLOAD_TTL_SECONDS = int(os.getenv("CROWDGPT_UPLOAD_TTL_S", "1800"))   # inactivity TTL
 
 import socket
 hostname = socket.gethostname()
@@ -171,7 +173,7 @@ HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = "PUT A SECRET HERE"
+ADMIN_SECRET = "YOUR ADMIN SECRET HERE"
 os.environ.setdefault("CROWDGPT_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 HF_WEIGHT_FILES = ["model_bf16.safetensors", "engram_bf16.safetensors"]
 
@@ -329,7 +331,7 @@ round_state = {"current_round": 1, "round_start_time": time.time(), "round_durat
 
 FL_CONFIG = {
     "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1,
-    "MAX_CHECKPOINTS": int(os.getenv("CROWDGPT_MAX_CHECKPOINTS", "5")),
+    "MAX_CHECKPOINTS": int(os.getenv("CROWDGPT_MAX_CHECKPOINTS", "1")),
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
     "SERVER_LR": 0.5, "WEIGHT_DECAY": 0.01,
     "MAX_WEIGHT_NORM": 10000000000.0,
@@ -377,7 +379,8 @@ HARDEN = {
     "TOKEN_CAP_FACTOR": _env_float("CROWDGPT_TOKEN_CAP_FACTOR", 3.0),
     "DUP_REL_DIST": _env_float("CROWDGPT_DUP_REL_DIST", 0.02),
     "MIN_FREE_DISK_TASK_BYTES": _env_int("CROWDGPT_MIN_FREE_DISK_TASK_BYTES", 10 * 1024**3),
-    "MIN_FREE_DISK_UPLOAD_BYTES": _env_int("CROWDGPT_MIN_FREE_DISK_UPLOAD_BYTES", 2 * 1024**3),
+    "MIN_FREE_DISK_UPLOAD_BYTES": _env_int("CROWDGPT_MIN_FREE_DISK_UPLOAD_BYTES", 4 * 1024**3),
+    "MAX_OPEN_UPLOADS": _env_int("CROWDGPT_MAX_OPEN_UPLOADS", 0),   # 0 = no cap, everyone can upload
     "MAX_CONCURRENT_UPLOADS": _env_int("CROWDGPT_MAX_CONCURRENT_UPLOADS", 2),
     "UPLOAD_SLOT_WAIT_S": _env_int("CROWDGPT_UPLOAD_SLOT_WAIT_S", 800),
     "MAX_PENDING_DELTAS": _env_int("CROWDGPT_MAX_PENDING_DELTAS", 0),
@@ -466,7 +469,7 @@ users_db = {"users": {}, "tokens": {}}
 users_lock = threading.Lock()
 PUB.resolver = lambda uid: (users_db["users"].get(uid) or {}).get("username")
 stats_lock = threading.Lock()
-BAD_WORDS = ["PUT BAD WORDS HERE"]
+BAD_WORDS = ["PUT BAD WORDS HERE TO PREVENT BAD USERNAMES"]
 
 def load_users_db():
     global users_db
@@ -530,6 +533,81 @@ def compute_global_rank(user_uuid: str) -> int:
         for i, u in enumerate(sorted_users):
             if u["uuid"] == user_uuid: return i + 1
     return 0
+def _infer_compute_cap(gpu_name: str, backend: str) -> str:
+    """Fallback cc inference from GPU name when the client doesn't send
+    X-Client-Compute-Cap. Client header (when present) is authoritative."""
+    b = (backend or "").upper()
+    if b == "ROCM": return "gfx_unknown"
+    g = (gpu_name or "").lower().strip()
+    if not g: return ""
+    if any(x in g for x in ("gb10","dgx spark")):                          return "sm_121"
+    if any(x in g for x in ("gb200","b100","b200","grace blackwell")):     return "sm_100"
+    if any(x in g for x in ("5090","5080","5070","5060","5050","rtx 50")): return "sm_120"
+    if any(x in g for x in ("h100","h200","gh200","hopper")):              return "sm_90"
+    if any(x in g for x in ("4090","4080","4070","4060","4050","rtx 40",
+                            "l4 ","l40","rtx 6000 ada")):                  return "sm_89"
+    if "a100" in g:                                                         return "sm_80"
+    if any(x in g for x in ("3090","3080","3070","3060","3050","rtx 30",
+                            "a6000","a5000","a4000","a10g","a10","a30","a40")): return "sm_86"
+    if any(x in g for x in ("2080","2070","2060","rtx 20","t4","titan rtx",
+                            "quadro rtx")):                                 return "sm_75"
+    if "v100" in g:                                                         return "sm_70"
+    if any(x in g for x in ("1080","1070","1060","1050","titan x")):        return "sm_61"
+    return ""
+
+def _compute_cap_for(client_key: str) -> str:
+    return (client_hardware.get(client_key) or {}).get("compute_cap") or ""
+
+def _pool_ccs(pool: dict) -> set:
+    """Distinct compute capabilities across the pool's clients. Empty if unknown."""
+    return {cc for c in pool["clients"] if (cc := _compute_cap_for(c))}
+
+def _parse_bool_header(v) -> Optional[bool]:
+    if v is None: return None
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes"): return True
+    if s in ("0", "false", "no"): return False
+    return None
+
+def _client_opt_caps(client_key: str) -> tuple:
+    """Returns (can_fp32, can_8bit).
+    Preference order:
+      1. Explicit X-Client-Optim-Can-Fp32 / X-Client-Optim-Can-8bit headers (v2.6+)
+      2. Fallback: infer can_8bit from reported native optimizer
+         (can_fp32 is always True — every backend supports torch.optim.AdamW)
+    """
+    hw = client_hardware.get(client_key) or {}
+    can_fp32 = hw.get("optim_can_fp32")
+    can_8bit = hw.get("optim_can_8bit")
+    if can_fp32 is None: can_fp32 = True
+    if can_8bit is None:
+        native = (hw.get("optim") or "").lower()
+        can_8bit = native in ("adamw8bit", "adamw8", "adamw_8bit", "8bit")
+    return bool(can_fp32), bool(can_8bit)
+
+def _norm_opt(s) -> str:
+    s = str(s or "any").lower()
+    if s in ("adamw32", "adamw_fp32", "adamw", "fp32"): return "adamw_fp32"
+    if s in ("adamw8", "adamw_8bit", "8bit", "adamw8bit"): return "adamw8bit"
+    return s
+
+def _pool_target_optimizer(pool: dict) -> str:
+    """Pool-wide optimizer, decided by the WEAKEST LINK.
+    - All members report can_8bit → 'adamw8bit'
+    - Any member reports can_8bit=0 → 'adamw_fp32' (everyone downgrades)
+    - Solo power user → honor native
+
+    The pool activates with one shared optimizer, so every member runs the
+    same algorithm and the cross-check sees the same numerical path.
+    """
+    if pool.get("power") and len(pool["clients"]) == 1:
+        native = _norm_opt((client_hardware.get(pool["clients"][0]) or {}).get("optim"))
+        return "adamw8bit" if native == "adamw8bit" else "adamw_fp32"
+    for c in pool["clients"]:
+        _can_fp32, can_8bit = _client_opt_caps(c)
+        if not can_8bit:
+            return "adamw_fp32"
+    return "adamw8bit"
 
 # ============ CLIENT IDENTITY ============
 def _peer_in_trusted(request: Request) -> bool:
@@ -537,6 +615,8 @@ def _peer_in_trusted(request: Request) -> bool:
     try: a = ipaddress.ip_address(peer)
     except Exception: return False
     return any(a in n for n in HARDEN["TRUSTED_PROXY_NETS"])
+
+
 
 def get_client_ip(request: Request) -> str:
     nets = HARDEN["TRUSTED_PROXY_NETS"]
@@ -854,7 +934,8 @@ def _hw_signature(client_key: str) -> tuple:
     autocast = (hw.get("autocast") or "any").lower()
     optim    = (hw.get("optim")    or "any").lower()
     gpu      = hw.get("gpu") or ""
-    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu))
+    cc       = (hw.get("compute_cap") or "").lower()
+    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc)
 
 def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     """v2.3 ASYMMETRIC matching — backend exact, optimizer normalize+wildcard,
@@ -911,21 +992,20 @@ def _autocast_rank(pool_or_sig) -> int:
     return 2
 
 def _pool_target_autocast(pool: dict) -> str:
-    """Effective training precision for the WHOLE pool.
+    # Power-solo: preserve native autocast (single client, no cohort to match)
+    if pool.get("power") and len(pool["clients"]) == 1:
+        hw = client_hardware.get(pool["clients"][0]) or {}
+        native = (hw.get("autocast") or "any").lower()
+        return native if native in ("bf16", "fp32") else "fp32"
 
-    Use the pool's creation-time autocast (hardware_sig[2]). A bf16 client
-    who later joins an fp32 pool is forced to fp32 via the task payload,
-    and _pool_target_autocast must reflect that."""
-    pool_ac = str((pool["hardware_sig"][2] if len(pool["hardware_sig"]) > 2 else "any") or "any").lower()
-    if pool_ac in ("fp32", "bf16"): return pool_ac
-    # Fallback for "any" / "other": infer from members.
-    precisions: set = set()
-    for c in pool["clients"]:
-        hw = client_hardware.get(c) or {}
-        ac = (hw.get("autocast") or "any").lower()
-        if ac in ("bf16", "fp32"): precisions.add(ac)
-    if len(precisions) == 1: return precisions.pop()
-    return "any"
+    pccs = _pool_ccs(pool)
+    if len(pccs) <= 1:
+        # Homogeneous (or unknown) → use the pool's creation autocast.
+        pool_ac = str((pool["hardware_sig"][2] if len(pool["hardware_sig"]) > 2 else "any") or "any").lower()
+        if pool_ac in ("fp32", "bf16"): return pool_ac
+        return "bf16"   # unknown native → safe default for homogeneous pools
+    # Mixed compute capabilities → fp32 for numerical alignment.
+    return "fp32"
 
 def _activate_pool(pool: dict):
     global current_data_shard
@@ -947,9 +1027,12 @@ def _activate_pool(pool: dict):
     scaled_steps = int(BASE_STEPS * hw_multiplier)
     target_steps = max(100, min(2500, scaled_steps))
     pool_autocast = _pool_target_autocast(pool)
+    pool_optimizer = _pool_target_optimizer(pool)
     pool["target_autocast"] = pool_autocast
+    pool["target_optimizer"] = pool_optimizer
     log.info(f"⚙️ Pool {pool_id} pacing: Slowest VRAM={vram_gb:.1f}GB → "
-             f"targetLocalSteps={target_steps}; targetAutocast={pool_autocast}")
+             f"targetLocalSteps={target_steps}; targetAutocast={pool_autocast}; "
+             f"targetOptimizer={pool_optimizer}")
     pool.update({"status": "training", "chunk_idx": chunk_idx, "task_id": task_id,
         "target_seed": target_seed, "activated_at": time.time(), "target_steps": target_steps})
     db["tasks"][task_id] = {
@@ -959,7 +1042,7 @@ def _activate_pool(pool: dict):
         "targetLocalSteps": target_steps, "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
         "targetAutocast": pool_autocast,
-        "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"],
+        "targetOptimizer": pool_optimizer,
     }
     with shard_lock:
         current_data_shard.update({"chunkIdx": chunk_idx, "shardId": pool_id,
@@ -967,7 +1050,8 @@ def _activate_pool(pool: dict):
             "round": round_state["current_round"], "consumed": False})
     PUB.event("pool_start", pool=pool_id, clients=len(pool["clients"]), chunk=chunk_idx, steps=target_steps, autocast=pool_autocast, power_solo=bool(pool.get("power")))
     log.info(f"🎯 Pool {pool_id} activated → chunk {chunk_idx}, {len(pool['clients'])} clients, "
-             f"seed {target_seed}, steps={target_steps}, autocast={pool_autocast}")
+             f"seed {target_seed}, steps={target_steps}, "
+             f"autocast={pool_autocast}, optimizer={pool_optimizer}")
 
 # ============ POWER USERS ============
 # Admin-designated accounts (see /api/admin/power_user).  They behave exactly like everybody else when a pool is
@@ -1026,15 +1110,24 @@ def _run_power_solo_check(pool: dict) -> Optional[list]:
     log.info(f"⚡ Pool {pool_id}: power solo delta accepted (no cohort cross-check)")
     return [(p, 1.0) for _, p in survivors]
 
+_merge_lock = threading.Lock()      # one merge at a time: the extra disk needed is bounded to ONE merged delta
+_MERGE_META_PAD = 512               # fixed-size header, rewritten in place at the end (no second copy of the file)
+
+def _merge_meta_bytes(meta: dict) -> bytes:
+    b = json.dumps(meta).encode("utf-8")
+    return b + b" " * (_MERGE_META_PAD - len(b))     # JSON tolerates trailing spaces
+
 def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_000) -> Optional[str]:
     """Merge multiple delta files into one weighted-average delta to save disk space."""
     if len(survivors) <= 1:
         return survivors[0][0] if survivors else None
+    with _merge_lock:
+        return _merge_pool_deltas_locked(pool_id, survivors, chunk_size)
+
+def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) -> Optional[str]:
     merged_path = str(DELTA_TEMP_DIR / f"merged_{pool_id}_{int(time.time()*1000)}.bin")
-    tmp_path = str(DELTA_TEMP_DIR / f"tmp_{pool_id}_{int(time.time()*1000)}.bin")
     fds = []
     try:
-        # Open all source files
         dfs = []
         for path, _ in survivors:
             try:
@@ -1045,18 +1138,16 @@ def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_0
             except Exception as e:
                 log.error(f"Merge: cannot open {path}: {e}")
                 return None
-        
         total_tokens = sum(df.tokens for df in dfs)
         weights = [w for _, w in survivors]
         wsum = sum(weights)
         if wsum <= 0: wsum = 1.0
         weights = [w / wsum for w in weights]
-        
         norm_sq = 0.0
         engram_acc = {}
-        
-        with open(tmp_path, 'wb') as out_f:
-            # Merge base delta
+        with open(merged_path, 'wb') as out_f:
+            out_f.write(struct.pack('<I', _MERGE_META_PAD))
+            out_f.write(_merge_meta_bytes({"delta_norm": 0.0, "tokensProcessed": total_tokens, "tokens": total_tokens}))
             for offset in range(0, MODEL_SIZE, chunk_size):
                 read_size = min(chunk_size, MODEL_SIZE - offset)
                 sum_chunk = torch.zeros(read_size, dtype=torch.float32)
@@ -1069,8 +1160,6 @@ def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_0
                     sum_chunk += arr * w
                 out_f.write(sum_chunk.to(torch.bfloat16).view(torch.uint16).numpy().tobytes())
                 norm_sq += float((sum_chunk * sum_chunk).sum().item())
-            
-            # Merge engram tail
             for f, df, w in zip(fds, dfs, weights):
                 f.seek(df.base_offset + MODEL_SIZE * 2)
                 eng_count_bytes = f.read(4)
@@ -1088,15 +1177,12 @@ def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_0
                             engram_acc[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0]
                         engram_acc[idx][0] += val * w
                         engram_acc[idx][1] += w
-            
-            # Write engram tail
             if engram_acc:
                 indices = sorted(engram_acc.keys())
                 vals = []
                 for idx in indices:
                     sum_val, sum_w = engram_acc[idx]
-                    avg = sum_val / sum_w if sum_w > 0 else sum_val
-                    vals.append(avg)
+                    vals.append(sum_val / sum_w if sum_w > 0 else sum_val)
                 eng_idx_arr = np.array(indices, dtype=np.uint32)
                 eng_val_arr = torch.stack(vals).to(torch.bfloat16).view(torch.uint16).numpy()
                 out_f.write(struct.pack('<I', len(eng_idx_arr)))
@@ -1104,27 +1190,16 @@ def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_0
                 out_f.write(eng_val_arr.tobytes())
             else:
                 out_f.write(struct.pack('<I', 0))
-        
-        # Build final file with header
-        norm = math.sqrt(norm_sq)
-        meta = {"delta_norm": norm, "tokensProcessed": total_tokens, "tokens": total_tokens}
-        meta_bytes = json.dumps(meta).encode('utf-8')
-        with open(merged_path, 'wb') as f:
-            f.write(struct.pack('<I', len(meta_bytes)))
-            f.write(meta_bytes)
-            with open(tmp_path, 'rb') as tmp_f:
-                shutil.copyfileobj(tmp_f, f)
-        
-        # Delete originals
+            out_f.seek(0)       # real header (same fixed length) now that the norm is known
+            out_f.write(struct.pack('<I', _MERGE_META_PAD))
+            out_f.write(_merge_meta_bytes({"delta_norm": math.sqrt(norm_sq), "tokensProcessed": total_tokens, "tokens": total_tokens}))
         for path, _ in survivors:
             try: os.remove(path)
             except Exception: pass
-        
         return merged_path
     except Exception as e:
         log.error(f"Merge failed for pool {pool_id}: {e}")
         try:
-            if os.path.exists(tmp_path): os.remove(tmp_path)
             if os.path.exists(merged_path): os.remove(merged_path)
         except Exception: pass
         return None
@@ -1132,9 +1207,6 @@ def _merge_pool_deltas(pool_id: str, survivors: list, chunk_size: int = 10_000_0
         for f in fds:
             try: f.close()
             except Exception: pass
-        try:
-            if os.path.exists(tmp_path): os.remove(tmp_path)
-        except Exception: pass
 
 def _merge_power_solo(pool: dict, survivors: list):
     entry = next((e for e in ready_pools if e.get("pool_id") == POWER_POOL_ID), None)
@@ -1173,6 +1245,7 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
 
     If no candidates and no solo pool → create a new pool from hw_sig."""
     hw_sig = _hw_signature(client_key)
+    my_cc = _compute_cap_for(client_key)
     with pool_lock:
         pid = client_pool_map.get(client_key)
         existing_solo = None
@@ -1209,7 +1282,26 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
         best = None
         if candidates:
             def _priority(p):
-                return (_autocast_rank(p), -len(p["clients"]))
+                pccs = _pool_ccs(p)
+                # 0 = same-cc (all pool members share my cc) → bf16 fast path
+                # 1 = anything else (mixed or unknown) → will be forced to fp32 at activation
+                same_cc = 0 if (pccs and my_cc and pccs == {my_cc}) else 1
+
+                # NEW v2.7: prefer pools that stay on 8bit if we can do 8bit,
+                # so 8bit-capable clients cluster and fp32-only clients don't
+                # force a whole pool of 8bit-native GPUs down to fp32.
+                _my_fp32, my_8bit = _client_opt_caps(client_key)
+                pool_all_8bit = all(
+                    _client_opt_caps(c)[1] for c in p["clients"]
+                )
+                joins_as_8bit = pool_all_8bit and my_8bit
+                if my_8bit:
+                    opt_pref = 0 if joins_as_8bit else 1
+                else:
+                    # We can only do fp32; any pool we join becomes fp32 anyway.
+                    opt_pref = 0
+
+                return (same_cc, opt_pref, _autocast_rank(p), -len(p["clients"]))
             best = min(candidates, key=_priority)
 
         if best is not None:
@@ -1266,7 +1358,7 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
             "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
             "targetAutocast": pool.get("target_autocast") or CROSS_CHECK["TARGET_AUTOCAST"],
-            "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"],
+            "targetOptimizer": pool.get("target_optimizer") or CROSS_CHECK["TARGET_OPTIMIZER"],
             "harmonizeMode": "strict" if CROSS_CHECK["TARGET_BATCH_SIZE"] > 0 else "per_client_bs",
             "instruction": ("Train on the assigned shard with EXACTLY: "
                 "seed=targetSeed, micro_steps=targetLocalSteps, "
@@ -1637,7 +1729,7 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                 log.info(f"🤗 Uploading to HF (attempt {attempt}/{retries})")
                 api = HfApi(token=HF_TOKEN)
                 temp_dir = Path(tempfile.mkdtemp(prefix="hf_upload_", dir=str(CHECKPOINT_DIR)))
-                _save_fp32 = _avail_mem_gb() > 8.0
+                _save_fp32 = _avail_mem_gb() > 8.0 and _free_disk_bytes() > 25 * 1024**3
                 formats = [("model_bf16.safetensors", torch.bfloat16), ("engram_bf16.safetensors", torch.bfloat16)]
                 if _save_fp32: formats.extend([("model_fp32.safetensors", torch.float32), ("engram_fp32.safetensors", torch.float32)])
                 else: log.info("⚠️ Skipping FP32 HF uploads to preserve RAM")
@@ -1789,6 +1881,19 @@ def compute_max_allowed_norm(local_steps, rank=None):
     rank_factor = np.sqrt(rank / LORA_CONFIG["FULL_RANK"]) if rank and rank < LORA_CONFIG["FULL_RANK"] else 1.0
     return base * rank_factor
 
+def _link_latest(src, dst) -> bool:
+    """dst becomes a hard link to src (atomic replace). Saves one full copy (4 GB) per step."""
+    tmp = Path(str(dst) + ".lnk")
+    try:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+        os.link(src, tmp); os.replace(tmp, dst)
+        return True
+    except Exception:
+        try: tmp.unlink()
+        except Exception: pass
+        return False
+
 def handle_checkpoints():
     try:
         fp = CHECKPOINT_DIR / f"model_step_{global_step}.bin"
@@ -1800,7 +1905,8 @@ def handle_checkpoints():
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
         gc.collect()
-        save_model_weights(); save_engram_weights()
+        if not (_link_latest(fp, LATEST_CHECKPOINT_FILE) and _link_latest(fp_eng, ENGRAM_CHECKPOINT_FILE)):
+            save_model_weights(); save_engram_weights()      # filesystem without hard links: old behaviour
         with open(CHECKPOINT_DIR / f"model_step_{global_step}.json", 'w', encoding='utf-8') as f:
             json.dump({"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(),
                        "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS}, f, indent=2)
@@ -1935,6 +2041,77 @@ def _cleanup_expired_uploads():
     except Exception: pass
 
 # ============ BACKGROUND THREADS ============
+def _dir_size(p) -> int:
+    total = 0; seen = set()
+    try:
+        for root, _d, files in os.walk(str(p)):
+            for fn in files:
+                try:
+                    st = os.lstat(os.path.join(root, fn))
+                    if (st.st_dev, st.st_ino) in seen: continue      # hard links counted once
+                    seen.add((st.st_dev, st.st_ino)); total += st.st_size
+                except OSError: pass
+    except Exception: pass
+    return total
+
+def _disk_report() -> dict:
+    gb = lambda n: round(n / 1024**3, 2)
+    try: du = shutil.disk_usage(str(CHECKPOINT_DIR)); free, tot = du.free, du.total
+    except Exception: free = tot = 0
+    parts = {"pending_deltas": _dir_size(DELTA_TEMP_DIR), "pending_uploads": _dir_size(UPLOAD_DIR),
+             "work_tmp": _dir_size(WORK_TMP), "checkpoints": _dir_size(CHECKPOINT_DIR) - _dir_size(DELTA_TEMP_DIR),
+             "hf_cache": _dir_size(CHECKPOINT_DIR / "hf_cache")}
+    with uploads_lock: n_up = len(_active_uploads)
+    with pool_lock:
+        n_pd = sum(len(p.get("deltas", {})) for p in pools.values()); n_rp = sum(len(e.get("deltas", [])) for e in ready_pools)
+    return {"freeGB": gb(free), "totalGB": gb(tot), **{k + "GB": gb(v) for k, v in parts.items()},
+            "baseDirTotalGB": gb(_dir_size(BASE_DIR)), "openUploads": n_up, "deltasInPools": n_pd, "deltasReady": n_rp,
+            "limits": {"maxOpenUploads": HARDEN["MAX_OPEN_UPLOADS"], "maxCheckpoints": FL_CONFIG["MAX_CHECKPOINTS"],
+                       "minFreeUploadGB": gb(HARDEN["MIN_FREE_DISK_UPLOAD_BYTES"]), "minFreeTaskGB": gb(HARDEN["MIN_FREE_DISK_TASK_BYTES"])}}
+
+_last_disk_warn = {"t": 0.0}
+def _sweep_orphans():
+    # Never sweep while an aggregation is in flight. The watchdog captures
+    # ready_pools into a local `ready` list and immediately clears
+    # ready_pools; between that moment and the aggregator's last os.remove(),
+    # the only reference to those merged_*.bin files is the aggregator's
+    # local list — which this sweep cannot see. Skipping one 60s tick is
+    # harmless; the next sweep catches real orphans.
+    if round_state.get("is_aggregating", False):
+        return
+    now = time.time()
+    with pool_lock:
+        live = set()
+        for p in pools.values():
+            live.update(str(x) for x in p.get("deltas", {}).values())
+        for e in ready_pools:
+            for item in e.get("deltas", []):
+                live.add(str(item[0]))
+    n = 0
+    for pat in ("merged_*.bin", "tmp_*.bin"):
+        for f in DELTA_TEMP_DIR.glob(pat):
+            try:
+                # 1h → 24h. A legit round can run 4h; a merged file from
+                # 2 hours ago is not orphaned, it's a pending round result.
+                if str(f) not in live and now - f.stat().st_mtime > 24 * 3600:
+                    f.unlink(); n += 1
+            except Exception:
+                pass
+    try:
+        for f in WORK_TMP.iterdir():
+            try:
+                if f.is_file() and now - f.stat().st_mtime > 3 * 3600:
+                    f.unlink(); n += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if n:
+        log.info(f"🧹 swept {n} orphaned temp/merge file(s)")
+    if _free_disk_bytes() < 1.5 * HARDEN["MIN_FREE_DISK_TASK_BYTES"] and now - _last_disk_warn["t"] > 600:
+        _last_disk_warn["t"] = now
+        log.warning(f"💾 LOW DISK: {_disk_report()}")
+
 def cleanup_loop():
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
@@ -1963,6 +2140,8 @@ def cleanup_loop():
                 try: f.unlink()
                 except Exception: pass
         _cleanup_expired_uploads()
+        try: _sweep_orphans()
+        except Exception as e: log.error(f"orphan sweep error: {e}")
         try: _pool_cleanup_tick()
         except Exception as e: log.error(f"pool cleanup error: {e}")
         if expired_tasks or stale_shards:
@@ -2176,9 +2355,13 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 native_ac = (hw.get("autocast") or "any").lower()
                 if native_ac in ("bf16", "fp32") and native_ac != tgt_autocast:
                     log.info(f"ℹ️ {client_key}: pool forced {tgt_autocast}, client native {native_ac}")
-            tgt_opt = task_meta.get("targetOptimizer") or "any"
-            if cc_actual_opt and tgt_opt != "any" and cc_actual_opt != tgt_opt:
-                log.warning(f"⚠️ {client_key}: optimizer mismatch actual={cc_actual_opt} target={tgt_opt}")
+            # Pre-v2.7 clients don't report actualOptimizer, so an arriving
+            # delta implies the client either honored targetOptimizer or the
+            # v2.0+ client logic would have aborted the round. Record the
+            # expected optimizer in the delta metadata for post-hoc analysis.
+            tgt_opt_n = _norm_opt(task_meta.get("targetOptimizer"))
+            if cc_actual_opt and tgt_opt_n not in ("any", "") and _norm_opt(cc_actual_opt) != tgt_opt_n:
+                log.warning(f"⚠️ {client_key}: optimizer mismatch actual={_norm_opt(cc_actual_opt)} target={tgt_opt_n}")
             cc_matches_ticket = False
             if cc_used and CROSS_CHECK["ENABLED"]:
                 tgt_steps = task_meta.get("targetLocalSteps")
@@ -2236,7 +2419,9 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "normalized": False, "submittedAt": int(time.time() * 1000), "weightFormat": "bf16",
                 "shardId": shard_id_for_meta, "taskId": task_id, "crossCheckUsed": cc_used,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
-                "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt}
+                "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
+                "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
+            }
             if delta_norm > max_allowed:
                 scale_factor = max_allowed / delta_norm
                 delta_metadata["normalized"] = True
@@ -2308,7 +2493,9 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     entry["submitted"] = True; entry["ultimatum_sent"] = False; entry["poolId"] = pool_id
                 n_sub = len(pool["deltas"]); n_need = len(pool["clients"])
                 log.info(f"📥 {client_key} → pool {pool_id} ({n_sub}/{n_need}, chunk={pool['chunk_idx']}, "
-                         f"norm={delta_norm:.2f}, cc={cc_used}, opt={cc_actual_opt or '?'}, tokens={delta_metadata['tokensProcessed']:,})")
+                         f"norm={delta_norm:.2f}, cc={cc_used}, "
+                         f"tgt_opt={_norm_opt(task_meta.get('targetOptimizer'))}, "
+                         f"tokens={delta_metadata['tokensProcessed']:,})")
                 PUB.event("submission", user=PUB.who(client_key), tokens=delta_metadata["tokensProcessed"], pool=pool_id, filled=f"{n_sub}/{n_need}", cross_check=bool(cc_used))
                 if _maybe_complete_pool(pool): pool_for_completion = pool
                 client_last_submit[client_key] = time.time()
@@ -2348,6 +2535,21 @@ def _free_disk_bytes() -> int:
 def _check_upload_capacity():
     if _free_disk_bytes() < HARDEN["MIN_FREE_DISK_UPLOAD_BYTES"]:
         raise HTTPException(status_code=503, detail="Storage full, try later", headers={"Retry-After": "600"})
+def _check_upload_admission(total_bytes: int = 0):
+    """Called before an upload is accepted. With 20 clients finishing together, unbounded uploads each hold
+    ~3x their size on disk (chunks + assembled file + decompressed copy) and filled the disk."""
+    now = time.time()
+    with uploads_lock:
+        n_open = sum(1 for u in _active_uploads.values()
+                     if u.get("status") == "finalizing" or (u.get("status") == "open" and now - u.get("last_activity", 0) < 600))
+    cap = HARDEN["MAX_OPEN_UPLOADS"]
+    if cap > 0 and n_open >= cap:
+        raise HTTPException(status_code=503, detail="Upload queue full, retry shortly",
+                            headers={"Retry-After": "90", "X-Status": "wait"})
+    need = HARDEN["MIN_FREE_DISK_UPLOAD_BYTES"] + 2 * max(0, int(total_bytes or 0))   # floor + room for this one upload only
+    if _free_disk_bytes() < need:
+        raise HTTPException(status_code=503, detail="Storage low, try later", headers={"Retry-After": "300", "X-Status": "wait"})
+
 def _pending_cap_reached() -> bool:
     cap = HARDEN["MAX_PENDING_DELTAS"]
     return cap > 0 and len(round_state["pending_deltas"]) >= cap
@@ -2423,7 +2625,8 @@ def _log_cross_check_summary():
     log.info(f"   → ban at {CROSS_CHECK['BAN_THRESHOLD']} subnet strikes")
     log.info(f"   → BACKEND exact; OPTIM normalize(adamw32→adamw_fp32, adamw8bit) + wildcard; OPTIM mix fp32/8bit allowed")
     log.info(f"   → ASYMMETRIC autocast: FP32 pools accept any client (forced fp32), BF16 pools accept bf16 only")
-    log.info(f"   → MATCHMAKING PRIORITY: FP32 forming pools > BF16 forming pools > new pool (v2.3)")
+    log.info(f"   → POOL OPTIMIZER: weakest-link (any fp32-only member → whole pool trains fp32)")
+    log.info(f"   → POOL AUTOCAST: same-cc → bf16; mixed-cc → fp32")
     log.info(f"   → SOLO RE-MATCHING: solo forming pools re-scanned on every poll (v2.3)")
     log.info(f"   → solo BF16 pools dissolve after {MATCHMAKING['BF16_SOLO_DISSOLVE_S']}s")
     log.info(f"   → solo FP32 pools dissolve after {MATCHMAKING['FP32_SOLO_DISSOLVE_S']}s")
@@ -2781,6 +2984,14 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
         "gpu":       request.headers.get("X-Client-Gpu-Name")      or "",
         "autocast": (request.headers.get("X-Client-Autocast")   or "any").lower(),
         "optim":    (request.headers.get("X-Client-Optim")      or "any").lower(),
+        # NEW in v2.7: pool-wide optimizer is decided by weakest-link capability
+        "optim_can_fp32": _parse_bool_header(request.headers.get("X-Client-Optim-Can-Fp32")),
+        "optim_can_8bit": _parse_bool_header(request.headers.get("X-Client-Optim-Can-8bit")),
+        # NEW (v2.6): prefer client header; infer from GPU name when absent
+        "compute_cap": ((request.headers.get("X-Client-Compute-Cap") or "").lower().strip()
+                        or _infer_compute_cap(
+                            request.headers.get("X-Client-Gpu-Name") or "",
+                            request.headers.get("X-Client-Backend") or "")),
         "last_seen": time.time(),
     }
     hw = client_hardware[client_key]
@@ -2900,6 +3111,7 @@ async def submit_init(request: Request):
     if fmt not in ("bf16", "fp16", "fp8", "fp32"): raise HTTPException(400, f"Unsupported format: {fmt}")
     has_engram = bool(data.get("hasEngram", False))
     if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS: raise HTTPException(400, "Invalid engramSparseCount")
+    _check_upload_admission(total_bytes)
     auth_user = get_current_user(request)
     upload_id = uuid.uuid4().hex
     up_dir = UPLOAD_DIR / upload_id
@@ -3134,7 +3346,9 @@ async def chunk_state(secret: str = ""):
     with pool_lock:
         pool_snapshot = [{"poolId": p["pool_id"], "status": p["status"], "clients": list(p["clients"]),
             "chunkIdx": p["chunk_idx"], "deltas": len(p["deltas"]),
-            "ageS": int(time.time() - p["created_at"]), "targetAutocast": p.get("target_autocast")}
+            "ageS": int(time.time() - p["created_at"]),
+            "targetAutocast": p.get("target_autocast"),
+            "targetOptimizer": p.get("target_optimizer")}
             for p in pools.values()]
         ready_count = len(ready_pools)
     return {"epoch": data_position["epoch"], "permutationPos": data_position["permutationPos"],
@@ -3508,6 +3722,11 @@ async def get_stats(request: Request):
             "revision": current_hf_revision, "revisionStep": hf_revision_global_step,
             "directDownloads": bool(_build_hf_weights_metadata("bf16"))} if HF_ENABLED else {}}
 
+@app.get("/api/admin/disk")
+async def admin_disk(secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    return await run_in_threadpool(_disk_report)
+
 # ============ PUBLIC LOG ENDPOINTS (no secret needed, no private data inside) ============
 @app.get("/api/public_log")
 async def api_public_log(limit: int = 200, type: str = "", since: int = 0):
@@ -3664,6 +3883,11 @@ async def startup():
             if p.is_dir(): shutil.rmtree(p, ignore_errors=True)
             else: p.unlink(missing_ok=True)
         log.info("🧹 Cleared old pending upload dirs")
+    except Exception: pass
+    try:
+        for f in WORK_TMP.iterdir():
+            if f.is_file(): f.unlink(missing_ok=True)
+        log.info("🧹 Cleared old work_tmp files")
     except Exception: pass
     sync_huggingface_state(); update_and_save_status(push_hf=True)
     log.info("=" * 60)
