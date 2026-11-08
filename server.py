@@ -3395,7 +3395,7 @@ async def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
 
 @app.post("/api/admin/reload")
 async def reload_checkpoint(step: int = -1, secret: str = ""):
-    global global_weights, global_step
+    global global_weights, global_engram_weights, global_step
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
     else:
