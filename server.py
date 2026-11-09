@@ -152,6 +152,34 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 WORK_TMP = BASE_DIR / "work_tmp"; WORK_TMP.mkdir(parents=True, exist_ok=True)
 tempfile.tempdir = str(WORK_TMP)   # NamedTemporaryFile(...) now lands here: swept at startup and by the cleanup loop
 
+# Durable orchestrator core (P1.1).  The package is optional so a deployment
+# that only copied server.py still boots; persistence is then a no-op.
+try:
+    from orchestrator import Orchestrator
+except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
+    Orchestrator = None
+    _ORCH_IMPORT_ERROR = _orch_import_err
+else:
+    _ORCH_IMPORT_ERROR = None
+ORCH = None
+ORCH_DB_PATH = Path(os.getenv("CROWDGPT_ORCHESTRATOR_DB", str(BASE_DIR / "orchestrator_state.sqlite3")))
+
+def _open_orchestrator():
+    global ORCH
+    if Orchestrator is None:
+        log.warning(f"⚠️ orchestrator package unavailable ({_ORCH_IMPORT_ERROR}); state is memory-only")
+        return None
+    try:
+        ORCH = Orchestrator.open(ORCH_DB_PATH,
+                                 publication_jsonl=BASE_DIR / "data" / "public_rounds.jsonl")
+        log.info(f"🗄️ Orchestrator state: {ORCH_DB_PATH} (SQLite WAL, schema {ORCH.store.schema_version()})")
+        return ORCH
+    except Exception as e:
+        log.error(f"❌ Could not open orchestrator state {ORCH_DB_PATH}: {e}")
+        ORCH = None
+        return None
+_open_orchestrator()
+
 MAX_CHUNK_BYTES = 80 * 1024 * 1024
 MAX_DIRECT_BODY_BYTES = 90 * 1024 * 1024
 MAX_TOTAL_UPLOAD_BYTES = 3 * 1024 * 1024 * 1024
@@ -328,6 +356,172 @@ dataset_stats = {"totalShardsProcessed": 0, "epochsCompleted": 0, "samplesProces
 round_state = {"current_round": 1, "round_start_time": time.time(), "round_duration_hours": 4.0,
     "participating_clients": {}, "aggregations_this_round": 0,
     "last_aggregation_time": 0, "pending_deltas": [], "is_aggregating": False, "force_end_at": None}
+
+# ============ DURABLE STATE ADAPTER (P1.1) ============
+# The HTTP layer keeps its fast in-memory view.  Every mutation that matters
+# after a restart is mirrored here; boot reconstructs the in-memory view from
+# SQLite instead of starting a fresh round with empty pools.
+def _orch():
+    return ORCH
+
+def _persist_round_state(state: str = "open"):
+    if ORCH is None: return
+    try:
+        with shard_lock:
+            ORCH.scheduling.save_round(
+                round_state["current_round"], state=state,
+                started_at=round_state["round_start_time"],
+                duration_hours=round_state["round_duration_hours"],
+                last_aggregation_at=round_state.get("last_aggregation_time", 0.0),
+                force_end_at=round_state.get("force_end_at"),
+                global_step=global_step,
+                participating=dict(round_state.get("participating_clients", {})),
+            )
+    except Exception as e:
+        log.warning(f"⚠️ round state persist failed: {e}")
+
+def _persist_pool_created(pool: dict):
+    if ORCH is None: return
+    try:
+        ORCH.scheduling.create_pool(pool["pool_id"], pool.get("round", round_state["current_round"]),
+                                    pool["clients"][0], hardware_sig=pool.get("hardware_sig", ()),
+                                    status=pool.get("status", "forming"),
+                                    created_at=pool.get("created_at"))
+        for i, c in enumerate(pool.get("clients", [])[1:], start=1):
+            ORCH.scheduling.join_pool(pool["pool_id"], c, i)
+        if pool.get("power"): ORCH.scheduling.set_pool_status(pool["pool_id"], pool["status"], power=True)
+    except Exception as e:
+        log.warning(f"⚠️ pool persist failed for {pool.get('pool_id')}: {e}")
+
+def _persist_pool_join(pool: dict, client_key: str):
+    if ORCH is None: return
+    try:
+        ORCH.scheduling.join_pool(pool["pool_id"], client_key, len(pool["clients"]) - 1)
+    except Exception as e:
+        log.warning(f"⚠️ pool join persist failed: {e}")
+
+def _persist_pool_activated(pool: dict):
+    if ORCH is None: return
+    try:
+        ORCH.scheduling.activate_pool(
+            pool["pool_id"], chunk_idx=pool.get("chunk_idx"), task_id=pool.get("task_id"),
+            target_seed=pool.get("target_seed"), target_autocast=pool.get("target_autocast"),
+            target_optimizer=pool.get("target_optimizer"), target_steps=pool.get("target_steps"))
+        if pool.get("power"): ORCH.scheduling.set_pool_status(pool["pool_id"], pool["status"], power=True)
+    except Exception as e:
+        log.warning(f"⚠️ pool activation persist failed: {e}")
+
+def _persist_pool_status(pool: dict, status: Optional[str] = None):
+    if ORCH is None: return
+    try:
+        ORCH.scheduling.set_pool_status(pool["pool_id"], status or pool["status"], power=bool(pool.get("power")))
+    except Exception as e:
+        log.warning(f"⚠️ pool status persist failed: {e}")
+
+def _persist_pool_removed(pool_id: str):
+    if ORCH is None: return
+    try: ORCH.scheduling.remove_pool(pool_id)
+    except Exception as e: log.warning(f"⚠️ pool removal persist failed: {e}")
+
+def _persist_ticket(client_key: str, task_id: str, pool: Optional[dict] = None):
+    if ORCH is None: return
+    try:
+        ORCH.admission.issue(client_key, task_id, round_state["current_round"],
+                             pool_id=(pool or {}).get("pool_id"),
+                             step_budget=(pool or {}).get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
+                             token_budget=HARDEN["MAX_TOKENS_PER_STEP"] * max(1, (pool or {}).get("target_steps", 1)),
+                             ttl_s=MATCHMAKING["POOL_TIMEOUT_S"])
+    except Exception as e:
+        log.warning(f"⚠️ ticket persist failed: {e}")
+
+def _persist_ticket_consumed(client_key: str, task_id: Optional[str]):
+    if ORCH is None: return
+    try: ORCH.admission.consume(client_key, task_id)
+    except Exception as e: log.warning(f"⚠️ ticket consume persist failed: {e}")
+
+def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict):
+    if ORCH is None: return
+    try:
+        key = hashlib.sha256(f"{pool['pool_id']}:{client_key}:{delta_path}".encode()).hexdigest()
+        ticket = ORCH.admission.get(client_key)
+        loss = meta.get("loss")
+        ORCH.submission.record_submission(
+            client_key=client_key, round_no=round_state["current_round"],
+            content_sha256=key, ticket_id=(ticket.ticket_id if ticket else None),
+            pool_id=pool["pool_id"], delta_path=delta_path,
+            tokens=int(meta.get("tokensProcessed", 0) or 0),
+            steps=int(meta.get("localSteps", 0) or 0),
+            loss_reported=None if loss is None else f"{float(loss):.6f}",
+        )
+    except Exception as e:
+        log.warning(f"⚠️ submission persist failed: {e}")
+
+def _restore_orchestrator_state() -> bool:
+    """Rebuild pools, members, tickets, tasks, and the open round from SQLite."""
+    if ORCH is None: return False
+    try:
+        rnd = ORCH.scheduling.load_round()
+        if rnd is None:
+            return False
+        if rnd.state != "open" or rnd.round != global_step + 1:
+            log.info(f"🗄️ Not restoring round {rnd.round} (state={rnd.state}, globalStep={global_step})")
+            return False
+        pools_view = ORCH.scheduling.load_pools(round_no=rnd.round,
+                                                statuses=("forming", "training"))
+        tickets = ORCH.admission.load_all(rnd.round)
+        submissions = ORCH.submission.load_submissions(round_no=rnd.round)
+        by_pool = {}
+        for sub in submissions:
+            if sub.pool_id and sub.delta_path and os.path.exists(sub.delta_path):
+                by_pool.setdefault(sub.pool_id, {})[sub.client_key] = sub.delta_path
+        with pool_lock:
+            pools.clear(); client_pool_map.clear(); ready_pools.clear()
+            for pv in pools_view:
+                p = {
+                    "pool_id": pv.pool_id, "clients": list(pv.clients),
+                    "hardware_sig": tuple(pv.hardware_sig), "status": pv.status,
+                    "created_at": pv.created_at, "last_activity": pv.last_activity,
+                    "chunk_idx": pv.chunk_idx, "task_id": pv.task_id,
+                    "target_seed": pv.target_seed, "target_autocast": pv.target_autocast,
+                    "target_optimizer": pv.target_optimizer, "target_steps": pv.target_steps,
+                    "round": pv.round, "deltas": dict(by_pool.get(pv.pool_id, {})),
+                    "power": pv.power,
+                }
+                if pv.activated_at: p["activated_at"] = pv.activated_at
+                pools[pv.pool_id] = p
+                for c in pv.clients: client_pool_map[c] = pv.pool_id
+                if pv.task_id:
+                    db["tasks"][pv.task_id] = {
+                        "poolId": pv.pool_id, "shardId": pv.pool_id,
+                        "chunkIdx": pv.chunk_idx, "round": pv.round,
+                        "createdAt": int(pv.created_at * 1000), "poolClients": list(pv.clients),
+                        "targetSeed": pv.target_seed,
+                        "targetLocalSteps": pv.target_steps or CROSS_CHECK["TARGET_LOCAL_STEPS"],
+                        "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
+                        "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
+                        "targetAutocast": pv.target_autocast or CROSS_CHECK["TARGET_AUTOCAST"],
+                        "targetOptimizer": pv.target_optimizer or CROSS_CHECK["TARGET_OPTIMIZER"],
+                    }
+        with shard_lock:
+            task_tickets.clear()
+            for client_key, t in tickets.items():
+                if t.round == rnd.round and not t.consumed and t.expires_at > time.time():
+                    task_tickets[client_key] = {"taskId": t.task_id, "createdAt": t.created_at,
+                                                "round": t.round}
+            round_state["current_round"] = rnd.round
+            round_state["round_start_time"] = rnd.started_at
+            round_state["round_duration_hours"] = rnd.duration_hours
+            round_state["last_aggregation_time"] = rnd.last_aggregation_at
+            round_state["force_end_at"] = rnd.force_end_at
+            round_state["participating_clients"] = dict(rnd.participating)
+            round_state["is_aggregating"] = False
+        log.info(f"🗄️ Restored round {rnd.round}: {len(pools_view)} pool(s), "
+                 f"{len(task_tickets)} live ticket(s), {len(submissions)} submission record(s)")
+        return True
+    except Exception as e:
+        log.error(f"❌ Orchestrator restore failed: {e}")
+        import traceback; traceback.print_exc()
+        return False
 
 FL_CONFIG = {
     "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1,
@@ -1048,6 +1242,7 @@ def _activate_pool(pool: dict):
         current_data_shard.update({"chunkIdx": chunk_idx, "shardId": pool_id,
             "assignedClients": list(pool["clients"]), "createdAt": int(time.time() * 1000),
             "round": round_state["current_round"], "consumed": False})
+    _persist_pool_activated(pool)
     PUB.event("pool_start", pool=pool_id, clients=len(pool["clients"]), chunk=chunk_idx, steps=target_steps, autocast=pool_autocast, power_solo=bool(pool.get("power")))
     log.info(f"🎯 Pool {pool_id} activated → chunk {chunk_idx}, {len(pool['clients'])} clients, "
              f"seed {target_seed}, steps={target_steps}, "
@@ -1310,10 +1505,15 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
                 except ValueError: pass
                 if not existing_solo["clients"]:
                     pools.pop(existing_solo["pool_id"], None)
+                    _persist_pool_removed(existing_solo["pool_id"])
+                else:
+                    _persist_pool_join(existing_solo, existing_solo["clients"][0])
+                    ORCH and ORCH.scheduling.leave_pool(existing_solo["pool_id"], client_key)
                 log.info(f"🧹 {client_key}: releasing solo pool {existing_solo['pool_id']} → joining {best['pool_id']}")
             best["clients"].append(client_key)
             best["last_activity"] = time.time()
             client_pool_map[client_key] = best["pool_id"]
+            _persist_pool_join(best, client_key)
             n = len(best["clients"])
             pool_ac = (best["hardware_sig"][2] if len(best["hardware_sig"]) > 2 else "any")
             log.info(f"👥 {client_key} → pool {best['pool_id']} ({n}/{MATCHMAKING['POOL_SIZE']}, "
@@ -1333,6 +1533,7 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
             "round": round_state["current_round"], "deltas": {}}
         pools[pool_id] = new_pool
         client_pool_map[client_key] = pool_id
+        _persist_pool_created(new_pool)
         log.info(f"🆕 {client_key} → NEW pool {pool_id} "
                  f"(backend={hw_sig[0]}, autocast={hw_sig[2]}, optim={hw_sig[3]})")
         return new_pool
@@ -1462,9 +1663,29 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
     return list(zip(kept, weights))
 
 # ============ PUBLIC LOG HELPERS ============
+def _persist_pool_verdicts(pool: dict, survivors) -> None:
+    """Attach the cross-check outcome to each persisted submission."""
+    if ORCH is None: return
+    try:
+        kept_paths = {item[0] for item in (survivors or [])}
+        known = {s.delta_path: s for s in ORCH.submission.load_submissions(pool_id=pool["pool_id"])}
+        for client_key, path in pool.get("deltas", {}).items():
+            sub = known.get(path)
+            if sub is None:
+                continue
+            if path in kept_paths:
+                ORCH.verification.record(sub.submission_id, "accepted", reason="cross_check_passed",
+                                         evidence={"pool": pool["pool_id"], "survivors": len(kept_paths)})
+            else:
+                ORCH.verification.record(sub.submission_id, "rejected", reason="cross_check_outlier",
+                                         evidence={"pool": pool["pool_id"], "survivors": len(kept_paths)})
+    except Exception as e:
+        log.warning(f"⚠️ verification persist failed: {e}")
+
 def _pub_pool_result(pool: dict, survivors) -> None:
     """Called right after the cross-check, BEFORE the early merge (merged files lose per-client loss)."""
     try:
+        _persist_pool_verdicts(pool, survivors)
         pid = pool["pool_id"]; n_cl = len(pool["clients"]); n_sub = len(pool.get("deltas", {}))
         if not survivors:
             PUB.event("pool_discarded", pool=pid, clients=n_cl, submitted=n_sub, power_solo=bool(pool.get("power")))
@@ -1485,6 +1706,13 @@ def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -
         PUB.event("round_end", round=rnd, step=global_step, pools=n_pools, applied=bool(success),
                   rolled_back=bool(loss_rejected), loss=row.get("loss"), heldout=held)
         PUB.event("round_start", round=rnd + 1, step=global_step)
+        if ORCH is not None:
+            ORCH.publication.publish_round(rnd, {
+                "schema": "ng-legacy-1", "round": rnd, "step": global_step,
+                "success": bool(success), "lossRejected": bool(loss_rejected),
+                "pools": int(n_pools), "lossReported": row.get("loss"),
+                "lossHeldOut": held, "source": "coordinator",
+            })
         PUB.export_static()
     except Exception: pass
 
@@ -1492,6 +1720,7 @@ def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -
 def _complete_pool_sync(pool: dict):
     pool_id = pool["pool_id"]
     try:
+        _persist_pool_status(pool, "completing")
         survivors = _run_pool_cross_check(pool)
         _pub_pool_result(pool, survivors)
         with pool_lock:
@@ -1509,9 +1738,11 @@ def _complete_pool_sync(pool: dict):
                 else:
                     ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
             pools.pop(pool_id, None)
+            _persist_pool_removed(pool_id)
     except Exception as e:
         log.error(f"❌ Pool {pool_id} completion failed: {e}")
         with pool_lock: pools.pop(pool_id, None)
+        _persist_pool_removed(pool_id)
 
 def _complete_pool_async(pool: dict): _complete_pool_sync(pool)
 def _spawn_pool_completion(pool: dict):
@@ -1541,6 +1772,7 @@ def _pool_cleanup_tick():
                 if not alive:
                     log.info(f"🧹 Dissolving empty forming pool {pid} (ac={pool_ac})")
                     pools.pop(pid, None)
+                    _persist_pool_removed(pid)
                     continue
 
                 if len(alive) >= 2:
@@ -1559,6 +1791,7 @@ def _pool_cleanup_tick():
                     for c in pool["clients"]:
                         if client_pool_map.get(c) == pid: client_pool_map.pop(c, None)
                     pools.pop(pid, None)
+                    _persist_pool_removed(pid)
 
             elif pool["status"] == "training":
                 age = now - pool.get("activated_at", now)
@@ -1570,6 +1803,7 @@ def _pool_cleanup_tick():
                         for c in pool["clients"]:
                             if client_pool_map.get(c) == pid: client_pool_map.pop(c, None)
                         pools.pop(pid, None)
+                        _persist_pool_removed(pid)
     for p in to_spawn: _spawn_pool_completion(p)
 
 # ============ MODEL WEIGHTS ============
@@ -2237,6 +2471,15 @@ def round_watchdog():
                         round_state["last_aggregation_time"] = time.time()
                         round_state["is_aggregating"] = False
                         round_state["force_end_at"] = None
+                    if ORCH is not None:
+                        try: ORCH.scheduling.save_round(current_round_ending, state="closed",
+                                                        started_at=round_state["round_start_time"],
+                                                        duration_hours=round_state["round_duration_hours"],
+                                                        last_aggregation_at=round_state["last_aggregation_time"],
+                                                        force_end_at=None, global_step=global_step,
+                                                        participating=dict(round_state["participating_clients"]))
+                        except Exception as e: log.warning(f"⚠️ close-round persist failed: {e}")
+                    _persist_round_state()
                     if success or loss_rejected: save_dataset_state()
                     _pub_round_end(current_round_ending, success, loss_rejected, len(ready))
                     log.info(f"🚀 Round {round_state['current_round']} started (step {global_step})")
@@ -2253,6 +2496,7 @@ def round_watchdog():
                         round_state["current_round"] += 1
                         round_state["round_start_time"] = time.time()
                         round_state["participating_clients"] = {}
+                        _persist_round_state()
         except Exception as e:
             log.error(f"❌ round_watchdog error: {e}")
             import traceback; traceback.print_exc()
@@ -2482,6 +2726,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     return _duplicate_response("already_submitted")
                 _count_submission(client_key, client_ip, task_id)
                 pool["deltas"][client_key] = final_delta_path
+                _persist_submission(pool, client_key, final_delta_path, delta_metadata)
                 submitted_path = final_delta_path
                 final_delta_path = None
                 client_pool_map.pop(client_key, None)
@@ -2567,7 +2812,9 @@ def _count_submission(client_key: str, client_ip: str, task_id: Optional[str]):
         for d in (submit_counts_client, submit_counts_subnet):
             for k in [k for k in d if k[0] < rnd]: del d[k]
     t = task_tickets.get(client_key)
-    if t and t.get("taskId") == task_id: task_tickets.pop(client_key, None)
+    if t and t.get("taskId") == task_id:
+        task_tickets.pop(client_key, None)
+        _persist_ticket_consumed(client_key, task_id)
 def _duplicate_response(reason: str) -> dict:
     return {"status": "success", "duplicate": True, "reason": reason, "globalStep": global_step,
             "normalized": False, "round": round_state["current_round"], "loss": None, "savedPath": None}
@@ -2576,6 +2823,7 @@ def _issue_ticket(client_key: str, task_id: str):
         t = task_tickets.get(client_key)
         if t and t.get("taskId") == task_id: return
         task_tickets[client_key] = {"taskId": task_id, "createdAt": time.time(), "round": round_state["current_round"]}
+        _persist_ticket(client_key, task_id, pools.get(client_pool_map.get(client_key, "")))
         if len(task_tickets) > 20000:
             for k in sorted(task_tickets, key=lambda k: task_tickets[k]["createdAt"])[:5000]:
                 task_tickets.pop(k, None)
@@ -2944,6 +3192,7 @@ async def get_round_status(request: Request):
     with shard_lock:
         if client_key not in round_state["participating_clients"]:
             round_state["participating_clients"][client_key] = {"joined": time.time(), "submitted": False, "ultimatum_sent": False}
+            _persist_round_state()
     in_cooldown = (time.time() - round_state["last_aggregation_time"]) < ROUND_CONFIG["AGGREGATION_COOLDOWN_SEC"]
     round_elapsed_hours = (time.time() - round_state["round_start_time"]) / 3600
     time_left = round_state["round_duration_hours"] - round_elapsed_hours
@@ -3033,6 +3282,7 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
         if entry is None:
             round_state["participating_clients"][client_key] = {"joined": time.time(), "submitted": False,
                 "ultimatum_sent": False, "poolId": pool["pool_id"]}
+            _persist_round_state()
         else:
             entry["ultimatum_sent"] = False
             entry["poolId"] = pool["pool_id"]
@@ -3390,6 +3640,7 @@ async def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
         for p in pool.get("deltas", {}).values():
             try: os.remove(p)
             except Exception: pass
+        _persist_pool_removed(pool_id)
     log.warning(f"🔧 Admin dissolved pool {pool_id} ({len(freed)} clients freed)")
     return {"status": "dissolved", "pool_id": pool_id, "clients_freed": freed}
 
@@ -3508,6 +3759,7 @@ async def admin_force_round_end(secret: str = "", minutes: float = 0):
     with shard_lock:
         if round_state.get("is_aggregating"): raise HTTPException(409, "Round is already ending — wait for the next round")
         round_state["force_end_at"] = time.time() + minutes * 60
+        _persist_round_state()
         ends_at, current = round_state["force_end_at"], round_state["current_round"]
     PUB.event("admin", action="force_round_end", minutes=minutes)
     log.warning(f"⏱️ Admin scheduled end of round {current} in {minutes:.1f} min")
@@ -3518,6 +3770,7 @@ async def admin_force_round_end(secret: str = "", minutes: float = 0):
 async def admin_cancel_force_round_end(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     with shard_lock: old = round_state.pop("force_end_at", None)
+    _persist_round_state()
     return {"status": "cancelled" if old is not None else "no_pending_force_end",
         "cancelledAt": datetime.fromtimestamp(old, tz=timezone.utc).isoformat() if old else None}
 
@@ -3870,13 +4123,19 @@ async def startup():
     load_dataset_state(); load_users_db(); load_global_state(); _load_loss_state()
     initialize_model(); load_model_weights(); load_engram_weights()
     initialize_dataset(); _ensure_permutation(); _crash_recovery()
-    with pool_lock:
-        pools.clear(); client_pool_map.clear(); ready_pools.clear()
-    round_state["round_start_time"] = time.time()
-    round_state["current_round"] = global_step + 1
+    restored = _restore_orchestrator_state()
+    if not restored:
+        with pool_lock:
+            pools.clear(); client_pool_map.clear(); ready_pools.clear()
+        round_state["round_start_time"] = time.time()
+        round_state["current_round"] = global_step + 1
+        _persist_round_state()
     try:
-        for f in DELTA_TEMP_DIR.glob("*.bin"): f.unlink()
-        log.info("🧹 Cleared old pending delta files")
+        if not restored:
+            for f in DELTA_TEMP_DIR.glob("*.bin"): f.unlink()
+            log.info("🧹 Cleared old pending delta files")
+        else:
+            log.info("🧹 Kept pending delta files referenced by the restored round")
     except Exception: pass
     try:
         for p in UPLOAD_DIR.iterdir():
