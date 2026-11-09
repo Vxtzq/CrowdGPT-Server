@@ -100,3 +100,29 @@ Evidence:
 - `pytest tests/test_ng_server_harness.py -q` → 6 passed: duplicate finalize,
   out-of-order chunks, expired ticket (`{"reason":"ticket_expired"}`), and
   finalize replay after a simulated restart.
+
+## P1.3 — presigned data plane
+
+`orchestrator/objects.py` implements the grant format. `LocalObjectStore` is
+the development backend and the reference implementation for S3/R2:
+
+- A grant is an HMAC-SHA256 token over `key \n expires_at \n sha256`, returned
+  as `{key, url, method, headers, expiresAt, sha256}`.
+- `PUT /fl/object/{key}` verifies the token and expiry, streams to a temp file,
+  checks the SHA-256, and commits atomically. A bad or expired grant is `403`;
+  a hash mismatch is `400 {"reason":"object_hash_mismatch"}`.
+- `/fl/submit/init` returns the grant under `object`. The client can PUT the
+  delta directly; the orchestrator only sees the grant and the finalize call.
+- `finalize` accepts `{objectKey, sha256}` and re-hashes the stored object
+  before processing. A retry still replays the stored response.
+- `CONTROL_PLANE` counts requests and Content-Length bytes on `/fl/*` except
+  `/fl/object`; it is exposed in `/fl/round_status`. Object PUT bytes are not
+  in the control-plane count.
+- HF weight metadata now carries each file's LFS SHA-256 (from the HF tree
+  API). The client verifies a fresh download against it and deletes the file
+  and raises on mismatch.
+
+Evidence: `pytest tests -q` → 10 passed, including token scope/expiry and hash
+mismatch. `pytest tests/test_ng_server_harness.py -q` → 7 passed, including a
+presigned PUT that does not increment control-plane requests, bad/expired grant
+rejection, and a tampered object rejected at finalize.

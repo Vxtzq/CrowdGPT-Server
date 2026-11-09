@@ -156,16 +156,20 @@ tempfile.tempdir = str(WORK_TMP)   # NamedTemporaryFile(...) now lands here: swe
 # that only copied server.py still boots; persistence is then a no-op.
 try:
     from orchestrator import Orchestrator
+    from orchestrator.objects import LocalObjectStore
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     _ORCH_IMPORT_ERROR = _orch_import_err
 else:
     _ORCH_IMPORT_ERROR = None
+    LocalObjectStore = LocalObjectStore
 ORCH = None
+OBJECT_STORE = None
+CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
 ORCH_DB_PATH = Path(os.getenv("CROWDGPT_ORCHESTRATOR_DB", str(BASE_DIR / "orchestrator_state.sqlite3")))
 
 def _open_orchestrator():
-    global ORCH
+    global ORCH, OBJECT_STORE
     if Orchestrator is None:
         log.warning(f"⚠️ orchestrator package unavailable ({_ORCH_IMPORT_ERROR}); state is memory-only")
         return None
@@ -174,6 +178,20 @@ def _open_orchestrator():
                                  publication_jsonl=BASE_DIR / "data" / "public_rounds.jsonl",
                                  identity_path=BASE_DIR / "orchestrator_node_key.pem")
         log.info(f"🗄️ Orchestrator state: {ORCH_DB_PATH} (SQLite WAL, schema {ORCH.store.schema_version()})")
+        if Orchestrator is not None and "LocalObjectStore" in globals():
+            obj_dir = Path(os.getenv("CROWDGPT_OBJECT_DIR", str(BASE_DIR / "data" / "objects")))
+            secret_path = BASE_DIR / "orchestrator_object_secret"
+            if secret_path.exists():
+                secret = secret_path.read_bytes()
+            else:
+                secret = secrets.token_bytes(32)
+                secret_path.write_bytes(secret)
+                try: os.chmod(secret_path, 0o600)
+                except OSError: pass
+            OBJECT_STORE = LocalObjectStore(
+                obj_dir, secret=secret,
+                url_base=os.getenv("CROWDGPT_OBJECT_URL_BASE", "/fl/object"))
+            log.info(f"📦 Object store: {obj_dir} (presigned PUT)")
         return ORCH
     except Exception as e:
         log.error(f"❌ Could not open orchestrator state {ORCH_DB_PATH}: {e}")
@@ -1977,12 +1995,25 @@ def _get_hf_config_step(revision: Optional[str]) -> Optional[int]:
 def _refresh_hf_file_info(revision: Optional[str]) -> Dict[str, Dict]:
     info = {}
     if not revision: return info
+    remote_sha = {}
+    try:
+        r = requests.get(f"https://huggingface.co/api/models/{HF_REPO_ID}/tree/{revision}",
+                         params={"recursive": "true"}, timeout=30)
+        if r.ok:
+            for entry in r.json():
+                if entry.get("path") in HF_WEIGHT_FILES:
+                    oid = (entry.get("lfs") or {}).get("oid") or entry.get("oid")
+                    if oid and len(oid) == 64: remote_sha[entry["path"]] = oid.lower()
+    except Exception as e:
+        log.warning(f"Could not read HF LFS hashes: {e}")
     for fn in HF_WEIGHT_FILES:
         try:
             r = requests.head(_hf_resolve_url(revision, fn), timeout=30, allow_redirects=True)
             if r.ok:
                 size = int(r.headers.get("content-length", 0) or 0)
-                if size > 0: info[fn] = {"size": size, "etag": r.headers.get("etag")}
+                if size > 0:
+                    info[fn] = {"size": size, "etag": r.headers.get("etag"),
+                                "sha256": remote_sha.get(fn)}
         except Exception as e: log.warning(f"Could not HEAD HF file {fn}: {e}")
     return info
 def _set_hf_revision(revision: Optional[str], step: int) -> bool:
@@ -2004,7 +2035,8 @@ def _build_hf_weights_metadata(fmt: str) -> Optional[dict]:
         fi = info.get(fn)
         if not fi or not fi.get("size"): return None
         files[role] = {"path": fn, "url": _hf_resolve_url(current_hf_revision, fn),
-                       "size": int(fi["size"]), "dtype": "bf16", "layout": "flat", "tensorKey": "weights"}
+                       "size": int(fi["size"]), "dtype": "bf16", "layout": "flat",
+                       "tensorKey": "weights", "sha256": fi.get("sha256")}
     return {"source": "huggingface", "repo": HF_REPO_ID, "revision": current_hf_revision, "format": "bf16", "files": files}
 
 def upload_to_huggingface(retries: int = 3) -> bool:
@@ -3219,6 +3251,22 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="CrowdGPT Continuous FL Coordinator (v2.3)")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+@app.middleware("http")
+async def _measure_control_plane(request: Request, call_next):
+    """Count control-plane bytes; bulk object PUTs are deliberately excluded."""
+    path = request.url.path
+    counted = path.startswith("/fl/") and not path.startswith("/fl/object")
+    if counted:
+        try: CONTROL_PLANE["bytesIn"] += int(request.headers.get("content-length") or 0)
+        except ValueError: pass
+    response = await call_next(request)
+    if counted:
+        CONTROL_PLANE["requests"] += 1
+        try: CONTROL_PLANE["bytesOut"] += int(response.headers.get("content-length") or 0)
+        except ValueError: pass
+        CONTROL_PLANE["round"] = round_state["current_round"]
+    return response
+
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
@@ -3276,7 +3324,7 @@ async def get_round_status(request: Request):
         "force_end_at": round_state.get("force_end_at"),
         "hfDirectDownloads": bool(_build_hf_weights_metadata("bf16")),
         "cohortSize": MATCHMAKING["POOL_SIZE"], "maxCohortSize": MATCHMAKING["POOL_SIZE"],
-        "matchmaking": mm}
+        "matchmaking": mm, "controlPlane": dict(CONTROL_PLANE)}
 
 @app.get("/fl/task")
 async def get_task(request: Request, format: str = "bf16", skip_weights: bool = False):
@@ -3355,6 +3403,36 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
     if skip_weights: return JSONResponse(metadata, headers=headers)
     return StreamingResponse(_stream_task_weights(metadata, format),
         media_type="application/octet-stream", headers=headers)
+
+@app.put("/fl/object/{key:path}")
+async def object_put(request: Request, key: str, exp: int, sha256: str, sig: str):
+    """Local reference backend for presigned object PUTs.
+
+    Production deployments point ``CROWDGPT_OBJECT_URL_BASE`` at S3/R2 and this
+    route is never used; the orchestrator then sees only the grant metadata.
+    """
+    if OBJECT_STORE is None:
+        raise HTTPException(404, "Object store disabled")
+    if not OBJECT_STORE.verify(key, exp, sha256, sig):
+        raise HTTPException(403, {"reason": "bad_or_expired_grant"})
+    tmp = WORK_TMP / f"obj_{uuid.uuid4().hex}.part"
+    total = 0
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > MAX_TOTAL_UPLOAD_BYTES:
+                    raise HTTPException(413, "Object too large")
+                f.write(chunk)
+        if total == 0: raise HTTPException(400, "Empty object")
+        result = OBJECT_STORE.commit_file(key, tmp, expected_sha256=sha256)
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(400, {"reason": str(e)})
+    finally:
+        try:
+            if tmp.exists(): tmp.unlink()
+        except OSError: pass
 
 @app.post("/fl/submit")
 async def submit_delta(request: Request):
@@ -3460,7 +3538,16 @@ async def submit_init(request: Request):
                 ttl_s=UPLOAD_TTL_SECONDS)
         except Exception as e:
             log.warning(f"⚠️ upload persist failed: {e}")
-    return {"uploadId": upload_id, "chunkSize": chunk_size, "chunks": chunks, "totalBytes": total_bytes}
+    response = {"uploadId": upload_id, "chunkSize": chunk_size, "chunks": chunks,
+                "totalBytes": total_bytes}
+    if OBJECT_STORE is not None:
+        try:
+            key = f"deltas/r{round_state['current_round']}/{client_key.replace(':', '_')}/{upload_id}.bin"
+            response["object"] = OBJECT_STORE.grant_put(
+                key, checksum, expires_s=UPLOAD_TTL_SECONDS).as_dict()
+        except Exception as e:
+            log.warning(f"⚠️ object grant failed: {e}")
+    return response
 
 @app.post("/fl/submit/chunk")
 async def submit_chunk(request: Request, uploadId: str, index: int):
@@ -3529,6 +3616,43 @@ async def submit_finalize(request: Request):
         if _replay is not None:
             log.info(f"♻️ replaying finalized upload {upload_id}")
             return JSONResponse(_replay)
+    object_key = data.get("objectKey")
+    if object_key and OBJECT_STORE is not None:
+        with uploads_lock:
+            up = _active_uploads.get(upload_id)
+        if not up: raise HTTPException(404, "Unknown uploadId")
+        if up.get("status") != "open": raise HTTPException(409, "Upload not open")
+        cur_user = get_current_user(request)
+        if up.get("user_uuid") is not None:
+            if not cur_user or cur_user["uuid"] != up["user_uuid"]: raise HTTPException(403, "Owner mismatch")
+        else:
+            if up.get("client_key") and get_client_key(request) != up["client_key"]:
+                raise HTTPException(403, "Owner mismatch")
+        expected = str(data.get("sha256") or up.get("checksum") or "").lower()
+        if len(expected) != 64:
+            raise HTTPException(400, {"reason": "object_hash_missing"})
+        if not OBJECT_STORE.verify_file(str(object_key), expected):
+            raise HTTPException(400, {"reason": "object_hash_mismatch"})
+        client_ip = get_client_ip(request)
+        client_key = up.get("client_key") or get_client_key(request)
+        up["status"] = "finalizing"; up["last_activity"] = time.time()
+        try:
+            result = await run_in_threadpool(_guarded_process, str(OBJECT_STORE.path_for(str(object_key))),
+                                             client_ip, client_key, request, up["meta"])
+            if ORCH is not None:
+                try: ORCH.submission.complete_upload(upload_id, result)
+                except Exception as e: log.warning(f"⚠️ finalize result persist failed: {e}")
+            OBJECT_STORE.delete(str(object_key))
+            with uploads_lock:
+                _active_uploads.pop(upload_id, None)
+            try: shutil.rmtree(up["dir"], ignore_errors=True)
+            except Exception: pass
+            return result
+        finally:
+            with uploads_lock:
+                current = _active_uploads.get(upload_id)
+                if current and current.get("status") == "finalizing":
+                    current["status"] = "open"
     with uploads_lock:
         up = _active_uploads.get(upload_id)
         if not up: raise HTTPException(404, "Unknown uploadId")
