@@ -40,8 +40,13 @@ def test_ticket_lifecycle_and_expiry(tmp_path):
     orch = Orchestrator.open(tmp_path / "state.sqlite3")
     try:
         t1 = orch.admission.issue("ip:10.0.0.1", "round_7_p1", 7, pool_id="p1")
+        assert t1.signature and t1.public_key
+        assert orch.admission.verify(t1) is True
+        tampered = type(t1)(**{**t1.__dict__, "step_budget": t1.step_budget + 1})
+        assert orch.admission.verify(tampered) is False
         again = orch.admission.issue("ip:10.0.0.1", "round_7_p1", 7, pool_id="p1")
         assert again.ticket_id == t1.ticket_id
+        assert again.signature == t1.signature
         assert again.consumed is False
         assert orch.admission.consume("ip:10.0.0.1", "round_7_p1") is True
         assert orch.admission.get("ip:10.0.0.1").consumed is True
@@ -104,6 +109,9 @@ def test_submission_is_idempotent_by_content_hash(tmp_path):
         up = orch.submission.finalize_upload(upload_id)
         assert up["state"] == "open"
         assert orch.submission.get_upload(upload_id)["state"] == "finalized"
+        result = {"status": "success", "savedPath": "/tmp/delta.bin"}
+        orch.submission.complete_upload(upload_id, result)
+        assert orch.submission.get_upload_result(upload_id) == result
 
         first, created = orch.submission.record_submission(
             client_key="ip:a", round_no=12, content_sha256="b" * 64,
@@ -144,6 +152,19 @@ def test_verification_and_publication(tmp_path):
         assert [r["round"] for r in orch.publication.all_rounds()] == [12]
     finally:
         orch.close()
+
+
+def test_node_identity_survives_restart(tmp_path):
+    key = tmp_path / "node.pem"
+    first = Orchestrator.open(tmp_path / "state.sqlite3", identity_path=key)
+    ticket = first.admission.issue("ip:a", "task", 1)
+    first.close()
+    second = Orchestrator.open(tmp_path / "state.sqlite3", identity_path=key)
+    try:
+        assert second.identity.public_key_hex == ticket.public_key
+        assert second.admission.verify(ticket) is True
+    finally:
+        second.close()
 
 
 def test_two_connections_see_one_state(tmp_path):

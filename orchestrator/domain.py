@@ -50,6 +50,25 @@ class TicketView:
     nonce: str
     pool_id: Optional[str] = None
     consumed_at: Optional[float] = None
+    signature: Optional[str] = None
+    public_key: Optional[str] = None
+    base_weights: Optional[str] = None
+
+    def signing_payload(self) -> bytes:
+        import json
+        body = {
+            "schema": "ng-ticket-1", "ticketId": self.ticket_id,
+            "clientKey": self.client_key, "round": self.round, "taskId": self.task_id,
+            "createdAt": self.created_at, "expiresAt": self.expires_at,
+            "stepBudget": self.step_budget, "tokenBudget": self.token_budget,
+            "nonce": self.nonce,
+        }
+        if self.pool_id is not None:
+            body["poolId"] = self.pool_id
+        if self.base_weights is not None:
+            body["baseWeights"] = self.base_weights
+        return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
 
     @property
     def consumed(self) -> bool:

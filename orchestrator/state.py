@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     step_budget INTEGER NOT NULL,
     token_budget INTEGER NOT NULL,
     nonce TEXT NOT NULL,
+    base_weights TEXT,
+    signature TEXT,
+    public_key TEXT,
     consumed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_round ON tickets(round);
@@ -102,6 +105,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     content_sha256 TEXT,
     state TEXT NOT NULL,
     received_chunks TEXT NOT NULL DEFAULT '[]',
+    result TEXT,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -149,11 +153,24 @@ class StateStore:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO NOTHING",
                 (str(SCHEMA_VERSION),),
             )
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first deployment."""
+        wanted = {
+            "tickets": {"base_weights": "TEXT", "signature": "TEXT", "public_key": "TEXT"},
+            "uploads": {"result": "TEXT"},
+        }
+        for table, columns in wanted.items():
+            have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in have:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         with self._lock:

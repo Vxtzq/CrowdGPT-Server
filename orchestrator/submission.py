@@ -18,8 +18,9 @@ class SubmissionService:
     def begin_upload(self, client_key: str, *, expected_bytes: int, chunk_size: int,
                      chunks: int, ticket_id: Optional[str] = None,
                      content_sha256: Optional[str] = None,
-                     ttl_s: Optional[float] = None) -> str:
-        upload_id = uuid.uuid4().hex
+                     ttl_s: Optional[float] = None,
+                     upload_id: Optional[str] = None) -> str:
+        upload_id = upload_id or uuid.uuid4().hex
         now = time.time()
         ttl = self.upload_ttl_s if ttl_s is None else float(ttl_s)
         with self.store.transaction() as conn:
@@ -77,6 +78,25 @@ class SubmissionService:
         data = dict(row)
         data["received_chunks"] = received
         return data
+
+    def complete_upload(self, upload_id: str, result: dict) -> None:
+        """Persist the response body so a retried finalize can replay it."""
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE uploads SET state='completed', result=?, updated_at=? WHERE upload_id=?",
+                (json.dumps(result, sort_keys=True, separators=(",", ":")), time.time(), upload_id),
+            )
+
+    def get_upload_result(self, upload_id: str) -> Optional[dict]:
+        row = self.store.query_one(
+            "SELECT state,result FROM uploads WHERE upload_id=?", (upload_id,)
+        )
+        if not row or row["state"] != "completed" or not row["result"]:
+            return None
+        try:
+            return json.loads(row["result"])
+        except ValueError:
+            return None
 
     def record_submission(self, *, client_key: str, round_no: int,
                           content_sha256: str, status: str = "accepted",

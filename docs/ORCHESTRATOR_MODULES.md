@@ -69,3 +69,34 @@ including a simulated restart that asserts pools, tasks, membership, and live
 tickets are reconstructed rather than dropped.
 
 The server repository has no writable fork yet, so this commit is local.
+
+## P1.2 — signed tickets and idempotent finalize
+
+Tickets are Ed25519-signed by a persistent node key
+(`orchestrator_node_key.pem`, mode 0600, created on first boot). The signing
+payload is canonical JSON with schema `ng-ticket-1` and binds:
+
+`ticketId`, `clientKey`, `round`, `taskId`, `poolId`, `createdAt`,
+`expiresAt`, `stepBudget`, `tokenBudget`, `nonce`, `baseWeights`.
+
+`baseWeights` is `step:<global_step>` for the current round, so a ticket issued
+before an aggregation is rejected with `base_weights_changed` instead of being
+applied to a different model.
+
+The signed object is included in the `/fl/task` metadata as `ticket`; the
+client can ignore it today. The server validates expiry, task id, ticket id,
+consumption, and base weights before accepting an upload. Rejections use
+`HTTPException(403, detail={"reason": "<machine-readable>"})`.
+
+Uploads now have durable rows from `/fl/submit/init`, per-chunk receipts, and a
+stored finalize response. A retried `finalize` after the in-memory upload
+context is gone returns the original body instead of `404`. Submission
+registration uses `sha256(ticketId + upload checksum)` as the unique content
+key, so a duplicate finalize cannot create a second delta.
+
+Evidence:
+
+- `pytest tests -q` in the server checkout → 8 passed.
+- `pytest tests/test_ng_server_harness.py -q` → 6 passed: duplicate finalize,
+  out-of-order chunks, expired ticket (`{"reason":"ticket_expired"}`), and
+  finalize replay after a simulated restart.

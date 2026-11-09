@@ -171,7 +171,8 @@ def _open_orchestrator():
         return None
     try:
         ORCH = Orchestrator.open(ORCH_DB_PATH,
-                                 publication_jsonl=BASE_DIR / "data" / "public_rounds.jsonl")
+                                 publication_jsonl=BASE_DIR / "data" / "public_rounds.jsonl",
+                                 identity_path=BASE_DIR / "orchestrator_node_key.pem")
         log.info(f"🗄️ Orchestrator state: {ORCH_DB_PATH} (SQLite WAL, schema {ORCH.store.schema_version()})")
         return ORCH
     except Exception as e:
@@ -424,15 +425,62 @@ def _persist_pool_removed(pool_id: str):
     except Exception as e: log.warning(f"⚠️ pool removal persist failed: {e}")
 
 def _persist_ticket(client_key: str, task_id: str, pool: Optional[dict] = None):
-    if ORCH is None: return
+    if ORCH is None: return None
     try:
-        ORCH.admission.issue(client_key, task_id, round_state["current_round"],
-                             pool_id=(pool or {}).get("pool_id"),
-                             step_budget=(pool or {}).get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
-                             token_budget=HARDEN["MAX_TOKENS_PER_STEP"] * max(1, (pool or {}).get("target_steps", 1)),
-                             ttl_s=MATCHMAKING["POOL_TIMEOUT_S"])
+        ticket = ORCH.admission.issue(client_key, task_id, round_state["current_round"],
+                                     pool_id=(pool or {}).get("pool_id"),
+                                     step_budget=(pool or {}).get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
+                                     token_budget=HARDEN["MAX_TOKENS_PER_STEP"] * max(1, (pool or {}).get("target_steps", 1)),
+                                     ttl_s=MATCHMAKING["POOL_TIMEOUT_S"],
+                                     base_weights=f"step:{global_step}")
+        t = task_tickets.get(client_key)
+        if t is not None and t.get("taskId") == task_id:
+            t["expiresAt"] = ticket.expires_at
+            t["ticketId"] = ticket.ticket_id
+            t["signature"] = ticket.signature
+            t["publicKey"] = ticket.public_key
+        return ticket
     except Exception as e:
         log.warning(f"⚠️ ticket persist failed: {e}")
+        return None
+
+def _ticket_info(client_key: str, task_id: str) -> Optional[dict]:
+    if ORCH is None: return None
+    try:
+        t = ORCH.admission.get(client_key)
+        if not t or t.task_id != task_id: return None
+        return {"schema": "ng-ticket-1", "ticketId": t.ticket_id, "nonce": t.nonce,
+                "round": t.round, "taskId": t.task_id, "poolId": t.pool_id,
+                "stepBudget": t.step_budget, "tokenBudget": t.token_budget,
+                "createdAt": t.created_at, "expiresAt": t.expires_at,
+                "baseWeights": t.base_weights,
+                "signature": t.signature, "publicKey": t.public_key}
+    except Exception as e:
+        log.warning(f"⚠️ ticket lookup failed: {e}")
+        return None
+
+def _ticket_rejection(client_key: str, task_id: Optional[str] = None,
+                      ticket_id: Optional[str] = None) -> Optional[str]:
+    """Return a machine-readable reason when the ticket cannot be used."""
+    if ORCH is None:
+        t = task_tickets.get(client_key)
+        if t is None: return None if not HARDEN["REQUIRE_TASK_TICKET"] else "ticket_missing"
+        if task_id and t.get("taskId") != task_id: return "ticket_task_mismatch"
+        exp = t.get("expiresAt")
+        if exp is not None and exp < time.time(): return "ticket_expired"
+        return None
+    try:
+        t = ORCH.admission.get(client_key)
+        if t is None: return "ticket_missing" if HARDEN["REQUIRE_TASK_TICKET"] else None
+        if ticket_id and t.ticket_id != ticket_id: return "ticket_mismatch"
+        if task_id and t.task_id != task_id: return "ticket_task_mismatch"
+        if t.base_weights and t.base_weights != f"step:{global_step}": return "base_weights_changed"
+        if t.expires_at < time.time(): return "ticket_expired"
+        if t.consumed: return "ticket_consumed"
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ ticket validation failed: {e}")
+        return "ticket_unavailable"
 
 def _persist_ticket_consumed(client_key: str, task_id: Optional[str]):
     if ORCH is None: return
@@ -442,7 +490,11 @@ def _persist_ticket_consumed(client_key: str, task_id: Optional[str]):
 def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict):
     if ORCH is None: return
     try:
-        key = hashlib.sha256(f"{pool['pool_id']}:{client_key}:{delta_path}".encode()).hexdigest()
+        content = meta.get("checksum")
+        if content:
+            key = hashlib.sha256(f"{meta.get('ticketId') or 'no-ticket'}:{content}".encode()).hexdigest()
+        else:
+            key = hashlib.sha256(f"path:{pool['pool_id']}:{client_key}:{delta_path}".encode()).hexdigest()
         ticket = ORCH.admission.get(client_key)
         loss = meta.get("loss")
         ORCH.submission.record_submission(
@@ -1568,6 +1620,8 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
                 "If targetOptimizer is set (adamw_fp32/adamw8bit), use that optimizer. "
                 "Report actualOptimizer in submit body.")},
     }
+    ticket = _ticket_info(client_key, pool["task_id"])
+    if ticket: metadata["ticket"] = ticket
     hf = _build_hf_weights_metadata("bf16")
     metadata["weights"] = hf or {"source": "coordinator", "reason": "hf_unavailable_or_step_mismatch"}
     return metadata
@@ -2508,6 +2562,13 @@ threading.Thread(target=hf_status_loop, daemon=True).start()
 
 # ============ SUBMISSION PROCESSING ============
 def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str, request: Request, init_meta: Optional[dict] = None):
+    _ticket_reason = _ticket_rejection(client_key,
+        task_id=((init_meta or {}).get("taskId")),
+        ticket_id=((init_meta or {}).get("ticketId")))
+    if _ticket_reason in ("ticket_expired", "ticket_mismatch", "ticket_task_mismatch",
+                          "ticket_consumed", "base_weights_changed"):
+        log.warning(f"🚫 {client_key}: ticket rejected ({_ticket_reason})")
+        raise HTTPException(status_code=403, detail={"reason": _ticket_reason})
     temp_delta_path = None; final_delta_path = None
     try:
         with open(dec_path, 'rb') as dec_f:
@@ -2658,6 +2719,8 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             safe_key = client_key.replace(":", "_").replace(".", "_")
             final_delta_path = str(DELTA_TEMP_DIR / f"delta_{safe_key}_{ts}.bin")
             delta_metadata = {"nodeKey": client_key, "nodeIp": client_ip,
+                "ticketId": ((init_meta or {}).get("ticketId") or body.get("ticketId")),
+                "checksum": ((init_meta or {}).get("checksum") or body.get("checksum")),
                 "delta_norm": delta_norm, "rank": rank, "loss": loss_float,
                 "localSteps": local_steps, "tokensProcessed": _bounded_tokens(body, client_key, local_steps),
                 "normalized": False, "submittedAt": int(time.time() * 1000), "weightFormat": "bf16",
@@ -2821,7 +2884,8 @@ def _duplicate_response(reason: str) -> dict:
 def _issue_ticket(client_key: str, task_id: str):
     with shard_lock:
         t = task_tickets.get(client_key)
-        if t and t.get("taskId") == task_id: return
+        if (t and t.get("taskId") == task_id
+                and t.get("expiresAt", float("inf")) > time.time()): return
         task_tickets[client_key] = {"taskId": task_id, "createdAt": time.time(), "round": round_state["current_round"]}
         _persist_ticket(client_key, task_id, pools.get(client_pool_map.get(client_key, "")))
         if len(task_tickets) > 20000:
@@ -3345,6 +3409,10 @@ async def submit_init(request: Request):
         if k not in data: raise HTTPException(status_code=400, detail=f"Missing field: {k}")
     task_id = str(data["taskId"])
     if task_id not in db["tasks"]: raise HTTPException(status_code=404, detail="Task expired")
+    _tr = _ticket_rejection(client_key, task_id=task_id, ticket_id=data.get("ticketId"))
+    if _tr in ("ticket_expired", "ticket_mismatch", "ticket_task_mismatch",
+               "ticket_consumed", "base_weights_changed"):
+        raise HTTPException(status_code=403, detail={"reason": _tr})
     try:
         total_bytes = int(data["totalBytes"]); chunk_size = int(data["chunkSize"])
         chunks = int(data["chunks"]); engram_sparse_count = int(data.get("engramSparseCount", 0) or 0)
@@ -3374,7 +3442,9 @@ async def submit_init(request: Request):
         "crossCheckUsed": data.get("crossCheckUsed", False),
         "actualSeed": data.get("actualSeed"), "actualSteps": data.get("actualSteps"),
         "actualBatchSize": data.get("actualBatchSize"),
-        "actualOptimizer": data.get("actualOptimizer")}
+        "actualOptimizer": data.get("actualOptimizer"),
+        "ticketId": data.get("ticketId"),
+        "checksum": checksum}
     with uploads_lock:
         _active_uploads[upload_id] = {"dir": up_dir, "created": time.time(), "last_activity": time.time(),
             "status": "open", "client_key": client_key, "client_ip": client_ip,
@@ -3382,6 +3452,14 @@ async def submit_init(request: Request):
             "chunks": chunks, "chunk_size": chunk_size, "total_bytes": total_bytes,
             "checksum": checksum, "meta": meta, "received": set(),
             "chunk_sizes": {}, "bytes_received": 0}
+    if ORCH is not None:
+        try:
+            ORCH.submission.begin_upload(client_key, upload_id=upload_id,
+                expected_bytes=total_bytes, chunk_size=chunk_size, chunks=chunks,
+                ticket_id=data.get("ticketId"), content_sha256=checksum,
+                ttl_s=UPLOAD_TTL_SECONDS)
+        except Exception as e:
+            log.warning(f"⚠️ upload persist failed: {e}")
     return {"uploadId": upload_id, "chunkSize": chunk_size, "chunks": chunks, "totalBytes": total_bytes}
 
 @app.post("/fl/submit/chunk")
@@ -3425,6 +3503,9 @@ async def submit_chunk(request: Request, uploadId: str, index: int):
             up["chunk_sizes"][index] = size
             up["bytes_received"] = up["bytes_received"] - old + size
             up["received"].add(index); up["last_activity"] = time.time()
+        if ORCH is not None:
+            try: ORCH.submission.mark_chunk(uploadId, index, size=size)
+            except Exception as e: log.warning(f"⚠️ chunk persist failed: {e}")
         return {"ok": True, "index": index, "size": size,
                 "receivedChunks": len(up["received"]), "totalChunks": up["chunks"]}
     finally:
@@ -3443,6 +3524,11 @@ async def submit_finalize(request: Request):
     except Exception: raise HTTPException(400, "Invalid JSON")
     upload_id = data.get("uploadId")
     if not _valid_upload_id(upload_id): raise HTTPException(400, "Invalid uploadId")
+    if ORCH is not None:
+        _replay = ORCH.submission.get_upload_result(upload_id)
+        if _replay is not None:
+            log.info(f"♻️ replaying finalized upload {upload_id}")
+            return JSONResponse(_replay)
     with uploads_lock:
         up = _active_uploads.get(upload_id)
         if not up: raise HTTPException(404, "Unknown uploadId")
@@ -3476,6 +3562,9 @@ async def submit_finalize(request: Request):
         if h.hexdigest() != up["checksum"]: raise HTTPException(400, "Checksum mismatch")
         result = await run_in_threadpool(_guarded_process, str(compressed_path), client_ip, client_key, request, up["meta"])
         completed = True
+        if ORCH is not None:
+            try: ORCH.submission.complete_upload(upload_id, result)
+            except Exception as e: log.warning(f"⚠️ finalize result persist failed: {e}")
         return result
     except HTTPException: raise
     except Exception as e:
