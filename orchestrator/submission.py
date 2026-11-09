@@ -102,7 +102,8 @@ class SubmissionService:
                           content_sha256: str, status: str = "accepted",
                           ticket_id: Optional[str] = None, pool_id: Optional[str] = None,
                           delta_path: Optional[str] = None, tokens: int = 0,
-                          steps: int = 0, loss_reported: Optional[str] = None) -> tuple[SubmissionView, bool]:
+                          steps: int = 0, loss_reported: Optional[str] = None,
+                          user_uuid: Optional[str] = None) -> tuple[SubmissionView, bool]:
         """Register one finalized delta.  The content hash is the idempotency key.
 
         Returns ``(submission, created)``.  A retry with the same content gets
@@ -118,11 +119,11 @@ class SubmissionService:
         with self.store.transaction() as conn:
             conn.execute(
                 "INSERT INTO submissions(submission_id,ticket_id,round,pool_id,client_key,"
-                "content_sha256,delta_path,tokens,steps,loss_reported,status,created_at,"
-                "finalized_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "user_uuid,content_sha256,delta_path,tokens,steps,loss_reported,status,"
+                "created_at,finalized_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (submission_id, ticket_id, int(round_no), pool_id, client_key,
-                 content_sha256, delta_path, int(tokens), int(steps), loss_reported,
-                 status, now, now),
+                 user_uuid, content_sha256, delta_path, int(tokens), int(steps),
+                 loss_reported, status, now, now),
             )
         row = self.store.query_one("SELECT * FROM submissions WHERE submission_id=?", (submission_id,))
         return _submission(row), True
@@ -152,7 +153,8 @@ class SubmissionService:
 def _submission(row) -> SubmissionView:
     return SubmissionView(
         submission_id=row["submission_id"], client_key=row["client_key"], round=row["round"],
-        content_sha256=row["content_sha256"], status=row["status"], created_at=row["created_at"],
+        content_sha256=row["content_sha256"], user_uuid=row["user_uuid"] if "user_uuid" in row.keys() else None,
+        status=row["status"], created_at=row["created_at"],
         finalized_at=row["finalized_at"], ticket_id=row["ticket_id"], pool_id=row["pool_id"],
         delta_path=row["delta_path"], tokens=row["tokens"], steps=row["steps"],
         loss_reported=row["loss_reported"],
