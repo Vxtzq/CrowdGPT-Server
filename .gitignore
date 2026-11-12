@@ -1,0 +1,39 @@
+# Local handoff
+.HANDOFF.md
+
+# Python bytecode and local tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+ENV/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Runtime data and generated server outputs
+/checkpoints/
+/data/
+/chunks/
+/pending_uploads/
+/work_tmp/
+/users.json
+/status.json
+/leaderboard.json
+/badge_tokens.json
+/public_events.jsonl*
+/public_log.json
+/loss_history.json
+/server.log*
+/hf_status_*/
