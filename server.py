@@ -173,7 +173,7 @@ HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = "YOUR ADMIN SECRET HERE"
+ADMIN_SECRET = "PUT AN ADMIN SECRET HERE"
 os.environ.setdefault("CROWDGPT_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 HF_WEIGHT_FILES = ["model_bf16.safetensors", "engram_bf16.safetensors"]
 
@@ -192,7 +192,7 @@ LORA_CONFIG = {
     "DEFAULT_RANK": MODEL_CONFIG["dim"], "WEIGHT_BY_RANK": True, "LOG_EFFECTIVE_RANK": True,
 }
 DATASET_CONFIG = {
-    "repoId": DATASET_REPO_ID, "totalChunks": 5482, "subChunkMB": 10,
+    "repoId": DATASET_REPO_ID, "totalChunks": 5659, "subChunkMB": 10,
     "tokensPerSample": MODEL_CONFIG["maxSeqLen"] + 1, "tokenBytes": 4,
 }
 
@@ -299,6 +299,34 @@ def load_delta_from_disk(filepath):
             engram_indices = None; engram_values = None
     return metadata, delta, engram_indices, engram_values
 
+def _client_ip_for(client_key: str) -> str:
+    """Best-effort source IP for a client key.
+    Falls back to the `ip:` prefix when client_hardware has been GC'd."""
+    if client_key.startswith("ip:"):
+        return client_key[3:]
+    hw = client_hardware.get(client_key)
+    return (hw.get("client_ip") if hw else "") or ""
+
+
+def _pool_contains_same_actor(pool: dict, client_key: str) -> bool:
+    """True if adding client_key to this pool would let one actor
+    (same user UUID, OR same source IP) occupy two or more slots.
+
+    One actor filling a pool defeats the mandatory cross-check: they
+    can submit N colluding or identical deltas and pass verification.
+    Applies to both logged-in clients (same UUID across devices) and
+    anonymous clients (same IP across 'identities')."""
+    my_uid = _user_id_from_key(client_key)
+    my_ip  = _client_ip_for(client_key)
+    for c in pool.get("clients", []):
+        if c == client_key:
+            continue
+        if my_uid and _user_id_from_key(c) == my_uid:
+            return True
+        if my_ip and _client_ip_for(c) == my_ip:
+            return True
+    return False
+
 # ============ GLOBAL STATE ============
 db = {"tasks": {}, "pendingSubmissions": {}, "shardMeta": {}}
 active_clients: Dict[str, float] = {}
@@ -333,7 +361,7 @@ FL_CONFIG = {
     "CONSENSUS_REQUIRED": 1, "CHECKPOINT_INTERVAL": 1,
     "MAX_CHECKPOINTS": int(os.getenv("CROWDGPT_MAX_CHECKPOINTS", "1")),
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
-    "SERVER_LR": 0.5, "WEIGHT_DECAY": 0.01,
+    "SERVER_LR": 1.0, "WEIGHT_DECAY": 0.00,
     "MAX_WEIGHT_NORM": 10000000000.0,
     "MAX_DELTA_APPLY_NORM": 1200.0,
     "LR_DECAY_STEPS": 50_000, "MIN_LR_MULT": 0.05,
@@ -413,6 +441,17 @@ CROSS_CHECK = {
     "BAN_THRESHOLD": _env_int("CROWDGPT_BYZANTINE_BAN_THRESHOLD", 3),
 }
 if CROSS_CHECK["COHORT_SIZE"] < 2: CROSS_CHECK["COHORT_SIZE"] = 3
+
+# bf16 in cross-checked pools. bf16 matmuls differ between GPU models/kernels, and over a few hundred
+# steps the tiny differences grow, so honest members get flagged as divergent.
+#   "off"    every cross-checked pool trains in fp32 (clients with bf16 are told to disable autocast)
+#   "arch"   (default) bf16 only between members of the SAME GPU generation (same arch class AND same compute
+#            capability, e.g. Ada with Ada); anything else -> fp32
+#   "strict" like "arch" but also the same card model (4090 with 4090 only)
+#   "on"     previous behaviour (bf16 pools may mix generations)
+# Power-solo pools are not cross-checked, so they keep the client's native precision in every mode.
+POOL_BF16 = os.getenv("CROWDGPT_POOL_BF16", "arch").strip().lower()
+if POOL_BF16 not in ("off", "arch", "strict", "on"): POOL_BF16 = "arch"
 if CROSS_CHECK["MAX_OVERFLOW"] < 0: CROSS_CHECK["MAX_OVERFLOW"] = 0
 if CROSS_CHECK["MAX_OVERFLOW"] > 2: CROSS_CHECK["MAX_OVERFLOW"] = 2
 if CROSS_CHECK["TARGET_BATCH_SIZE"] < 0: CROSS_CHECK["TARGET_BATCH_SIZE"] = 0
@@ -469,7 +508,25 @@ users_db = {"users": {}, "tokens": {}}
 users_lock = threading.Lock()
 PUB.resolver = lambda uid: (users_db["users"].get(uid) or {}).get("username")
 stats_lock = threading.Lock()
-BAD_WORDS = ["PUT BAD WORDS HERE TO PREVENT BAD USERNAMES"]
+
+# ── Per-IP auth rate limiting (registration + login) ──
+_register_attempts: Dict[str, list] = {}
+_login_attempts: Dict[str, list] = {}
+_auth_rate_lock = threading.Lock()
+
+def _rate_limit_auth(ip: str, bucket: dict, max_per_window: int, window_s: int) -> bool:
+    """Sliding-window per-IP limiter. Returns True if the request is allowed."""
+    now = time.time()
+    with _auth_rate_lock:
+        arr = [t for t in bucket.get(ip, []) if now - t < window_s]
+        if len(arr) >= max_per_window:
+            bucket[ip] = arr
+            return False
+        arr.append(now)
+        bucket[ip] = arr
+        return True
+
+BAD_WORDS = ["PUT BAD WORDS HERE"]
 
 def load_users_db():
     global users_db
@@ -932,6 +989,7 @@ def _hw_signature(client_key: str) -> tuple:
     bs       = int(hw.get("bs") or 0)
     bucket   = (1 << (bs.bit_length() - 1)) if bs > 0 else 0
     autocast = (hw.get("autocast") or "any").lower()
+    if POOL_BF16 == "off": autocast = "fp32"     # pools never train in bf16; fp32 pools accept any client
     optim    = (hw.get("optim")    or "any").lower()
     gpu      = hw.get("gpu") or ""
     cc       = (hw.get("compute_cap") or "").lower()
@@ -972,7 +1030,14 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     pool_ac   = str((pool_sig[2]   if len(pool_sig)   > 2 else "any") or "any").lower()
     client_ac = str((client_sig[2] if len(client_sig) > 2 else "any") or "any").lower()
     if pool_ac == "fp32": return True
-    if pool_ac == "bf16": return client_ac == "bf16"
+    if pool_ac == "bf16":
+        if client_ac != "bf16": return False
+        if POOL_BF16 in ("arch", "strict"):
+            # sig = (backend, bucket, autocast, optim, arch_class, card_class, cc)
+            if len(client_sig) < 7 or len(pool_sig) < 7: return False
+            if not client_sig[6] or client_sig[6] != pool_sig[6] or client_sig[4] != pool_sig[4]: return False   # same generation
+            if POOL_BF16 == "strict" and client_sig[5] != pool_sig[5]: return False                                 # same card model
+        return True
     return pool_ac == client_ac
 
 def _autocast_rank(pool_or_sig) -> int:
@@ -998,6 +1063,7 @@ def _pool_target_autocast(pool: dict) -> str:
         native = (hw.get("autocast") or "any").lower()
         return native if native in ("bf16", "fp32") else "fp32"
 
+    if POOL_BF16 == "off": return "fp32"
     pccs = _pool_ccs(pool)
     if len(pccs) <= 1:
         # Homogeneous (or unknown) → use the pool's creation autocast.
@@ -1063,11 +1129,11 @@ def _activate_pool(pool: dict):
 #   * ALL solo power deltas of a round are merged into ONE pseudo-pool, so however often a power user submits,
 #     the group counts once, scaled by POWER_SOLO_WEIGHT (default 0.5 = half a cross-checked pool).
 POWER = {
-    "SOLO_WEIGHT": min(1.0, max(0.05, _env_float("CROWDGPT_POWER_SOLO_WEIGHT", 0.5))),
+    "SOLO_WEIGHT": min(1.0, max(0.05, _env_float("CROWDGPT_POWER_SOLO_WEIGHT", 1.0))),
     "SOLO_ENABLED": os.getenv("CROWDGPT_POWER_SOLO_ENABLED", "1") == "1",
     # 1 (default): a power user joins ANY compatible forming pool that already has someone in it.
     # 0: only join a pool that their arrival completes; otherwise train solo right away (never waits).
-    "JOIN_ANY_POOL": os.getenv("CROWDGPT_POWER_JOIN_ANY_POOL", "1") == "1",
+    "JOIN_ANY_POOL": os.getenv("CROWDGPT_POWER_JOIN_ANY_POOL", "0") == "1",
 }
 POWER_POOL_ID = "power_solo"
 
@@ -1275,7 +1341,14 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
             if pool["status"] != "forming": continue
             if len(pool["clients"]) >= MATCHMAKING["POOL_SIZE"]: continue
             if not _pools_compatible(hw_sig, pool["hardware_sig"]): continue
-            # optional strict mode: power users only join a pool that their arrival completes
+            # NEW: never let one actor occupy two slots in the same pool.
+            # Closes:
+            #   - one account + multiple X-Client-Device headers
+            #   - N accounts registered from one IP joining the same pool
+            #   - one anonymous host on the same IP joining twice
+            if _pool_contains_same_actor(pool, client_key):
+                log.info(f"🚫 {client_key}: skipping pool {pool['pool_id']} (same actor already present)")
+                continue
             if power and not POWER["JOIN_ANY_POOL"] and len(pool["clients"]) + 1 < MATCHMAKING["POOL_SIZE"]: continue
             candidates.append(pool)
 
@@ -1544,6 +1617,23 @@ def _pool_cleanup_tick():
                     continue
 
                 if len(alive) >= 2:
+                    # NEW: refuse to activate a pool with duplicate actors
+                    # (defence in depth — _matchmake should already prevent this).
+                    seen_ids = set()
+                    has_dup = False
+                    for c in alive:
+                        uid = _user_id_from_key(c)
+                        ip  = _client_ip_for(c)
+                        if uid and ("u", uid) in seen_ids: has_dup = True; break
+                        if ip  and ("i", ip)  in seen_ids: has_dup = True; break
+                        if uid: seen_ids.add(("u", uid))
+                        if ip:  seen_ids.add(("i", ip))
+                    if has_dup:
+                        log.warning(f"🚫 Pool {pid}: duplicate actor among members — dissolving")
+                        for c in alive:
+                            if client_pool_map.get(c) == pid: client_pool_map.pop(c, None)
+                        pools.pop(pid, None)
+                        continue
                     if age > MATCHMAKING["FORMING_TIMEOUT_S"]:
                         log.info(f"⏱️ Activating {len(alive)}-client pool {pid} (ac={pool_ac})")
                         _activate_pool(pool)
@@ -1669,7 +1759,7 @@ def _extract_commit_sha(commit_info) -> Optional[str]:
 def _latest_hf_revision() -> Optional[str]:
     if not HF_ENABLED: return None
     try:
-        r = requests.head(f"https://huggingface.co/{HF_REPO_ID}/resolve/main/config.json", allow_redirects=False, timeout=15)
+        r = requests.head(f"https://huggingface.co/{HF_REPO_ID}/resolve/main/training_state.json", allow_redirects=False, timeout=15)
         sha = r.headers.get("x-repo-commit")
         if sha and len(sha) >= 12: return sha
         loc = r.headers.get("location", "")
@@ -1680,11 +1770,11 @@ def _latest_hf_revision() -> Optional[str]:
 def _get_hf_config_step(revision: Optional[str]) -> Optional[int]:
     if not revision: return None
     try:
-        r = requests.get(_hf_resolve_url(revision, "config.json"), timeout=20, allow_redirects=True)
+        r = requests.get(_hf_resolve_url(revision, "training_state.json"), timeout=20, allow_redirects=True)
         if r.ok:
             j = r.json(); gs = j.get("globalStep")
             if gs is not None: return int(gs)
-    except Exception as e: log.warning(f"Could not read HF config.json: {e}")
+    except Exception as e: log.warning(f"Could not read HF training_state.json: {e}")
     return None
 def _refresh_hf_file_info(revision: Optional[str]) -> Dict[str, Dict]:
     info = {}
@@ -1745,7 +1835,7 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                     "mlpHidden": MODEL_CONFIG["mlpHidden"], "weightTying": MODEL_CONFIG["weightTying"],
                     "globalStep": global_step, "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS,
                     "uploadedAt": datetime.now(timezone.utc).isoformat()}
-                with open(temp_dir / "config.json", 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=2)
+                with open(temp_dir / "training_state.json", 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=2)
                 commit = api.upload_folder(folder_path=str(temp_dir), repo_id=HF_REPO_ID, repo_type="model",
                     commit_message=f"Update step {global_step} round {round_state['current_round']}")
                 rev = _extract_commit_sha(commit) or _latest_hf_revision()
@@ -1767,7 +1857,7 @@ def sync_huggingface_state():
     try:
         api = HfApi(token=HF_TOKEN)
         files = set(api.list_repo_files(HF_REPO_ID, repo_type="model"))
-        required = HF_WEIGHT_FILES + ["config.json"]
+        required = HF_WEIGHT_FILES + ["training_state.json"]
         missing = [f for f in required if f not in files]
         if missing:
             log.warning(f"⚠️ Missing HF files: {missing}"); upload_to_huggingface(); return
@@ -2116,6 +2206,13 @@ def cleanup_loop():
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
         now = time.time(); now_ms = int(now * 1000)
+        # prune auth rate-limit buckets so memory stays bounded
+        with _auth_rate_lock:
+            for bucket in (_register_attempts, _login_attempts):
+                for k in list(bucket.keys()):
+                    bucket[k] = [t for t in bucket[k] if now - t < 3600]
+                    if not bucket[k]:
+                        del bucket[k]
         for key in list(active_clients.keys()):
             if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
         for k in list(client_hardware.keys()):
@@ -2477,6 +2574,15 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 if not pool or pool["status"] != "training":
                     log.warning(f"🚫 {client_key}: pool {pool_id} missing/not training")
                     return _duplicate_response("pool_gone")
+
+                # NEW: the submitter must be one of the clients the server
+                # itself placed in this pool. Closes the "fill remaining
+                # delta slots from outside" attack even if an attacker gets
+                # past submit_init via a stale uploadId or direct /fl/submit.
+                if client_key not in pool["clients"]:
+                    log.warning(f"🚫 {client_key}: not a member of pool {pool_id} — rejecting submission")
+                    return _duplicate_response("not_pool_member")
+
                 if client_key in pool["deltas"]:
                     log.warning(f"🚫 {client_key}: already submitted to {pool_id}")
                     return _duplicate_response("already_submitted")
@@ -2992,6 +3098,7 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
                         or _infer_compute_cap(
                             request.headers.get("X-Client-Gpu-Name") or "",
                             request.headers.get("X-Client-Backend") or "")),
+        "client_ip": client_ip,             # ← NEW: used by same-actor pool check
         "last_seen": time.time(),
     }
     hw = client_hardware[client_key]
@@ -3095,6 +3202,18 @@ async def submit_init(request: Request):
         if k not in data: raise HTTPException(status_code=400, detail=f"Missing field: {k}")
     task_id = str(data["taskId"])
     if task_id not in db["tasks"]: raise HTTPException(status_code=404, detail="Task expired")
+
+    # NEW: fail fast if the submitter is not a member of the task's pool.
+    # Without this, an attacker holding one slot could use submit_init to
+    # start uploading deltas from other identities. Fail here (before any
+    # chunks are accepted) rather than at finalize time, so the attack
+    # never wastes server disk or bandwidth.
+    _task_meta = db["tasks"][task_id]
+    with pool_lock:
+        _pool = pools.get(_task_meta.get("poolId"))
+        if not _pool or _pool["status"] != "training" or client_key not in _pool["clients"]:
+            log.warning(f"🚫 {client_key}: submit_init for {task_id} rejected — not a pool member")
+            raise HTTPException(status_code=403, detail="Not a member of this pool")
     try:
         total_bytes = int(data["totalBytes"]); chunk_size = int(data["chunkSize"])
         chunks = int(data["chunks"]); engram_sparse_count = int(data.get("engramSparseCount", 0) or 0)
@@ -3249,6 +3368,10 @@ async def submit_finalize(request: Request):
 # ============ AUTH ROUTES ============
 @app.post("/auth/register")
 async def register(request: Request):
+    client_ip = get_client_ip(request)
+    if not _rate_limit_auth(client_ip, _register_attempts, 3, 3600):
+        log.warning(f"🚫 Rate-limited registration from {client_ip}")
+        raise HTTPException(429, "Too many registrations from this IP; try again later")
     try: data = await request.json()
     except ClientDisconnect: raise HTTPException(499, "Client disconnected")
     except Exception: raise HTTPException(400, "Invalid JSON")
@@ -3278,6 +3401,10 @@ async def register(request: Request):
 
 @app.post("/auth/login")
 async def auth_login(request: Request):
+    client_ip = get_client_ip(request)
+    if not _rate_limit_auth(client_ip, _login_attempts, 20, 600):
+        log.warning(f"🚫 Rate-limited login from {client_ip}")
+        raise HTTPException(429, "Too many login attempts; try again later")
     try: data = await request.json()
     except ClientDisconnect: raise HTTPException(499, "Client disconnected")
     except Exception: raise HTTPException(400, "Invalid JSON")
@@ -3395,7 +3522,7 @@ async def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
 
 @app.post("/api/admin/reload")
 async def reload_checkpoint(step: int = -1, secret: str = ""):
-    global global_weights, global_step
+    global global_weights, global_engram_weights, global_step
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
     else:
@@ -3801,15 +3928,15 @@ async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int 
     hf_cache.mkdir(parents=True, exist_ok=True)
     log.warning(f"🔧 Restore-from-HF: revision={revision[:12]} requested_step={step}")
     try:
-        cfg_path = hf_hub_download(repo_id=HF_REPO_ID, filename="config.json",
+        cfg_path = hf_hub_download(repo_id=HF_REPO_ID, filename="training_state.json",
             revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache))
         with open(cfg_path, 'r', encoding='utf-8') as f: hf_cfg = json.load(f)
         hf_step = int(hf_cfg.get("globalStep", -1))
-        if hf_step < 0: raise ValueError("no globalStep in config.json")
-    except Exception as e: raise HTTPException(500, f"config.json at {revision}: {e}")
+        if hf_step < 0: raise ValueError("no globalStep in training_state.json")
+    except Exception as e: raise HTTPException(500, f"training_state.json at {revision}: {e}")
     if step < 0: step = hf_step
     elif step != hf_step:
-        log.warning(f"⚠️ Requested step={step} but config.json says {hf_step}; using requested")
+        log.warning(f"⚠️ Requested step={step} but training_state.json says {hf_step}; using requested")
     try:
         st_path = hf_hub_download(repo_id=HF_REPO_ID, filename="model_bf16.safetensors",
             revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache))
