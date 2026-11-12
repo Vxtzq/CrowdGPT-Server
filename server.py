@@ -2211,6 +2211,20 @@ def update_and_save_status(push_hf: bool = True):
             "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
             "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
             "readyPools": len(ready_pools)}
+        # Aggregate pool hardware breakdown by backend/precision/arch
+        pool_breakdown = {}
+        for pool in pools.values():
+            sig = pool.get("hardware_sig", ())
+            if len(sig) < 5: continue
+            backend = sig[0]
+            autocast = sig[2]
+            gpu_arch = sig[4]
+            key = f"{backend}-{autocast}-{gpu_arch}"
+            if key not in pool_breakdown:
+                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
+            pool_breakdown[key][pool["status"]] += 1
+            pool_breakdown[key]["clients"] += len(pool.get("clients", []))
+        mm_snapshot["poolBreakdown"] = pool_breakdown
     status_data = {"totalParticipants": total_participants,
         "totalContributions": lora_stats.get("total_submissions", 0),
         "activeGpus": active_gpus, "totalTokens": total_tokens,
@@ -4284,6 +4298,20 @@ async def get_stats(request: Request):
             "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
             "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
             "readyPools": len(ready_pools)}
+        # Pool hardware breakdown
+        pool_breakdown = {}
+        for pool in pools.values():
+            sig = pool.get("hardware_sig", ())
+            if len(sig) < 5: continue
+            backend = sig[0]
+            autocast = sig[2]
+            gpu_arch = sig[4]
+            key = f"{backend}-{autocast}-{gpu_arch}"
+            if key not in pool_breakdown:
+                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
+            pool_breakdown[key][pool["status"]] += 1
+            pool_breakdown[key]["clients"] += len(pool.get("clients", []))
+        mm["poolBreakdown"] = pool_breakdown
     return {"totalParticipants": total_users, "totalContributions": lora_stats.get("total_submissions", 0),
         "activeGpus": active_gpus, "totalTokens": global_stats["totalTokens"],
         "trainingLossChange": training_loss_change, "yourContribution": your_contribution,
