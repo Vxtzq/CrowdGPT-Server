@@ -162,6 +162,7 @@ try:
                                       record_hash, sign_record)
     from orchestrator.adversarial import plausible_loss
     from orchestrator.compression import iter_frames
+    from orchestrator.status import eval_fields
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     iter_frames = None
@@ -169,6 +170,10 @@ except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy 
     def plausible_loss(x):   # fallback when the orchestrator package is absent (the real one is imported above otherwise)
         try: v = float(x); return math.isfinite(v) and 0.0 <= v <= 100.0
         except (TypeError, ValueError): return False
+    def eval_fields(_state):  # without the orchestrator nothing is evaluated; publish that honestly
+        return {"heldoutLoss": None, "heldoutCi": None, "evalRound": None,
+                "evalSource": None, "evalMode": None, "evalStatus": "unevaluated",
+                "evalEvaluatedAt": None}
 else:
     _ORCH_IMPORT_ERROR = None
     LocalObjectStore = LocalObjectStore
@@ -176,6 +181,10 @@ ORCH = None
 OBJECT_STORE = None
 CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
 ROUND_BYTES_START = {"requests": 0, "bytesIn": 0, "bytesOut": 0}
+# Last round's evaluation, independent of the loss ratchet. `round` is updated
+# even when nothing was evaluated, so a new checkpoint cannot inherit the
+# previous round's held-out number (see orchestrator.status.eval_fields).
+eval_state = {"round": None, "eval": None, "updatedAt": None}
 NODE_ID = None
 ORCH_DB_PATH = Path(os.getenv("CROWDGPT_ORCHESTRATOR_DB", str(BASE_DIR / "orchestrator_state.sqlite3")))
 
@@ -2017,6 +2026,7 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
         prior = ORCH.publication.all_rounds()
         if prior: prev = record_hash(prior[-1]["record"])
         weights_hash = _model_digest()
+        eval_result = _round_eval(held)
         rec = build_round_record(
             round_no=rnd, opened_at=opened, closed_at=closed,
             base_weights=digest_of({"model": weights_hash,
@@ -2025,13 +2035,15 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
                                          "step": view.global_step}),
             leader=NODE_ID or "node-unknown", witnesses=(),
             tickets_root=tickets_root, submissions_root=submissions_root,
-            deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
+            deltas_root=deltas_root, prev_record_hash=prev, eval=eval_result,
             bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
             bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
             code_versions=("3.3",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
         ORCH.publication.publish_round(rnd, rec)
         _write_nutrition(rec, rnd, rec.get("eval"))
+        eval_state.update({"round": int(rnd), "eval": eval_result,
+                           "updatedAt": datetime.now(timezone.utc).isoformat()})
         mirror = os.getenv("CROWDGPT_AUDIT_MIRROR", "").strip()
         if mirror:
             try:
@@ -2182,6 +2194,8 @@ def load_global_state():
             global_stats["lossHistory"] = global_stats.get("lossHistory", [])[-100:]
         if "loraStats" in state:
             lora_stats.clear(); lora_stats.update(state["loraStats"])
+        if isinstance(state.get("lastEval"), dict):
+            eval_state.clear(); eval_state.update(state["lastEval"])
         log.info(f"✅ Loaded state → step {global_step}, tokens {global_stats.get('totalTokens', 0):,}")
     except Exception as e: log.error(f"❌ Failed to parse global_state.json: {e}")
 
@@ -2189,7 +2203,7 @@ def save_global_state():
     try:
         state_data = {"globalStep": global_step, "savedAt": datetime.now(timezone.utc).isoformat(),
             "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS, "modelConfig": MODEL_CONFIG,
-            "globalStats": global_stats, "loraStats": lora_stats}
+            "globalStats": global_stats, "loraStats": lora_stats, "lastEval": eval_state}
         temp_file = GLOBAL_STATE_FILE.with_suffix('.tmp')
         with open(temp_file, 'w', encoding='utf-8') as f: json.dump(state_data, f, indent=2)
         os.replace(temp_file, GLOBAL_STATE_FILE)
@@ -2415,6 +2429,8 @@ def update_and_save_status(push_hf: bool = True):
         "activeGpus": active_gpus, "totalTokens": total_tokens,
         "trainingLossChange": training_loss_change, "globalStep": global_step,
         "lastLoss": global_stats["lastLoss"],
+        "trainLoss": global_stats["lastLoss"], "lossKind": "training",
+        **eval_fields(eval_state),
         "updatedAt": datetime.now(timezone.utc).isoformat(),
         "currentRound": round_state["current_round"],
         "hfRevision": current_hf_revision, "hfRevisionStep": hf_revision_global_step,
