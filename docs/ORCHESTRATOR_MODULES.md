@@ -11,11 +11,14 @@ HTTP-free package:
 | `orchestrator/submission.py` | upload bookkeeping and idempotent submissions |
 | `orchestrator/verification.py` | one verdict per submission, with evidence |
 | `orchestrator/publication.py` | append-only round publications + JSONL mirror |
+| `orchestrator/lora.py` | LoRA wire format, dense expansion, and train-mode/rank checks |
 | `orchestrator/service.py` | `Orchestrator` facade that wires the services |
 
 No module imports FastAPI. `tests/test_orchestrator_modules.py` asserts that in
 a subprocess (`fastapi` must not appear in `sys.modules`) and exercises every
-service directly.
+service directly. `orchestrator/lora.py` follows the same rule: it is pure
+numpy + struct, so the `NGL1` decoder and the train-mode rules are testable
+without the HTTP layer.
 
 ## Storage
 

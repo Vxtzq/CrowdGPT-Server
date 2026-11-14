@@ -170,6 +170,14 @@ except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy 
 else:
     _ORCH_IMPORT_ERROR = None
     LocalObjectStore = LocalObjectStore
+
+# LoRA wire format + train-mode checks.  Imported separately from the block
+# above so a deployment with an older orchestrator package still keeps its
+# durable state; it simply rejects LoRA submissions instead.
+try:
+    from orchestrator import lora as lora_wire
+except Exception:  # pragma: no cover - exercised by legacy deployments
+    lora_wire = None
 ORCH = None
 OBJECT_STORE = None
 CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
@@ -320,6 +328,11 @@ def _decode_delta_chunk(buf: bytearray, fmt: str) -> torch.Tensor:
     return torch.frombuffer(buf, dtype=torch.uint16).view(torch.bfloat16).to(torch.float32)
 
 def _encode_float32_to_bf16_bytes(t: torch.Tensor) -> bytes: return t.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
+
+def _encode_delta_chunk(t: torch.Tensor, fmt: str) -> bytes:
+    """Encode a dense delta chunk in the format the delta file declares."""
+    if fmt == "fp16": return t.clamp(-65504.0, 65504.0).to(torch.float16).view(torch.uint16).numpy().tobytes()
+    return _encode_float32_to_bf16_bytes(t)
 
 # ============ DISK-BASED DELTA STORAGE ============
 def save_delta_to_disk(client_ip, delta, engram_indices, engram_values, metadata):
@@ -639,6 +652,7 @@ def _restore_orchestrator_state() -> bool:
                 pools[pv.pool_id] = p
                 for c in pv.clients: client_pool_map[c] = pv.pool_id
                 if pv.task_id:
+                    _mode, _lora_rank, _trained = _train_mode_for_sig(tuple(pv.hardware_sig))
                     db["tasks"][pv.task_id] = {
                         "poolId": pv.pool_id, "shardId": pv.pool_id,
                         "chunkIdx": pv.chunk_idx, "round": pv.round,
@@ -649,6 +663,8 @@ def _restore_orchestrator_state() -> bool:
                         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
                         "targetAutocast": pv.target_autocast or CROSS_CHECK["TARGET_AUTOCAST"],
                         "targetOptimizer": pv.target_optimizer or CROSS_CHECK["TARGET_OPTIMIZER"],
+                        "trainMode": _mode, "loraRank": _lora_rank,
+                        "trainedParams": _trained,
                     }
         with shard_lock:
             task_tickets.clear()
@@ -1323,7 +1339,11 @@ def _hw_signature(client_key: str) -> tuple:
     optim    = (hw.get("optim")    or "any").lower()
     gpu      = hw.get("gpu") or ""
     cc       = (hw.get("compute_cap") or "").lower()
-    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc)
+    base = (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc)
+    if lora_wire is None: return base
+    # Positions 7/8: training mode and adapter rank are part of pool identity.
+    mode = lora_wire.train_mode_of(hw.get("train_mode"))
+    return base + (mode, lora_wire.rank_of(hw.get("lora_rank")) if mode == "lora" else 0)
 
 def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     """v2.3 ASYMMETRIC matching — backend exact, optimizer normalize+wildcard,
@@ -1345,6 +1365,11 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     Arch is intentionally ignored (cross-arch tolerated at 5× threshold)."""
     if len(client_sig) < 4 or len(pool_sig) < 4: return False
     if client_sig[0] != pool_sig[0]: return False  # backend exact
+    # A LoRA direction and a full-parameter update are not comparable in the
+    # cross-check, and neither are two different ranks, so a training-mode
+    # mismatch never shares a pool.  Legacy signatures read as dense/0.
+    if lora_wire is not None and not lora_wire.signatures_compatible(client_sig, pool_sig):
+        return False
 
     def _norm_opt(s):
         s = str(s or "any").lower()
@@ -1369,6 +1394,15 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
             if POOL_BF16 == "strict" and client_sig[5] != pool_sig[5]: return False                                 # same card model
         return True
     return pool_ac == client_ac
+
+def _train_mode_for_sig(sig) -> tuple:
+    """(trainMode, loraRank, trainedParams) for a pool hardware signature.
+
+    Derived from the pool's signature — the identity frozen at creation — so a
+    task cannot flip mode because a member reconnected with other headers."""
+    if lora_wire is None: return "dense", 0, ["base"] + (["engram"] if ENG_PARAMS else [])
+    mode, rank = lora_wire.signature_mode(sig)
+    return mode, rank, lora_wire.trained_params(mode, has_engram=bool(ENG_PARAMS))
 
 def _autocast_rank(pool_or_sig) -> int:
     """Rank autocast precision for matchmaking priority.
@@ -1431,6 +1465,7 @@ def _activate_pool(pool: dict):
              f"targetOptimizer={pool_optimizer}")
     pool.update({"status": "training", "chunk_idx": chunk_idx, "task_id": task_id,
         "target_seed": target_seed, "activated_at": time.time(), "target_steps": target_steps})
+    train_mode, lora_rank, trained = _train_mode_for_sig(pool.get("hardware_sig") or ())
     db["tasks"][task_id] = {
         "poolId": pool_id, "shardId": pool_id, "chunkIdx": chunk_idx,
         "round": round_state["current_round"], "createdAt": int(time.time() * 1000),
@@ -1439,6 +1474,7 @@ def _activate_pool(pool: dict):
         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
         "targetAutocast": pool_autocast,
         "targetOptimizer": pool_optimizer,
+        "trainMode": train_mode, "loraRank": lora_rank, "trainedParams": trained,
     }
     with shard_lock:
         current_data_shard.update({"chunkIdx": chunk_idx, "shardId": pool_id,
@@ -1748,11 +1784,15 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
         return new_pool
 
 def _build_task_payload(pool: dict, client_key: str) -> dict:
+    train_mode, lora_rank, trained = _train_mode_for_sig(pool.get("hardware_sig") or ())
     metadata = {
         "taskId": pool["task_id"], "globalStep": global_step,
         "currentRound": round_state["current_round"],
         "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS, "modelConfig": MODEL_CONFIG,
         "weightFormat": "bf16",
+        # The client must train exactly what the pool was matched on: a dense
+        # pool trains base weights, a LoRA pool trains rank-r adapters.
+        "trainMode": train_mode, "loraRank": lora_rank, "trainedParams": trained,
         "datasetConfig": {"repoId": DATASET_CONFIG["repoId"], "chunkIdx": pool["chunk_idx"],
             "totalChunks": dataset_info["totalChunks"], "subChunkSize": DATASET_CONFIG["subChunkMB"] * 1024 * 1024,
             "epoch": data_position["epoch"], "tokensPerSample": DATASET_CONFIG["tokensPerSample"],
@@ -2910,7 +2950,8 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if len(payload_bytes) < payload_len: raise HTTPException(status_code=400, detail="Incomplete JSON")
             body = json.loads(payload_bytes.decode('utf-8'))
             if init_meta:
-                for k in ("taskId", "weightFormat", "hasEngram", "engramSparseCount"):
+                for k in ("taskId", "weightFormat", "hasEngram", "engramSparseCount",
+                          "isLoRA", "loraRank", "trainMode", "trainedParams"):
                     if k in init_meta and body.get(k) != init_meta.get(k):
                         raise HTTPException(status_code=400, detail=f"Init mismatch: {k}")
             _q = _check_submission_quota(client_key, client_ip)
@@ -2926,21 +2967,69 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS:
                 raise HTTPException(status_code=400, detail="Invalid engramSparseCount")
             bpp = _bytes_per_param(fmt)
+            # LoRA clients advertise the mode in the body; a LoRA submission is
+            # a compact adapter payload instead of MODEL_SIZE dense parameters.
+            lora_rank_declared = lora_wire.rank_of(body.get("loraRank")) if lora_wire is not None else 0
+            is_lora = bool(body.get("isLoRA")) or lora_rank_declared > 0
+            if is_lora:
+                if lora_wire is None:
+                    raise HTTPException(status_code=503, detail="LoRA submissions unsupported on this deployment")
+                if fmt not in ("bf16", "fp16"):
+                    # fp8 cannot represent adapter updates this small.
+                    raise HTTPException(status_code=400, detail="LoRA payload must be bf16 or fp16")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as tdf:
                 temp_delta_path = tdf.name
             norm_sq = 0.0; offset = 0; has_nan_inf = False
             with open(temp_delta_path, 'wb') as td:
-                while offset < MODEL_SIZE:
-                    read_params = min(10_000_000, MODEL_SIZE - offset)
-                    chunk_bytes = dec_f.read(read_params * bpp)
-                    if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
-                        raise HTTPException(status_code=400, detail="Incomplete base delta payload")
-                    td.write(chunk_bytes)
-                    chunk_t = _decode_delta_chunk(bytearray(chunk_bytes), fmt)
-                    if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
-                        has_nan_inf = True; break
-                    norm_sq += torch.sum(chunk_t * chunk_t).item()
-                    offset += read_params; del chunk_t
+                if is_lora:
+                    blob = dec_f.read()
+                    tail_len = 0
+                    if has_engram and engram_sparse_count > 0:
+                        tail_len = (4 + engram_sparse_count * 4
+                                    + engram_sparse_count * MODEL_CONFIG["dim"] * bpp)
+                    if tail_len:
+                        if len(blob) < tail_len + 1:
+                            raise HTTPException(status_code=400, detail="Truncated LoRA engram tail")
+                        # Leave the sparse engram rows for the shared reader below.
+                        # The LoRA tail is prefixed with its own row count (the dense
+                        # tail is not), so consume and check it here.
+                        blob = blob[:-tail_len]
+                        dec_f.seek(-tail_len, os.SEEK_CUR)
+                        declared_rows = struct.unpack(
+                            "<I", read_exact(dec_f, 4))[0]
+                        if declared_rows != engram_sparse_count:
+                            raise HTTPException(status_code=400,
+                                                detail="LoRA engram row count mismatch")
+                    if len(blob) > MODEL_SIZE * 2:
+                        raise HTTPException(status_code=400, detail="LoRA payload larger than a dense delta")
+                    try:
+                        adapters = lora_wire.decode_payload(blob, model_size=MODEL_SIZE)
+                    except Exception as exc:
+                        raise HTTPException(status_code=400, detail=f"Invalid LoRA payload: {exc}")
+                    if lora_rank_declared and any(
+                            int(item["a"].shape[0]) != lora_rank_declared for item in adapters):
+                        raise HTTPException(status_code=400,
+                                            detail="Invalid LoRA payload: loraRank does not match adapter factors")
+                    # Expand into the dense stream the cross-check and aggregation
+                    # path consumes, one chunk at a time so no multi-GB buffer lives on the heap.
+                    for chunk in lora_wire.iter_dense_chunks(adapters, MODEL_SIZE):
+                        chunk_t = torch.from_numpy(chunk)
+                        norm_sq += torch.sum(chunk_t * chunk_t).item()
+                        td.write(_encode_delta_chunk(chunk_t, fmt))
+                        del chunk_t
+                    del adapters
+                else:
+                    while offset < MODEL_SIZE:
+                        read_params = min(10_000_000, MODEL_SIZE - offset)
+                        chunk_bytes = dec_f.read(read_params * bpp)
+                        if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
+                            raise HTTPException(status_code=400, detail="Incomplete base delta payload")
+                        td.write(chunk_bytes)
+                        chunk_t = _decode_delta_chunk(bytearray(chunk_bytes), fmt)
+                        if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
+                            has_nan_inf = True; break
+                        norm_sq += torch.sum(chunk_t * chunk_t).item()
+                        offset += read_params; del chunk_t
             if has_nan_inf:
                 ban_subnet(client_ip, "submitted NaN/Inf delta")
                 raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
@@ -2977,6 +3066,16 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             task_id = body.get("taskId")
             task_meta = db["tasks"].get(task_id)
             if task_meta is None: raise HTTPException(status_code=404, detail="Task expired")
+            # The task (derived from the pool's frozen signature and bound by the
+            # ticket's taskId) decides the mode; the submission must agree with it,
+            # so a dense delta can never be aggregated into a LoRA pool.
+            if lora_wire is not None:
+                try:
+                    is_lora, lora_rank_declared = lora_wire.check_submission(task_meta, body)
+                except ValueError as exc:
+                    log.warning(f"🚫 {client_key}: train-mode rejection ({exc})")
+                    PUB.event("train_mode_rejected", client=PUB.who(client_key), reason=str(exc))
+                    raise HTTPException(status_code=400, detail={"reason": str(exc)})
             if task_meta.get("round") != round_state["current_round"]:
                 log.info(f"🚫 {client_key}: stale submission — task round {task_meta.get('round')}, current round {round_state['current_round']}")
                 return _duplicate_response("stale_round")
@@ -3063,6 +3162,9 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
                 "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
                 "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
+                "trainMode": "lora" if is_lora else "dense", "isLoRA": bool(is_lora),
+                "loraRank": int(lora_rank_declared) if is_lora else 0,
+                "trainedParams": list(body.get("trainedParams") or []),
             }
             if delta_norm > max_allowed:
                 scale_factor = max_allowed / delta_norm
@@ -3667,6 +3769,11 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
                         or _infer_compute_cap(
                             request.headers.get("X-Client-Gpu-Name") or "",
                             request.headers.get("X-Client-Backend") or "")),
+        # Training mode is part of the pool identity, not a scheduling hint.
+        "train_mode": (lora_wire.train_mode_of(request.headers.get("X-Client-Train-Mode"))
+                       if lora_wire is not None else "dense"),
+        "lora_rank": (lora_wire.rank_of(request.headers.get("X-Client-Lora-Rank"))
+                      if lora_wire is not None else 0),
         "client_ip": client_ip,             # ← NEW: used by same-actor pool check
         "last_seen": time.time(),
     }
@@ -3816,6 +3923,13 @@ async def submit_init(request: Request):
         if not _pool or _pool["status"] != "training" or client_key not in _pool["clients"]:
             log.warning(f"🚫 {client_key}: submit_init for {task_id} rejected — not a pool member")
             raise HTTPException(status_code=403, detail="Not a member of this pool")
+    # Same fail-fast rule for train mode: refuse a dense upload into a LoRA pool
+    # (or the reverse) before any chunk reaches disk.
+    if lora_wire is not None:
+        try: lora_wire.check_submission(_task_meta, data)
+        except ValueError as exc:
+            log.warning(f"🚫 {client_key}: submit_init for {task_id} rejected — {exc}")
+            raise HTTPException(status_code=400, detail={"reason": str(exc)})
     try:
         total_bytes = int(data["totalBytes"]); chunk_size = int(data["chunkSize"])
         chunks = int(data["chunks"]); engram_sparse_count = int(data.get("engramSparseCount", 0) or 0)
@@ -3841,7 +3955,9 @@ async def submit_init(request: Request):
         "checksum": checksum, "weightFormat": fmt, "hasEngram": has_engram,
         "engramSparseCount": engram_sparse_count, "loss": data.get("loss"),
         "localSteps": data.get("localSteps"), "tokensProcessed": data.get("tokensProcessed"),
-        "loraRank": data.get("loraRank"), "isDelta": data.get("isDelta", True),
+        "loraRank": data.get("loraRank"), "isLoRA": data.get("isLoRA"),
+        "trainMode": data.get("trainMode"), "trainedParams": data.get("trainedParams"),
+        "isDelta": data.get("isDelta", True),
         "crossCheckUsed": data.get("crossCheckUsed", False),
         "actualSeed": data.get("actualSeed"), "actualSteps": data.get("actualSteps"),
         "actualBatchSize": data.get("actualBatchSize"),
