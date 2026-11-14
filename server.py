@@ -99,7 +99,7 @@ import numpy as np
 import torch
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import ipaddress
@@ -157,6 +157,10 @@ tempfile.tempdir = str(WORK_TMP)   # NamedTemporaryFile(...) now lands here: swe
 try:
     from orchestrator import Orchestrator
     from orchestrator.objects import LocalObjectStore
+    from orchestrator.nodes import NodeRegistry, local_node_record, node_id_for
+    from orchestrator.records import (build_round_record, digest_of, merkle_root,
+                                      record_hash, sign_record)
+    from orchestrator.adversarial import plausible_loss
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     _ORCH_IMPORT_ERROR = _orch_import_err
@@ -166,6 +170,8 @@ else:
 ORCH = None
 OBJECT_STORE = None
 CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
+ROUND_BYTES_START = {"requests": 0, "bytesIn": 0, "bytesOut": 0}
+NODE_ID = None
 ORCH_DB_PATH = Path(os.getenv("CROWDGPT_ORCHESTRATOR_DB", str(BASE_DIR / "orchestrator_state.sqlite3")))
 
 def _open_orchestrator():
@@ -192,6 +198,18 @@ def _open_orchestrator():
                 obj_dir, secret=secret,
                 url_base=os.getenv("CROWDGPT_OBJECT_URL_BASE", "/fl/object"))
             log.info(f"📦 Object store: {obj_dir} (presigned PUT)")
+        try:
+            global NODE_ID
+            reg = NodeRegistry(ORCH.store)
+            rec = local_node_record(ORCH.identity,
+                endpoints=[os.getenv("CROWDGPT_PUBLIC_URL", "http://localhost:5006")],
+                roles=["leader", "witness", "validator"],
+                software_version="3.2", started_at=datetime.now(timezone.utc).isoformat())
+            reg.register(rec)
+            NODE_ID = rec["node_id"]
+            log.info(f"🪪 Node identity: {NODE_ID}")
+        except Exception as e:
+            log.warning(f"⚠️ node registration failed: {e}")
         return ORCH
     except Exception as e:
         log.error(f"❌ Could not open orchestrator state {ORCH_DB_PATH}: {e}")
@@ -527,6 +545,33 @@ def _ticket_rejection(client_key: str, task_id: Optional[str] = None,
     except Exception as e:
         log.warning(f"⚠️ ticket validation failed: {e}")
         return "ticket_unavailable"
+
+def _capture_client_key(client_key: str, request: Request) -> None:
+    pub = (request.headers.get("X-Client-Pubkey") or "").lower().strip()
+    if ORCH is None or len(pub) != 64 or any(c not in "0123456789abcdef" for c in pub):
+        return
+    try: ORCH.receipts.register_key(client_key, pub)
+    except Exception as e: log.warning(f"⚠️ client key persist failed: {e}")
+
+def _check_receipt(client_key: str, init_meta: Optional[dict]) -> Optional[str]:
+    receipt = (init_meta or {}).get("receipt")
+    if not receipt: return None
+    if ORCH is None: return "receipt_unavailable"
+    sig = (init_meta or {}).get("receiptSig") or ""
+    pub = (init_meta or {}).get("clientPubkey") or ""
+    if not sig or len(pub) != 64: return "receipt_signature_missing"
+    ok, reason = ORCH.receipts.verify_and_record(client_key, receipt, sig, pub)
+    if not ok: return reason
+    ticket = ORCH.admission.get(client_key)
+    if ticket is None: return "receipt_ticket_missing"
+    if receipt.get("ticket_id") != ticket.ticket_id: return "receipt_ticket_mismatch"
+    if int(receipt.get("round", -1)) != round_state["current_round"]: return "receipt_round_mismatch"
+    expected_base = hashlib.sha256(f"step:{global_step}".encode()).hexdigest()
+    if receipt.get("base_weights") != expected_base: return "receipt_base_mismatch"
+    fr = receipt.get("fingerprint_root")
+    if fr is not None and (not isinstance(fr, str) or len(fr) != 64):
+        return "receipt_fingerprint_invalid"
+    return None
 
 def _persist_ticket_consumed(client_key: str, task_id: Optional[str]):
     if ORCH is None: return
@@ -1860,6 +1905,65 @@ def _pub_pool_result(pool: dict, survivors) -> None:
                   power_solo=bool(pool.get("power")))
     except Exception: pass
 
+def _model_digest() -> str:
+    h = hashlib.sha256()
+    for t in (global_weights, global_engram_weights):
+        if t is None: continue
+        view = t.detach().cpu().contiguous().view(torch.uint8).numpy()
+        h.update(memoryview(view))
+    return h.hexdigest()
+
+def _round_roots(rnd: int) -> tuple[str, str, str]:
+    tickets = ORCH.admission.load_all(rnd) if ORCH is not None else {}
+    t_leaves = [digest_of({"ticket": t.ticket_id, "client": t.client_key,
+                           "task": t.task_id, "round": t.round})
+                for t in tickets.values()]
+    subs = ORCH.submission.load_submissions(round_no=rnd) if ORCH is not None else []
+    s_leaves = [digest_of({"id": s.submission_id, "client": s.client_key,
+                           "content": s.content_sha256, "tokens": s.tokens})
+                for s in subs]
+    d_leaves = [digest_of({"content": s.content_sha256, "path": s.delta_path or ""})
+                for s in subs]
+    return merkle_root(t_leaves), merkle_root(s_leaves), merkle_root(d_leaves)
+
+def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -> None:
+    if ORCH is None: return
+    try:
+        view = ORCH.scheduling.load_round(rnd)
+        if view is None: return
+        opened = datetime.fromtimestamp(view.started_at, tz=timezone.utc).isoformat()
+        closed = datetime.now(timezone.utc).isoformat()
+        tickets_root, submissions_root, deltas_root = _round_roots(rnd)
+        prev = None
+        prior = ORCH.publication.all_rounds()
+        if prior: prev = record_hash(prior[-1]["record"])
+        weights_hash = _model_digest()
+        rec = build_round_record(
+            round_no=rnd, opened_at=opened, closed_at=closed,
+            base_weights=digest_of({"model": weights_hash,
+                                    "step": view.global_step - (1 if success else 0)}),
+            aggregate_weights=digest_of({"model": weights_hash,
+                                         "step": view.global_step}),
+            leader=NODE_ID or "node-unknown", witnesses=(),
+            tickets_root=tickets_root, submissions_root=submissions_root,
+            deltas_root=deltas_root, prev_record_hash=prev, eval=None,
+            bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
+            bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
+            code_versions=("3.2",))
+        rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
+        ORCH.publication.publish_round(rnd, rec)
+        mirror = os.getenv("CROWDGPT_AUDIT_MIRROR", "").strip()
+        if mirror:
+            try:
+                Path(mirror).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(BASE_DIR / "data" / "public_rounds.jsonl", mirror)
+            except Exception as e:
+                log.warning(f"⚠️ audit mirror failed: {e}")
+        ROUND_BYTES_START.update({k: CONTROL_PLANE[k] for k in ROUND_BYTES_START})
+        log.info(f"🧾 Signed round record {rnd} ({record_hash(rec)[:12]}…)")
+    except Exception as e:
+        log.warning(f"⚠️ signed round record failed: {e}")
+
 def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -> None:
     try:
         held = loss_ratchet_state.get("lastAcceptedLoss") if HARDEN["LOSS_CHECK_MODE"] != "off" else None
@@ -1867,13 +1971,7 @@ def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -
         PUB.event("round_end", round=rnd, step=global_step, pools=n_pools, applied=bool(success),
                   rolled_back=bool(loss_rejected), loss=row.get("loss"), heldout=held)
         PUB.event("round_start", round=rnd + 1, step=global_step)
-        if ORCH is not None:
-            ORCH.publication.publish_round(rnd, {
-                "schema": "ng-legacy-1", "round": rnd, "step": global_step,
-                "success": bool(success), "lossRejected": bool(loss_rejected),
-                "pools": int(n_pools), "lossReported": row.get("loss"),
-                "lossHeldOut": held, "source": "coordinator",
-            })
+        _publish_round_record(rnd, success, loss_rejected, n_pools)
         PUB.export_static()
     except Exception: pass
 
@@ -2172,6 +2270,8 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                     "globalStep": global_step, "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS,
                     "uploadedAt": datetime.now(timezone.utc).isoformat()}
                 with open(temp_dir / "training_state.json", 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=2)
+                _audit_jsonl = BASE_DIR / "data" / "public_rounds.jsonl"
+                if _audit_jsonl.exists(): shutil.copy2(_audit_jsonl, temp_dir / "rounds.jsonl")
                 commit = api.upload_folder(folder_path=str(temp_dir), repo_id=HF_REPO_ID, repo_type="model",
                     commit_message=f"Update step {global_step} round {round_state['current_round']}")
                 rev = _extract_commit_sha(commit) or _latest_hf_revision()
@@ -2658,6 +2758,7 @@ def round_watchdog():
                             if not _finish_with_loss_check(step_before):
                                 loss_rejected = True; success = False
                     else: log.warning("⚠️ Round ended with no completed pools")
+                    ended_round_started_at = round_state["round_start_time"]
                     with shard_lock:
                         if success or loss_rejected:
                             current_data_shard["consumed"] = True
@@ -2673,7 +2774,7 @@ def round_watchdog():
                         round_state["force_end_at"] = None
                     if ORCH is not None:
                         try: ORCH.scheduling.save_round(current_round_ending, state="closed",
-                                                        started_at=round_state["round_start_time"],
+                                                        started_at=ended_round_started_at,
                                                         duration_hours=round_state["round_duration_hours"],
                                                         last_aggregation_at=round_state["last_aggregation_time"],
                                                         force_end_at=None, global_step=global_step,
@@ -2715,6 +2816,10 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                           "ticket_consumed", "base_weights_changed"):
         log.warning(f"🚫 {client_key}: ticket rejected ({_ticket_reason})")
         raise HTTPException(status_code=403, detail={"reason": _ticket_reason})
+    _receipt_reason = _check_receipt(client_key, init_meta)
+    if _receipt_reason:
+        log.warning(f"🚫 {client_key}: receipt rejected ({_receipt_reason})")
+        raise HTTPException(status_code=403, detail={"reason": _receipt_reason})
     temp_delta_path = None; final_delta_path = None
     try:
         with open(dec_path, 'rb') as dec_f:
@@ -2850,12 +2955,16 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             except Exception: local_steps = 1
             if local_steps <= 0: local_steps = 1
             local_steps = min(local_steps, HARDEN["MAX_LOCAL_STEPS"])
-            loss_raw = body.get("loss"); loss_float = None
+            loss_raw = body.get("loss", (init_meta or {}).get("loss")); loss_float = None
             try:
                 if loss_raw is not None:
                     loss_float = float(loss_raw)
                     if math.isnan(loss_float) or math.isinf(loss_float): loss_float = None
             except Exception: loss_float = None
+            if loss_float is not None and not plausible_loss(loss_float):
+                log.warning(f"🚫 {client_key}: implausible reported loss {loss_float}")
+                PUB.event("implausible_loss", client=PUB.who(client_key), loss=loss_float)
+                raise HTTPException(status_code=400, detail={"reason": "implausible_loss"})
             max_allowed = compute_max_allowed_norm(local_steps, rank)
             abs_max = max(FL_CONFIG["DELTA_NORM_ABSOLUTE_MAX"], max_allowed * 3)
             if delta_norm > abs_max:
@@ -3460,6 +3569,7 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
     if _gate is not None: return _gate
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
+    _capture_client_key(client_key, request)
     active_clients[client_key] = time.time()
     client_hardware[client_key] = {
         "backend":  (request.headers.get("X-Client-Backend")    or "").upper(),
@@ -3568,6 +3678,7 @@ async def submit_delta(request: Request):
         raise HTTPException(status_code=503, detail="Server aggregating", headers={"Retry-After": "120"})
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
+    _capture_client_key(client_key, request)
     active_clients[client_key] = time.time()
     _check_upload_capacity()
     temp_compressed = None
@@ -3601,6 +3712,7 @@ async def submit_init(request: Request):
         raise HTTPException(status_code=503, detail="Server aggregating", headers={"Retry-After": "120"})
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
+    _capture_client_key(client_key, request)
     active_clients[client_key] = time.time()
     _check_upload_capacity()
     try: data = await request.json()
@@ -3654,7 +3766,10 @@ async def submit_init(request: Request):
         "actualBatchSize": data.get("actualBatchSize"),
         "actualOptimizer": data.get("actualOptimizer"),
         "ticketId": data.get("ticketId"),
-        "checksum": checksum}
+        "checksum": checksum,
+        "receipt": data.get("receipt"),
+        "receiptSig": data.get("receiptSig"),
+        "clientPubkey": data.get("clientPubkey") or request.headers.get("X-Client-Pubkey")}
     with uploads_lock:
         _active_uploads[upload_id] = {"dir": up_dir, "created": time.time(), "last_activity": time.time(),
             "status": "open", "client_key": client_key, "client_ip": client_ip,
@@ -3903,6 +4018,64 @@ async def auth_me(request: Request):
             "globalRank": compute_global_rank(user["uuid"])}
 
 # ============ ADMIN ROUTES ============
+@app.get("/audit")
+async def audit_page():
+    return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8">
+<title>CrowdGPT audit</title><style>body{font:14px system-ui;max-width:1100px;margin:2rem auto}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.35rem;text-align:left}
+code{font-size:12px}</style></head><body>
+<h1>CrowdGPT audit</h1><p>Append-only signed round records. Reported, checked and held-out values are never merged.</p>
+<p id="chain"></p><table><thead><tr><th>round</th><th>leader</th><th>record hash</th><th>weights</th><th>bytes</th></tr></thead>
+<tbody id="rows"></tbody></table>
+<script>
+async function main(){
+ const r=await fetch('/api/audit/rounds').then(x=>x.json());
+ const c=await fetch('/api/audit/chain').then(x=>x.json());
+ document.getElementById('chain').textContent=`chain ok=${c.ok} rounds=${c.rounds} broken=${JSON.stringify(c.broken)}`;
+ const tb=document.getElementById('rows');
+ for(const item of r.rounds){
+  const rec=item.record, tr=document.createElement('tr');
+  tr.innerHTML=`<td>${rec.round}</td><td><code>${rec.leader}</code></td>`+
+   `<td><code>${(rec.certificate&&rec.certificate[0]?rec.certificate[0].sig:'').slice(0,16)}…</code></td>`+
+   `<td><code>${rec.aggregate_weights.slice(0,16)}…</code></td>`+
+   `<td>${rec.bytes.down}/${rec.bytes.up}</td>`;
+  tb.appendChild(tr);
+ }
+}
+main();
+</script></body></html>""", media_type="text/html")
+
+@app.get("/api/audit/rounds")
+async def audit_rounds():
+    if ORCH is None: return {"rounds": []}
+    return {"rounds": ORCH.audit.rounds()}
+
+@app.get("/api/audit/checkpoint")
+async def audit_checkpoint(upto: int | None = None):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    return ORCH.audit.checkpoint(upto)
+
+@app.get("/api/audit/proof")
+async def audit_proof(round: int):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    try: return ORCH.audit.inclusion(round)
+    except KeyError: raise HTTPException(404, f"round {round} not published")
+
+@app.get("/api/audit/chain")
+async def audit_chain():
+    if ORCH is None: return {"rounds": 0, "broken": [], "ok": True}
+    return ORCH.audit.verify_chain()
+
+@app.get("/api/node")
+async def get_node():
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    nodes = NodeRegistry(ORCH.store).active()
+    return {"nodes": [n.record for n in nodes]}
+
+@app.get("/api/nodes")
+async def get_nodes():
+    return await get_node()
+
 @app.get("/api/checkpoints")
 async def list_checkpoints(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
