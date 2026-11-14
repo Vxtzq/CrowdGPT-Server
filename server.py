@@ -1223,6 +1223,7 @@ def _gpu_arch_class(gpu_name: str) -> str:
     if any(x in g for x in ("2080","2070","2060","rtx 20","t4","titan rtx","quadro rtx")): return "turing"
     if any(x in g for x in ("1080","1070","1060","1050","titan x","titan v")): return "pascal"
     if "v100" in g: return "volta"
+    if "arc" in g: return "intel_arc"
     if any(x in g for x in ("radeon","mi250","mi300","mi210","mi100")): return "rocm"
     return "unknown"
 
@@ -1241,6 +1242,21 @@ def _gpu_card_class(gpu_name: str) -> str:
     if "t4" in g: return "t4"
     if "v100" in g: return "v100"
     return _gpu_arch_class(gpu_name)
+
+def _pool_hardware_breakdown(pool_list) -> dict:
+    breakdown = {}
+    for pool in pool_list:
+        sig = pool.get("hardware_sig", ())
+        if len(sig) < 5: continue
+        key = f"{sig[0]}-{sig[2]}-{sig[4]}"
+        counts = breakdown.setdefault(key, {
+            "forming": 0, "training": 0, "idle": 0, "completing": 0, "clients": 0
+        })
+        status = pool.get("status")
+        if status in counts:
+            counts[status] += 1
+        counts["clients"] += len(pool.get("clients", []))
+    return breakdown
 
 def _force_fp32_arch(gpu_name: str) -> bool:
     a = _gpu_arch_class(gpu_name)
@@ -2211,20 +2227,7 @@ def update_and_save_status(push_hf: bool = True):
             "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
             "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
             "readyPools": len(ready_pools)}
-        # Aggregate pool hardware breakdown by backend/precision/arch
-        pool_breakdown = {}
-        for pool in pools.values():
-            sig = pool.get("hardware_sig", ())
-            if len(sig) < 5: continue
-            backend = sig[0]
-            autocast = sig[2]
-            gpu_arch = sig[4]
-            key = f"{backend}-{autocast}-{gpu_arch}"
-            if key not in pool_breakdown:
-                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
-            pool_breakdown[key][pool["status"]] += 1
-            pool_breakdown[key]["clients"] += len(pool.get("clients", []))
-        mm_snapshot["poolBreakdown"] = pool_breakdown
+        mm_snapshot["poolBreakdown"] = _pool_hardware_breakdown(pools.values())
     status_data = {"totalParticipants": total_participants,
         "totalContributions": lora_stats.get("total_submissions", 0),
         "activeGpus": active_gpus, "totalTokens": total_tokens,
@@ -4298,20 +4301,7 @@ async def get_stats(request: Request):
             "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
             "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
             "readyPools": len(ready_pools)}
-        # Pool hardware breakdown
-        pool_breakdown = {}
-        for pool in pools.values():
-            sig = pool.get("hardware_sig", ())
-            if len(sig) < 5: continue
-            backend = sig[0]
-            autocast = sig[2]
-            gpu_arch = sig[4]
-            key = f"{backend}-{autocast}-{gpu_arch}"
-            if key not in pool_breakdown:
-                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
-            pool_breakdown[key][pool["status"]] += 1
-            pool_breakdown[key]["clients"] += len(pool.get("clients", []))
-        mm["poolBreakdown"] = pool_breakdown
+        mm["poolBreakdown"] = _pool_hardware_breakdown(pools.values())
     return {"totalParticipants": total_users, "totalContributions": lora_stats.get("total_submissions", 0),
         "activeGpus": active_gpus, "totalTokens": global_stats["totalTokens"],
         "trainingLossChange": training_loss_change, "yourContribution": your_contribution,
