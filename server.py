@@ -164,6 +164,9 @@ try:
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     _ORCH_IMPORT_ERROR = _orch_import_err
+    def plausible_loss(x):   # fallback when the orchestrator package is absent (the real one is imported above otherwise)
+        try: v = float(x); return math.isfinite(v) and 0.0 <= v <= 100.0
+        except (TypeError, ValueError): return False
 else:
     _ORCH_IMPORT_ERROR = None
     LocalObjectStore = LocalObjectStore
@@ -204,7 +207,7 @@ def _open_orchestrator():
             rec = local_node_record(ORCH.identity,
                 endpoints=[os.getenv("CROWDGPT_PUBLIC_URL", "http://localhost:5006")],
                 roles=["leader", "witness", "validator"],
-                software_version="3.2", started_at=datetime.now(timezone.utc).isoformat())
+                software_version="3.3", started_at=datetime.now(timezone.utc).isoformat())
             reg.register(rec)
             NODE_ID = rec["node_id"]
             log.info(f"🪪 Node identity: {NODE_ID}")
@@ -2023,7 +2026,7 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
             deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
             bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
             bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
-            code_versions=("3.2",))
+            code_versions=("3.3",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
         ORCH.publication.publish_round(rnd, rec)
         _write_nutrition(rec, rnd, rec.get("eval"))
