@@ -1926,7 +1926,79 @@ def _round_roots(rnd: int) -> tuple[str, str, str]:
                 for s in subs]
     return merkle_root(t_leaves), merkle_root(s_leaves), merkle_root(d_leaves)
 
-def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -> None:
+def _round_eval(held) -> Optional[dict]:
+    """Held-out evaluation for a round, or None when nothing was evaluated.
+
+    A configured loss-check service is the first source. Otherwise an
+    ``CROWDGPT_EVAL_URL`` sidecar may return ``{loss, ciLow, ciHigh, windows,
+    manifestSha256, modelSha256, source}``. A round without either stays
+    explicitly unevaluated; it is never filled with a reported training loss.
+    """
+    if held is not None:
+        try:
+            return {"mode": HARDEN["LOSS_CHECK_MODE"], "loss": f"{float(held):.6f}",
+                    "ciLow": None, "ciHigh": None, "windows": None, "source": "loss_check",
+                    "manifestSha256": None, "evaluatedAt": datetime.now(timezone.utc).isoformat()}
+        except (TypeError, ValueError):
+            return None
+    url = os.getenv("CROWDGPT_EVAL_URL", "").strip()
+    if not url:
+        return None
+    try:
+        r = requests.post(url.rstrip("/") + "/eval", json={
+            "round": round_state["current_round"], "globalStep": global_step,
+            "checkpoint": str(LATEST_CHECKPOINT_FILE),
+        }, timeout=float(os.getenv("CROWDGPT_EVAL_TIMEOUT_S", "1800")))
+        if not r.ok:
+            log.warning(f"⚠️ evaluator HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        body = r.json()
+        loss = body.get("loss")
+        if loss is None:
+            return None
+        return {"mode": "heldout", "loss": f"{float(loss):.6f}",
+                "ciLow": body.get("ciLow"), "ciHigh": body.get("ciHigh"),
+                "windows": body.get("windows"),
+                "manifestSha256": body.get("manifestSha256"),
+                "modelSha256": body.get("modelSha256"), "source": "eval_service",
+                "evaluatedAt": datetime.now(timezone.utc).isoformat()}
+    except Exception as exc:
+        log.warning(f"⚠️ evaluator unavailable: {exc}")
+        return None
+
+def _write_nutrition(rec: dict, rnd: int, eval_result: Optional[dict]) -> None:
+    try:
+        subs = ORCH.submission.load_submissions(round_no=rnd) if ORCH is not None else []
+        receipts = ORCH.receipts.all(rnd) if ORCH is not None else []
+        contributors = len({r.get("client_key") for r in receipts if r.get("client_key")})
+        nutrition = {
+            "schema": "ng-nutrition-1",
+            "model": {"repo": HF_REPO_ID, "revision": current_hf_revision,
+                      "globalStep": int(global_step), "baseWeights": rec.get("base_weights"),
+                      "aggregateWeights": rec.get("aggregate_weights")},
+            "round": int(rnd), "leader": rec.get("leader"),
+            "codeVersions": list(rec.get("code_versions") or []),
+            "tokens": {"verified": sum(int(s.tokens) for s in subs),
+                       "reported": int(global_stats.get("totalTokens", 0))},
+            "contributors": contributors,
+            "trainedParameters": sorted({p for t in db["tasks"].values()
+                                         for p in (t.get("trainedParams") or [])}),
+            "evaluation": eval_result or {"status": "unevaluated"},
+            "limitations": [
+                "Reported training loss is not a held-out evaluation.",
+                "A leader signature is not a witness quorum until P6.6 is operated.",
+                "Bulk weights and deltas live outside the signed record.",
+            ],
+            "writtenAt": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = DATA_DIR / "nutrition.json.tmp"
+        tmp.write_text(json.dumps(nutrition, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, DATA_DIR / "nutrition.json")
+    except Exception as exc:
+        log.warning(f"⚠️ nutrition write failed: {exc}")
+
+def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools: int,
+                          held=None) -> None:
     if ORCH is None: return
     try:
         view = ORCH.scheduling.load_round(rnd)
@@ -1946,12 +2018,13 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
                                          "step": view.global_step}),
             leader=NODE_ID or "node-unknown", witnesses=(),
             tickets_root=tickets_root, submissions_root=submissions_root,
-            deltas_root=deltas_root, prev_record_hash=prev, eval=None,
+            deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
             bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
             bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
             code_versions=("3.2",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
         ORCH.publication.publish_round(rnd, rec)
+        _write_nutrition(rec, rnd, rec.get("eval"))
         mirror = os.getenv("CROWDGPT_AUDIT_MIRROR", "").strip()
         if mirror:
             try:
@@ -1971,7 +2044,7 @@ def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -
         PUB.event("round_end", round=rnd, step=global_step, pools=n_pools, applied=bool(success),
                   rolled_back=bool(loss_rejected), loss=row.get("loss"), heldout=held)
         PUB.event("round_start", round=rnd + 1, step=global_step)
-        _publish_round_record(rnd, success, loss_rejected, n_pools)
+        _publish_round_record(rnd, success, loss_rejected, n_pools, held=held)
         PUB.export_static()
     except Exception: pass
 
@@ -2272,6 +2345,8 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                 with open(temp_dir / "training_state.json", 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=2)
                 _audit_jsonl = BASE_DIR / "data" / "public_rounds.jsonl"
                 if _audit_jsonl.exists(): shutil.copy2(_audit_jsonl, temp_dir / "rounds.jsonl")
+                _nutrition = DATA_DIR / "nutrition.json"
+                if _nutrition.exists(): shutil.copy2(_nutrition, temp_dir / "nutrition.json")
                 commit = api.upload_folder(folder_path=str(temp_dir), repo_id=HF_REPO_ID, repo_type="model",
                     commit_message=f"Update step {global_step} round {round_state['current_round']}")
                 rev = _extract_commit_sha(commit) or _latest_hf_revision()
