@@ -37,3 +37,10 @@ ENV/
 /loss_history.json
 /server.log*
 /hf_status_*/
+
+# Orchestrator runtime state and secrets created on first start (see docs/DEPLOYMENT.md)
+/orchestrator_state.sqlite3
+/orchestrator_state.sqlite3-*
+/orchestrator_node_key.pem
+/orchestrator_object_secret
+/public_log_salt.txt
