@@ -13,6 +13,30 @@ The client lives in the main repository. For the model and training setup, see [
 5. **Aggregation.** Surviving deltas from all pools are applied to the global model at the end of the round (4 h at most). Submissions outside a pool go through Krum instead.
 6. **Publish.** The new checkpoint is pushed to Hugging Face, where clients download it for the next round.
 
+## LoRA submissions
+
+A client can train rank-r adapters instead of the full model (`CROWDGPT_LORA=1`,
+`CROWDGPT_LORA_RANK`). The coordinator supports this as a wire format, not a
+separate aggregation path:
+
+- The task payload carries `trainMode` (`dense`/`lora`), `loraRank` and
+  `trainedParams`; clients echo them in the submission body and in the
+  `/fl/submit/init` body.
+- Instead of `modelSize` dense parameters, a LoRA upload is an `NGL1` payload:
+  per adapter a name, the offset of that base weight in the flat parameter
+  stream, its shape and the two fp16 factors. The server expands it with
+  `alpha/rank` scaling into the dense base delta, so cross-check and aggregation
+  are unchanged (~17 MB uploaded at rank 16 instead of ~1.3 GB). Sparse engram
+  rows follow the payload as a row count, indices and bf16 values.
+- Train mode and rank are part of the pool identity (`orchestrator/lora.py`):
+  a dense client and a LoRA client never share a pool, and two LoRA ranks never
+  share a pool. A submission whose declared mode, rank or `trainedParams`
+  disagree with its task is rejected with `train_mode_mismatch`,
+  `lora_rank_mismatch` or `trained_params_mismatch`.
+- Dense clients and tasks created before LoRA existed keep working: a missing
+  header or body field means `dense`, and their stored pool signatures read as
+  `dense`/rank 0.
+
 ## Requirements
 
 - Python 3 and a machine with enough disk for checkpoints and pending deltas. The server refuses new tasks below 10 GB free and new uploads below 2 GB.
