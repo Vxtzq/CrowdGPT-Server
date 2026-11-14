@@ -145,3 +145,19 @@ into the Hugging Face upload folder next to `rounds.jsonl`.
 `tools/eval_local.py` evaluates a hash-pinned manifest (`--mode uniform` for
 the ln(vocab) reference, `--mode checkpoint` for a real flat checkpoint) and
 `tools/eval_service.py` is the HTTP sidecar the orchestrator calls.
+
+## P6.3 — verified ledger and proposals
+
+`submissions.user_uuid` is filled best-effort from the auth session at finalize.
+`LeaderboardService.verified()` aggregates only accepted submissions, groups by
+account (or `client:<key>` when anonymous), and counts duplicate content once
+because the content hash is unique. `/api/leaderboard/verified` returns
+`{source: "verified", entries, totals}`; `/api/leaderboard/reported` wraps the
+legacy profile totals with `source: "reported"`. `/api/leaderboard` remains the
+legacy array for existing clients.
+
+`ProposalService` adds `proposals` and `votes` tables plus
+`/api/proposals` (list/create) and `/api/proposals/{id}/vote`. Vote weight is
+the actor's verified token total; a zero-weight actor gets
+`403 verified_contributor_required`, and voting again replaces the ballot rather
+than adding a second one.

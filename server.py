@@ -578,7 +578,8 @@ def _persist_ticket_consumed(client_key: str, task_id: Optional[str]):
     try: ORCH.admission.consume(client_key, task_id)
     except Exception as e: log.warning(f"⚠️ ticket consume persist failed: {e}")
 
-def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict):
+def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict,
+                        user_uuid: Optional[str] = None):
     if ORCH is None: return
     try:
         content = meta.get("checksum")
@@ -595,6 +596,7 @@ def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict
             tokens=int(meta.get("tokensProcessed", 0) or 0),
             steps=int(meta.get("localSteps", 0) or 0),
             loss_reported=None if loss is None else f"{float(loss):.6f}",
+            user_uuid=user_uuid,
         )
     except Exception as e:
         log.warning(f"⚠️ submission persist failed: {e}")
@@ -3128,7 +3130,8 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     return _duplicate_response("already_submitted")
                 _count_submission(client_key, client_ip, task_id)
                 pool["deltas"][client_key] = final_delta_path
-                _persist_submission(pool, client_key, final_delta_path, delta_metadata)
+                _persist_submission(pool, client_key, final_delta_path, delta_metadata,
+                                    user_uuid=((get_current_user(request) or {}).get("uuid")))
                 submitted_path = final_delta_path
                 final_delta_path = None
                 client_pool_map.pop(client_key, None)
@@ -4594,6 +4597,55 @@ async def api_loss_history(rounds: int = 2000, pools: int = 2000):
         p = list(PUB.pools)[-max(1, min(pools, 2000)):]
     return {"rounds": r, "pools": p, "note": "loss = token-weighted client-reported training loss of cross-checked deltas; "
             "heldoutLoss (when present) is the server-side evaluator's loss"}
+
+@app.get("/api/proposals")
+async def list_proposals(limit: int = 100):
+    if ORCH is None: return {"proposals": []}
+    return {"proposals": ORCH.proposals.list(limit)}
+
+@app.post("/api/proposals")
+async def create_proposal(request: Request):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    body = await request.json()
+    actor = (get_current_user(request) or {}).get("uuid") or get_client_key(request)
+    try:
+        return ORCH.proposals.create(body.get("title", ""), body.get("body", ""), actor)
+    except ValueError as exc:
+        raise HTTPException(400, {"reason": str(exc)})
+
+@app.post("/api/proposals/{proposal_id}/vote")
+async def vote_proposal(proposal_id: str, request: Request):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    actor = (get_current_user(request) or {}).get("uuid") or get_client_key(request)
+    try:
+        return ORCH.proposals.vote_with_ledger(proposal_id, actor)
+    except KeyError:
+        raise HTTPException(404, {"reason": "proposal_not_found"})
+    except PermissionError as exc:
+        raise HTTPException(403, {"reason": str(exc)})
+
+@app.get("/api/leaderboard/verified")
+async def get_verified_leaderboard(limit: int = 100):
+    if ORCH is None:
+        return {"source": "verified", "entries": [],
+                "totals": {"actors": 0, "tokens": 0, "submissions": 0}}
+    return ORCH.leaderboard.verified(limit)
+
+@app.get("/api/leaderboard/reported")
+async def get_reported_leaderboard():
+    with users_lock:
+        entries = [{"uuid": u["uuid"], "username": u["username"],
+                    "contributions": u["stats"].get("contributions", 0),
+                    "totalTokens": u["stats"].get("totalTokens", 0),
+                    "totalSteps": u["stats"].get("totalSteps", 0),
+                    "trustScore": compute_trust_score(u["stats"]),
+                    "byzantineFlags": u["stats"].get("byzantine_flags", 0),
+                    "power": bool(u.get("power", False))}
+                   for u in users_db["users"].values()]
+    entries.sort(key=lambda x: x["totalTokens"], reverse=True)
+    if ORCH is None:
+        return {"source": "reported", "entries": entries}
+    return ORCH.leaderboard.legacy(entries)
 
 @app.get("/api/leaderboard")
 async def get_leaderboard():

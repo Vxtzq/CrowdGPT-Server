@@ -90,6 +90,7 @@ class SubmissionView:
     tokens: int = 0
     steps: int = 0
     loss_reported: Optional[str] = None
+    user_uuid: Optional[str] = None
 
 
 @dataclass(frozen=True)

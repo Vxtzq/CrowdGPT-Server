@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     round INTEGER NOT NULL,
     pool_id TEXT,
     client_key TEXT NOT NULL,
+    user_uuid TEXT,
     content_sha256 TEXT NOT NULL UNIQUE,
     delta_path TEXT,
     tokens INTEGER NOT NULL DEFAULT 0,
@@ -149,6 +150,21 @@ CREATE TABLE IF NOT EXISTS nodes (
     PRIMARY KEY (node_id, pubkey)
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_active ON nodes(status, valid_until);
+CREATE TABLE IF NOT EXISTS proposals (
+    proposal_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    author TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS votes (
+    proposal_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    weight INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (proposal_id, actor)
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -192,6 +208,7 @@ class StateStore:
         wanted = {
             "tickets": {"base_weights": "TEXT", "signature": "TEXT", "public_key": "TEXT"},
             "uploads": {"result": "TEXT"},
+            "submissions": {"user_uuid": "TEXT"},
         }
         for table, columns in wanted.items():
             have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
