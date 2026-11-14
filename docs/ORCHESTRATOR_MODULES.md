@@ -161,3 +161,19 @@ legacy array for existing clients.
 the actor's verified token total; a zero-weight actor gets
 `403 verified_contributor_required`, and voting again replaces the ballot rather
 than adding a second one.
+
+## P6.5 — opt-in 1-bit codec on the wire
+
+`orchestrator/compression.py` implements the opt-in `NGD1`/`NGD2` delta codec.
+A dense client with `CROWDGPT_DELTA_CODEC=ngd1` writes `4-byte metadata length +
+metadata + NGD2 frames`; the `process_decompressed_payload` branch for
+`deltaCodec == "ngd1"` decodes each frame into the dense bf16 stream, checks
+finiteness and the total parameter count, and leaves the engram tail reader
+unchanged. The default `bf16` path is untouched.
+
+The codec is lossy: one sign bit plus one fp16 mean-absolute scale per
+1024-value block. The client documentation reports a 31.6x ratio (0.126
+bytes/param) on a synthetic 4M-value fixture, projecting ~83.2 MB for
+657,787,392 base parameters; a captured production delta is still unmeasured.
+Malformed, truncated, oversized, or trailing frame data is rejected with a
+`400` reason.
