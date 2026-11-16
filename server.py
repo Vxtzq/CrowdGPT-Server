@@ -313,14 +313,47 @@ def flat_ln_slices(cfg: dict):
     out.append((off, d, 0.0)); off += d              # ln.bias
     assert off == calculate_model_size(cfg), (off, calculate_model_size(cfg))
     return out
-def expected_init_norm(cfg: dict) -> float:
+def expected_init_norm(cfg: dict, mode: Optional[str] = None) -> float:
     """‖W‖ a fresh run should report from its initialisation (G0)."""
+    mode = (mode or INIT_MODE)
     slices = flat_ln_slices(cfg)
     ones = sum(n for _o, n, f in slices if f == 1.0)
     total = calculate_model_size(cfg)
-    if INIT_MODE == "flat":
+    if mode == "flat":
         return math.sqrt(4e-4 * total)
     return math.sqrt(4e-4 * (total - 2 * ones) + ones)
+
+
+def flat_norm(t, chunk: int = 10_000_000) -> float:
+    """‖·‖ of a flat buffer accumulated in float64.
+
+    ``Tensor.norm()`` accumulates the whole buffer in float32: at 657 M parameters it
+    under-reports by ~12 % (519.4 instead of the true 581.7), which is enough to fail the
+    G0 gate on a perfectly good initialisation. Chunked double accumulation matches
+    ``t.double().norm()`` to ~1e-9 without materialising a second full-size copy.
+    """
+    flat = t.reshape(-1)
+    total = float(flat.numel())
+    if total == 0:
+        return 0.0
+    sq = 0.0
+    for i in range(0, flat.numel(), chunk):
+        c = flat[i:i + chunk].to(torch.float64)
+        sq += float((c * c).sum())
+    return math.sqrt(sq)
+
+
+def build_init_weights(cfg: Optional[dict] = None, mode: Optional[str] = None):
+    """The exact buffer a fresh run starts from (seeded, so it is reproducible)."""
+    cfg = cfg or MODEL_CONFIG
+    mode = (mode or INIT_MODE)
+    total = calculate_model_size(cfg)
+    torch.manual_seed(42)
+    w = (torch.randn(total) * 0.02).float()
+    if mode == "ln_identity":
+        for off, n, fill in flat_ln_slices(cfg):
+            w[off:off + n] = fill
+    return w
 
 
 # ============ MEMORY GUARDS ============
@@ -2424,13 +2457,9 @@ def _pool_cleanup_tick():
 # ============ MODEL WEIGHTS ============
 def initialize_model():
     global global_weights, global_engram_weights
-    torch.manual_seed(42)
-    global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
-    if INIT_MODE == "ln_identity":
-        for off, n, fill in flat_ln_slices(MODEL_CONFIG):
-            global_weights[off:off + n] = fill
+    global_weights = build_init_weights()
     global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
-    wn = float(torch.norm(global_weights))
+    wn = flat_norm(global_weights)
     exp = expected_init_norm(MODEL_CONFIG)
     log.info(f"🎲 initialized {MODEL_SIZE:,} base + {ENG_PARAMS:,} engram weights (FP32 master), "
              f"mode={INIT_MODE}, ‖W‖={wn:.2f} (expected ≈{exp:.2f})")
@@ -5115,7 +5144,7 @@ async def get_stats(request: Request):
         "trainingLossChange": training_loss_change, "yourContribution": your_contribution,
         "activeNow": active_gpus, "totalSteps": global_stats["totalSteps"], "globalStep": global_step,
         "modelSize": MODEL_SIZE, "lastLoss": global_stats["lastLoss"], "avgLoss": avg_loss,
-        "weightNorm": float(torch.norm(global_weights.float()).item()) if global_weights is not None else 0.0,
+        "weightNorm": flat_norm(global_weights) if global_weights is not None else 0.0,
         "loraStats": lora_stats, "totalUsers": total_users, "activeContributors": active_gpus,
         "lossHistory": global_stats["lossHistory"][-20:],
         "datasetStats": {"totalChunks": dataset_info["totalChunks"], "currentChunk": data_position["currentChunkIdx"],
@@ -5324,7 +5353,7 @@ async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int 
     pushed = upload_to_huggingface()
     try: update_and_save_status(push_hf=True)
     except Exception as e: log.error(f"status: {e}")
-    wte_norm = float(global_weights[:MODEL_CONFIG["vocabSize"] * MODEL_CONFIG["dim"]].float().norm().item())
+    wte_norm = flat_norm(global_weights[:MODEL_CONFIG["vocabSize"] * MODEL_CONFIG["dim"]])
     return {"status": "restored", "revision": revision, "step": step, "hf_step": hf_step,
         "model_size": MODEL_SIZE, "wte_norm": wte_norm, "pushed_to_hf": pushed}
 
