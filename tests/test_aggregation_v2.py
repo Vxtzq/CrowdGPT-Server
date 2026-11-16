@@ -422,13 +422,22 @@ class StepBudgetTest(unittest.TestCase):
                                                            "TARGET_OPT_STEPS": 0}), 0)
         self.assertEqual(server._ref_steps_for_round(None, cc), 2)   # no budget -> step mode
 
-    def test_accum_payload_is_zero_in_token_mode(self):
-        """The client must derive accum from tokens, not from a stale fixed value."""
+    def test_accum_payload_is_zero_when_a_budget_is_live(self):
+        """The client must derive accum from the live budget (steps or tokens), never from a
+        stale fixed value that contradicts the round."""
         old = dict(server.CROSS_CHECK)
         try:
-            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 131072, "TARGET_ACCUM_STEPS": 32})
+            # token budget live -> derive from tokens
+            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 131072, "TARGET_OPT_STEPS": 0,
+                                       "TARGET_ACCUM_STEPS": 32})
             self.assertEqual(server._target_accum_payload(), 0)
-            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 0, "TARGET_ACCUM_STEPS": 32})
+            # step budget live -> derive from the step count
+            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 0, "TARGET_OPT_STEPS": 16,
+                                       "TARGET_ACCUM_STEPS": 32})
+            self.assertEqual(server._target_accum_payload(), 0)
+            # no budget at all -> the configured accum passes through (legacy)
+            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 0, "TARGET_OPT_STEPS": 0,
+                                       "TARGET_ACCUM_STEPS": 32})
             self.assertEqual(server._target_accum_payload(), 32)
         finally:
             server.CROSS_CHECK.clear(); server.CROSS_CHECK.update(old)

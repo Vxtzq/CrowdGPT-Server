@@ -18,13 +18,15 @@ The client lives in the main repository. For the model and training setup, see [
 A round must be a *descent step*, not a consensus of endpoints. Three rules produce that
 (see `approach-fix/PLAN.md` in the audit sidecar):
 
-- **Tokens per optimizer step, not a dictated step count.** `CROWDGPT_TARGET_TOKENS_PER_STEP`
-  (default `131072` = 32 micro-batches of 2×2048, v1's value) fixes the inner batch size, and the
-  round's micro-step budget decides how many optimizer steps it contains: `500` micro-steps ⇒
-  `accum = 32` ⇒ ≈16 steps. That is v1's parameterisation, and the distinction matters: asking for
-  `TARGET_OPT_STEPS=2` instead grouped the same 500 micro-steps into two ~1 M-token steps, which
-  measured ~26 % slower per token. `TARGET_OPT_STEPS` is now only a fallback, used when neither
-  tokens/step nor `TARGET_ACCUM_STEPS` is set.
+- **Bound the optimizer steps per round, and keep the round short.** `CROWDGPT_TARGET_OPT_STEPS`
+  (default `16`) is how many optimizer steps a round contains (`accum = ceil(targetLocalSteps / 16)`),
+  so a delta stays a bounded trajectory from the base and is comparable across clients. The round
+  itself is deliberately short — `CROWDGPT_ROUND_BASE_STEPS` (default `125` micro-steps), with the
+  hardware factor allowed to shorten it but never lengthen it. At a fixed 16 steps a short round
+  means a smaller inner batch (`accum = 8` at 125 micro-steps), i.e. more optimizer updates per
+  token: that measured **−0.17 held-out BPB at equal tokens** versus a 500-micro-step round, and it
+  reaches the same loss with ~4× fewer tokens. `CROWDGPT_TARGET_TOKENS_PER_STEP` (default `0`,
+  off) is the alternative way to pin the inner batch; when set it takes over from the step count.
 - **Normalise by the steps a delta actually took.** Clients report `optimizerSteps` and
   `accum` with the upload; the server scales each delta by
   `clamp(targetOptimizerSteps / optimizerSteps, 0.5, 2)` before applying it, so a volunteer
@@ -79,10 +81,12 @@ All settings are environment variables. Defaults are the values used when the va
 | `CROWDGPT_FORMING_TIMEOUT_S` | `1800` | How long a pool waits to fill |
 | `CROWDGPT_TIER0` / `TIER1` / `TIER2` | `1` | Matching levels: backend + precision + optimizer / backend + precision / backend only |
 | `CROWDGPT_TARGET_BATCH_SIZE` | `2` | Batch size given to pool members |
-| `CROWDGPT_TARGET_ACCUM_STEPS` | `32` | Gradient accumulation steps |
-| `CROWDGPT_TARGET_LOCAL_STEPS` | `500` | Micro-steps per task |
-| `CROWDGPT_TARGET_TOKENS_PER_STEP` | `131072` | Tokens per optimizer step; the step count is derived from `TARGET_LOCAL_STEPS` (v1's parameterisation). `0` = unset |
-| `CROWDGPT_TARGET_OPT_STEPS` | `0` | Fallback optimizer steps per round, used only when neither tokens/step nor accum is set. `0` = legacy |
+| `CROWDGPT_TARGET_ACCUM_STEPS` | `32` | Gradient accumulation steps; sent to clients as `0` whenever a step or token budget is live, so the client derives it |
+| `CROWDGPT_TARGET_LOCAL_STEPS` | `125` | Micro-steps per task (fallback; the live budget is `ROUND_BASE_STEPS` × hardware factor) |
+| `CROWDGPT_ROUND_BASE_STEPS` | `125` | Round budget before the hardware factor |
+| `CROWDGPT_ROUND_HW_MULT_MAX` | `1.0` | Upper clamp on that factor: slower clients get shorter rounds, faster ones never get longer ones |
+| `CROWDGPT_TARGET_TOKENS_PER_STEP` | `0` | Opt-in: pin tokens per optimizer step instead of the step count (`131072` = v1's batch), deriving the step count from the round budget |
+| `CROWDGPT_TARGET_OPT_STEPS` | `16` | Optimizer steps per round; clients derive `accum = ceil(local_steps / this)`. `0` = legacy client-derived accum |
 | `CROWDGPT_TARGET_AUTOCAST` | `any` | Force a precision for pools (`bf16`, `fp32`, `any`) |
 | `CROWDGPT_INIT_MODE` | `ln_identity` | Fresh-run init: `ln_identity` = N(0,0.02) + LayerNorm 1/0 (`‖W‖ ≈ 581.7`), `flat` = N(0,0.02) for every parameter, LayerNorm included (`‖W‖ ≈ 512.9`, what v1 ran with) |
 | `CROWDGPT_MAX_DELTA_APPLY_NORM` | `12000` | Per-delta clip at aggregation time. A tripwire that logs a warning, not a normaliser |

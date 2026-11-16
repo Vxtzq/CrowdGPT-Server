@@ -796,15 +796,21 @@ CROSS_CHECK = {
     "MAX_OVERFLOW": _env_int("CROWDGPT_COHORT_MAX_OVERFLOW", 1),
     "TARGET_BATCH_SIZE": _env_int("CROWDGPT_TARGET_BATCH_SIZE", 2),
     "TARGET_ACCUM_STEPS": _env_int("CROWDGPT_TARGET_ACCUM_STEPS", 32),
-    "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 500),
+    "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 125),
+    # Round budget actually handed to a pool: base (nominally 125 micro-steps) times a hardware
+    # factor.  §13 measured per-token efficiency falling as the round grows (accum = round/H),
+    # so the factor is capped at 1.0 by default: slower clients get shorter rounds, faster ones
+    # do not get longer ones.
+    "ROUND_BASE_STEPS": _env_int("CROWDGPT_ROUND_BASE_STEPS", 125),
+    "ROUND_HW_MULT_MAX": _env_float("CROWDGPT_ROUND_HW_MULT_MAX", 1.0),
     # A1 (descent-consistent aggregation): optimizer steps a pool must take per round, whatever
     # its micro-step budget is.  0 = legacy: the client derives `accum` from bs*sl.
-    "TARGET_OPT_STEPS": _env_int("CROWDGPT_TARGET_OPT_STEPS", 0),
+    "TARGET_OPT_STEPS": _env_int("CROWDGPT_TARGET_OPT_STEPS", 16),
     # Tokens per optimizer step is the authority for the inner batch size (v1's parameterisation).
     # When set, the step count is *derived* from the round's micro-step budget instead of dictated,
     # so a round keeps v1's per-step batch instead of grouping 500 micro-steps into 2 huge ones.
     # 131072 = 32 micro-batches of 2x2048 = v1's value.
-    "TARGET_TOKENS_PER_STEP": _env_int("CROWDGPT_TARGET_TOKENS_PER_STEP", 131072),
+    "TARGET_TOKENS_PER_STEP": _env_int("CROWDGPT_TARGET_TOKENS_PER_STEP", 0),
     "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "any").strip().lower(),
     "TARGET_OPTIMIZER": os.getenv("CROWDGPT_TARGET_OPTIMIZER", "any").strip().lower(),
     # v2.0: threshold raised to 5.0 — cross-arch tolerated, same backend/prec/optim
@@ -1670,12 +1676,13 @@ def _activate_pool(pool: dict):
     pool_id = pool["pool_id"]
     task_id = f"round_{round_state['current_round']}_{pool_id}"
     target_seed = _cohort_seed(pool_id)
-    BASE_STEPS = 500
+    BASE_STEPS = max(1, int(CROSS_CHECK["ROUND_BASE_STEPS"]))
     slowest_client = min(pool["clients"], key=lambda c: client_hardware.get(c, {}).get("vram_gb", 100.0))
     hw = client_hardware.get(slowest_client, {})
     vram_gb = hw.get("vram_gb", 8.0)
     client_bs = max(1, hw.get("bs", 1))
-    hw_multiplier = max(0.25, vram_gb / 8.0)
+    # Only shorten: a longer round raises accum (round/H) and measured worse per token.
+    hw_multiplier = min(float(CROSS_CHECK["ROUND_HW_MULT_MAX"]), max(0.25, vram_gb / 8.0))
     scaled_steps = int(BASE_STEPS * hw_multiplier)
     target_steps = max(100, min(2500, scaled_steps))
     pool_autocast = _pool_target_autocast(pool)
@@ -4914,8 +4921,14 @@ def _delta_metadata(path: str) -> Optional[dict]:
 REF_MICRO_BATCH_TOKENS = 4096     # bs=2 x sl=2048: the nominal client micro-batch
 
 def _target_accum_payload() -> int:
-    """Accum sent to clients: 0 when tokens/step is authoritative (the client derives it)."""
-    return 0 if _ref_accum_steps() > 0 else max(0, int(CROSS_CHECK.get("TARGET_ACCUM_STEPS") or 0))
+    """Accum sent to clients.
+
+    0 whenever a step budget or a token budget is in effect: the client then derives accum from
+    whichever budget is live (H=16 over a 125-micro-step round -> accum 8), instead of pinning a
+    stale fixed value that would contradict the round.
+    """
+    if _ref_accum_steps() > 0 or _ref_steps_for_round() > 0: return 0
+    return max(0, int(CROSS_CHECK.get("TARGET_ACCUM_STEPS") or 0))
 
 def _ref_accum_steps(cross_check: Optional[dict] = None) -> int:
     """Micro-batches per optimizer step implied by the token budget (0 = not in token mode)."""
