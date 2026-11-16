@@ -161,10 +161,8 @@ try:
     from orchestrator.records import (build_round_record, digest_of, merkle_root,
                                       record_hash, sign_record)
     from orchestrator.adversarial import plausible_loss
-    from orchestrator.compression import iter_frames
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
-    iter_frames = None
     _ORCH_IMPORT_ERROR = _orch_import_err
     def plausible_loss(x):   # fallback when the orchestrator package is absent (the real one is imported above otherwise)
         try: v = float(x); return math.isfinite(v) and 0.0 <= v <= 100.0
@@ -209,7 +207,7 @@ def _open_orchestrator():
             rec = local_node_record(ORCH.identity,
                 endpoints=[os.getenv("CROWDGPT_PUBLIC_URL", "http://localhost:5006")],
                 roles=["leader", "witness", "validator"],
-                software_version="3.3", started_at=datetime.now(timezone.utc).isoformat())
+                software_version="3.2", started_at=datetime.now(timezone.utc).isoformat())
             reg.register(rec)
             NODE_ID = rec["node_id"]
             log.info(f"🪪 Node identity: {NODE_ID}")
@@ -243,7 +241,7 @@ HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = "PUT AN ADMIN SECRET HERE"
+ADMIN_SECRET = ""
 os.environ.setdefault("CROWDGPT_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 HF_WEIGHT_FILES = ["model_bf16.safetensors", "engram_bf16.safetensors"]
 
@@ -844,7 +842,7 @@ if CROSS_CHECK["COHORT_SIZE"] < 2: CROSS_CHECK["COHORT_SIZE"] = 3
 #   "strict" like "arch" but also the same card model (4090 with 4090 only)
 #   "on"     previous behaviour (bf16 pools may mix generations)
 # Power-solo pools are not cross-checked, so they keep the client's native precision in every mode.
-POOL_BF16 = os.getenv("CROWDGPT_POOL_BF16", "arch").strip().lower()
+POOL_BF16 = False #os.getenv("CROWDGPT_POOL_BF16", "arch").strip().lower()
 if POOL_BF16 not in ("off", "arch", "strict", "on"): POOL_BF16 = "arch"
 if CROSS_CHECK["MAX_OVERFLOW"] < 0: CROSS_CHECK["MAX_OVERFLOW"] = 0
 if CROSS_CHECK["MAX_OVERFLOW"] > 2: CROSS_CHECK["MAX_OVERFLOW"] = 2
@@ -2311,7 +2309,7 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
             deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
             bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
             bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
-            code_versions=("3.3",))
+            code_versions=("3.2",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
         ORCH.publication.publish_round(rnd, rec)
         _write_nutrition(rec, rnd, rec.get("eval"))
@@ -3224,61 +3222,21 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS:
                 raise HTTPException(status_code=400, detail="Invalid engramSparseCount")
             bpp = _bytes_per_param(fmt)
-            codec = str(body.get("deltaCodec") or "").lower()
-            if codec not in ("", "off", "ngd1"):
-                raise HTTPException(status_code=400, detail=f"Unsupported deltaCodec: {codec}")
-            if codec == "ngd1" and fmt != "bf16":
-                raise HTTPException(status_code=400, detail="ngd1 delta requires weightFormat bf16")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as tdf:
                 temp_delta_path = tdf.name
             norm_sq = 0.0; offset = 0; has_nan_inf = False
             with open(temp_delta_path, 'wb') as td:
-                if codec == "ngd1":
-                    if iter_frames is None:
-                        raise HTTPException(status_code=400, detail="ngd1 codec unavailable on this server")
-                    blob = dec_f.read()
-                    # The NGD2 container has no engram section. Strip a declared
-                    # engram tail and rewind so the existing tail reader below
-                    # consumes it unchanged.
-                    tail_len = 0
-                    if has_engram and engram_sparse_count > 0:
-                        tail_len = (engram_sparse_count * 4
-                                    + engram_sparse_count * MODEL_CONFIG["dim"] * bpp)
-                    if tail_len:
-                        if len(blob) < tail_len:
-                            raise HTTPException(status_code=400, detail="Truncated ngd1 engram tail")
-                        dec_f.seek(-tail_len, os.SEEK_CUR)
-                        blob = blob[:-tail_len]
-                    total_params = 0
-                    try:
-                        for block in iter_frames(blob, max_total_params=MODEL_SIZE):
-                            if block.size <= 0:
-                                continue
-                            arr = np.asarray(block, dtype=np.float32)
-                            if not np.isfinite(arr).all():
-                                raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
-                            norm_sq += float(np.sum(arr * arr, dtype=np.float64))
-                            td.write(_encode_float32_to_bf16_bytes(torch.from_numpy(arr)))
-                            total_params += int(arr.size)
-                    except HTTPException:
-                        raise
-                    except (ValueError, struct.error, zlib.error) as exc:
-                        raise HTTPException(status_code=400, detail=f"Invalid ngd1 payload: {exc}")
-                    if total_params != MODEL_SIZE:
-                        raise HTTPException(status_code=400, detail="ngd1 payload size mismatch")
-                    offset = MODEL_SIZE
-                else:
-                    while offset < MODEL_SIZE:
-                        read_params = min(10_000_000, MODEL_SIZE - offset)
-                        chunk_bytes = dec_f.read(read_params * bpp)
-                        if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
-                            raise HTTPException(status_code=400, detail="Incomplete base delta payload")
-                        td.write(chunk_bytes)
-                        chunk_t = _decode_delta_chunk(bytearray(chunk_bytes), fmt)
-                        if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
-                            has_nan_inf = True; break
-                        norm_sq += torch.sum(chunk_t * chunk_t).item()
-                        offset += read_params; del chunk_t
+                while offset < MODEL_SIZE:
+                    read_params = min(10_000_000, MODEL_SIZE - offset)
+                    chunk_bytes = dec_f.read(read_params * bpp)
+                    if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
+                        raise HTTPException(status_code=400, detail="Incomplete base delta payload")
+                    td.write(chunk_bytes)
+                    chunk_t = _decode_delta_chunk(bytearray(chunk_bytes), fmt)
+                    if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
+                        has_nan_inf = True; break
+                    norm_sq += torch.sum(chunk_t * chunk_t).item()
+                    offset += read_params; del chunk_t
             if has_nan_inf:
                 ban_subnet(client_ip, "submitted NaN/Inf delta")
                 raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
@@ -3413,7 +3371,6 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
                 "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
                 "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
-                "deltaCodec": codec or "off",
             }
             if delta_norm > max_allowed:
                 scale_factor = max_allowed / delta_norm
