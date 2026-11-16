@@ -28,6 +28,11 @@ ENV/
 /chunks/
 /pending_uploads/
 /work_tmp/
+# Runtime state created by importing/starting server.py (orchestrator node identity et al.)
+/orchestrator_state.sqlite3*
+/orchestrator_node_key.pem
+/orchestrator_object_secret
+/public_log_salt.txt
 /users.json
 /status.json
 /leaderboard.json
