@@ -842,7 +842,9 @@ def _rate_limit_auth(ip: str, bucket: dict, max_per_window: int, window_s: int) 
         bucket[ip] = arr
         return True
 
-BAD_WORDS = ["PUT BAD WORDS HERE"]
+BAD_WORDS = ["fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt", "bastard", "damn", "piss", "crap", "twat",
+    "nigger", "nigga", "faggot", "fag", "retard", "tranny", "whore", "slut", "rape", "pedo", "nazi", "hitler",
+    "porn", "xxx", "hentai", "admin", "administrator", "root", "system", "moderator", "mod", "staff", "official"]
 
 def load_users_db():
     global users_db
@@ -989,7 +991,198 @@ def _peer_in_trusted(request: Request) -> bool:
     except Exception: return False
     return any(a in n for n in HARDEN["TRUSTED_PROXY_NETS"])
 
+# ════════════════════════════════════════════════════════════════════
+# DROP-IN: country detection from Cloudflare CF-IPCountry
+# ════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════
+# PATCH: IP-based country lookup (fallback when cf-ipcountry unavailable)
+# Install one of:
+#   pip install iptocc     # ~2 MB, data bundled, no external file
+#   pip install geoip2     # needs GeoLite2-Country.mmdb next to server.py
+# ══════════════════════════════════════════════════════════════════════
+_GEOIP_BACKEND = None
+_IPT_OCC_LOOKUP = None
+_GEOIP2_READER  = None
+
+try:
+    from iptocc import country_code as _IPT_OCC_LOOKUP  # noqa: F401
+    _GEOIP_BACKEND = "iptocc"
+except ImportError:
+    _IPT_OCC_LOOKUP = None
+    try:
+        import geoip2.database as _geoip2  # noqa: F401
+        _mmdb = BASE_DIR / "GeoLite2-Country.mmdb"
+        if _mmdb.exists():
+            _GEOIP2_READER = _geoip2.Reader(str(_mmdb))
+            _GEOIP_BACKEND = "geoip2"
+    except ImportError:
+        _geoip2 = None
+        _GEOIP2_READER = None
+
+if _GEOIP_BACKEND:
+    log.info(f"🌍 IP country fallback: {_GEOIP_BACKEND}")
+else:
+    log.info("🌍 IP country fallback: DISABLED (pip install iptocc to enable)")
+
+
+def _lookup_country_by_ip(ip: str) -> Optional[str]:
+    """Best-effort ISO-3166 alpha-2 country from an IP. Returns None on miss."""
+    if not ip or ip == "unknown":
+        return None
+    ip = ip.strip("[]")
+    if _GEOIP_BACKEND == "iptocc" and _IPT_OCC_LOOKUP is not None:
+        try:
+            cc = _IPT_OCC_LOOKUP(ip)
+            if cc and len(cc) == 2 and cc.upper() != "XX":
+                return cc.upper()
+        except Exception:
+            return None
+    elif _GEOIP_BACKEND == "geoip2" and _GEOIP2_READER is not None:
+        try:
+            resp = _GEOIP2_READER.country(ip)
+            if resp and resp.country.iso_code:
+                return resp.country.iso_code.upper()
+        except Exception:
+            return None
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PATCH: persistent country store (survives restart, powers mode=all_time)
+# ══════════════════════════════════════════════════════════════════════
+USER_COUNTRIES_FILE = DATA_DIR / "user_countries.json"
+user_countries: Dict[str, dict] = {}
+user_countries_lock = threading.Lock()
+_country_save_pending = False
+
+
+def _canonical_country_id(client_key: str) -> str:
+    """Dedup per user (3 devices → 1 person). Anonymous stays per-IP."""
+    uid = _user_id_from_key(client_key)   # resolved at runtime, fine
+    return f"user:{uid}" if uid else client_key
+
+
+def _load_user_countries():
+    global user_countries
+    try:
+        if USER_COUNTRIES_FILE.exists():
+            with open(USER_COUNTRIES_FILE, "r", encoding="utf-8") as f:
+                user_countries = json.load(f)
+            log.info(f"🌍 Loaded {len(user_countries)} persisted country entries")
+    except Exception as e:
+        log.warning(f"country load failed: {e}")
+        user_countries = {}
+
+
+def _save_user_countries():
+    global _country_save_pending
+    _country_save_pending = False
+    try:
+        with user_countries_lock:
+            snapshot = dict(user_countries)
+        tmp = USER_COUNTRIES_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, sort_keys=True)
+        os.replace(tmp, USER_COUNTRIES_FILE)
+    except Exception as e:
+        log.warning(f"country save failed: {e}")
+
+
+def _schedule_country_save():
+    """Debounce: at most one disk write per 60s, covering all changes."""
+    global _country_save_pending
+    with user_countries_lock:
+        if _country_save_pending:
+            return
+        _country_save_pending = True
+    t = threading.Timer(60.0, _save_user_countries)
+    t.daemon = True
+    t.start()
+
+
+def _record_user_country(client_key: str, cc: str, ip: str = ""):
+    now = time.time()
+    cid = _canonical_country_id(client_key)
+    with user_countries_lock:
+        entry = user_countries.get(cid)
+        if entry:
+            entry["country"]   = cc
+            entry["last_seen"] = now
+            if ip: entry["last_ip"] = ip
+        else:
+            user_countries[cid] = {
+                "country":    cc,
+                "first_seen": now,
+                "last_seen":  now,
+                "last_ip":    ip or "",
+            }
+    _schedule_country_save()
+
+def get_client_country(request: Request) -> Optional[str]:
+    """Prefer cf-ipcountry when the peer is trusted.
+    Fall back to IP-based lookup so this works even without Cloudflare."""
+    raw = request.headers.get("cf-ipcountry")
+    if raw:
+        cc = raw.strip().upper()
+        if len(cc) == 2 and cc != "XX":
+            nets = HARDEN["TRUSTED_PROXY_NETS"]
+            if not nets or _peer_in_trusted(request):
+                return cc
+    return _lookup_country_by_ip(get_client_ip(request))
+
+
+try:
+    import pycountry as _pycountry
+except ImportError:
+    _pycountry = None
+
+_ALPHA2_NUMERIC: Optional[dict] = None
+
+def _alpha2_to_numeric(cc: str) -> Optional[str]:
+    """'US' -> '840'. pycountry when available, else a built-in fallback
+    for the ~60 most likely countries (enough to render the map even
+    if you don't install pycountry)."""
+    global _ALPHA2_NUMERIC
+    if _ALPHA2_NUMERIC is None:
+        m: dict = {}
+        if _pycountry is not None:
+            for c in _pycountry.countries:
+                a, n = getattr(c, "alpha_2", None), getattr(c, "numeric", None)
+                if a and n:
+                    m[a.upper()] = n
+        if not m:
+            m = {
+                "US":"840","GB":"826","FR":"250","DE":"276","JP":"392","CN":"156",
+                "IN":"356","BR":"076","RU":"643","CA":"124","AU":"036","NL":"528",
+                "ES":"724","IT":"380","KR":"410","MX":"484","PL":"616","SE":"752",
+                "NO":"578","FI":"246","DK":"208","CH":"756","AT":"040","BE":"056",
+                "IE":"372","PT":"620","GR":"300","TR":"792","IL":"376","AE":"784",
+                "SA":"682","ZA":"710","NG":"566","EG":"818","KE":"404","AR":"032",
+                "CL":"152","CO":"170","PE":"604","VE":"862","UA":"804","CZ":"203",
+                "RO":"642","HU":"348","BG":"100","SG":"702","MY":"458","TH":"764",
+                "VN":"704","PH":"608","ID":"360","NZ":"554","HK":"344","TW":"158",
+                "XK":"383",
+            }
+        _ALPHA2_NUMERIC = m
+    return _ALPHA2_NUMERIC.get((cc or "").upper())
+
+
+def stamp_client_country(request: Request) -> Optional[str]:
+    """Stamp client_hardware[ck]['country'] and persist to user_countries.
+    Cheap, idempotent, safe to call on every request."""
+    try:
+        cc = get_client_country(request)
+        if not cc:
+            return None
+        ck = get_client_key(request)
+        hw = client_hardware.get(ck)
+        if hw is not None and hw.get("country") != cc:
+            hw["country"] = cc
+        _record_user_country(ck, cc, get_client_ip(request))
+        return cc
+    except Exception:
+        return None
 
 def get_client_ip(request: Request) -> str:
     nets = HARDEN["TRUSTED_PROXY_NETS"]
@@ -3623,6 +3816,106 @@ async def _measure_control_plane(request: Request, call_next):
         CONTROL_PLANE["round"] = round_state["current_round"]
     return response
 
+@app.middleware("http")
+async def _stamp_country_middleware(request: Request, call_next):
+    stamp_client_country(request)
+    response = await call_next(request)
+    stamp_client_country(request)
+    return response
+
+@app.get("/api/geo")
+async def api_geo(mode: str = "active"):
+    """
+    mode=active      → clients seen within IP_TIMEOUT_S  (live)
+    mode=round       → clients participating in current round
+    mode=registered  → all client_hardware entries with a country (in-memory)
+    mode=all_time    → every client ever seen, dedup'd per user (persisted)
+    """
+    if mode not in ("active", "round", "registered", "all_time"):
+        mode = "active"
+    now = time.time()
+    alpha_counts: Dict[str, int] = {}
+
+    if mode == "all_time":
+        with user_countries_lock:
+            for entry in user_countries.values():
+                cc = entry.get("country")
+                if cc:
+                    alpha_counts[cc] = alpha_counts.get(cc, 0) + 1
+    else:
+        if mode == "active":
+            keys = [ck for ck, ts in list(active_clients.items())
+                    if now - ts <= FL_CONFIG["IP_TIMEOUT_S"]]
+        elif mode == "round":
+            keys = list(round_state.get("participating_clients", {}).keys())
+        else:  # registered
+            keys = list(client_hardware.keys())
+        for ck in keys:
+            cc = (client_hardware.get(ck) or {}).get("country")
+            if cc:
+                alpha_counts[cc] = alpha_counts.get(cc, 0) + 1
+
+    numeric_counts: Dict[str, int] = {}
+    for cc, n in alpha_counts.items():
+        num = _alpha2_to_numeric(cc)
+        if num:
+            numeric_counts[num] = numeric_counts.get(num, 0) + n
+
+    return {
+        "mode": mode,
+        "window_s": FL_CONFIG["IP_TIMEOUT_S"] if mode == "active" else None,
+        "total": sum(alpha_counts.values()),
+        "by_alpha2":  dict(sorted(alpha_counts.items(),  key=lambda kv: (-kv[1], kv[0]))),
+        "by_numeric": dict(sorted(numeric_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/admin/geo_debug")
+async def admin_geo_debug(request: Request, secret: str = ""):
+    """One-shot diagnostic: tells you exactly what the server sees."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    now = time.time()
+    peer = request.client.host if request.client else "?"
+    return {
+        "backend": _GEOIP_BACKEND or "disabled",
+        "self": {
+            "peer_ip":          peer,
+            "is_trusted":       _peer_in_trusted(request),
+            "trusted_nets":     [str(n) for n in HARDEN["TRUSTED_PROXY_NETS"]],
+            "cf_ipcountry":     request.headers.get("cf-ipcountry"),
+            "cf_connecting":    request.headers.get("cf-connecting-ip"),
+            "resolved_ip":      get_client_ip(request),
+            "resolved_country": get_client_country(request),
+        },
+        "counts": {
+            "active_clients":           len(active_clients),
+            "client_hardware":          len(client_hardware),
+            "hardware_with_country":    sum(1 for hw in client_hardware.values() if hw.get("country")),
+            "user_countries_persisted": len(user_countries),
+        },
+        "sample_hardware": [
+            {"ck": ck[:40], "country": hw.get("country"),
+             "age_s": int(now - hw.get("last_seen", now))}
+            for ck, hw in list(client_hardware.items())[:10]
+        ],
+    }
+
+
+@app.post("/api/admin/test_country")
+async def admin_test_country(secret: str = "", client_key: str = "", country: str = ""):
+    """Inject a fake country for a fake client — proves the map works."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    cc = (country or "").upper()
+    if len(cc) != 2: raise HTTPException(400, "country must be 2 letters")
+    if not client_key: raise HTTPException(400, "client_key required")
+    hw = client_hardware.setdefault(client_key, {})
+    hw["country"] = cc
+    hw["last_seen"] = time.time()
+    active_clients[client_key] = time.time()
+    _record_user_country(client_key, cc, "0.0.0.0")
+    return {"ok": True, "client_key": client_key, "country": cc}
+
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
@@ -3953,7 +4246,25 @@ async def submit_chunk(request: Request, uploadId: str, index: int):
         expected_sha = request.headers.get("X-Chunk-Sha256")
         if expected_sha and expected_sha.lower() != h.hexdigest():
             raise HTTPException(400, "Checksum mismatch")
-        os.replace(part_tmp, part_final)
+        try:
+            os.replace(part_tmp, part_final)
+        except FileNotFoundError:
+            # Concurrent retry for the same (uploadId, index) already won the race
+            # and renamed the file. If the resulting .bin looks right, treat this
+            # request as a successful duplicate instead of a 500.
+            if not (part_final.exists() and part_final.stat().st_size == size):
+                raise
+            with uploads_lock:
+                up = _active_uploads.get(uploadId)
+                if up:
+                    old = up["chunk_sizes"].get(index, 0)
+                    up["chunk_sizes"][index] = size
+                    up["bytes_received"] = up["bytes_received"] - old + size
+                    up["received"].add(index)
+                    up["last_activity"] = time.time()
+            return {"ok": True, "index": index, "size": size, "duplicate": True,
+                    "receivedChunks": len(up["received"]) if up else 0,
+                    "totalChunks": up["chunks"] if up else 0}
         with uploads_lock:
             up = _active_uploads.get(uploadId)
             if not up: raise HTTPException(404, "Unknown uploadId")
@@ -4822,6 +5133,7 @@ async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int 
 async def startup():
     load_dataset_state(); load_users_db(); load_global_state(); _load_loss_state()
     initialize_model(); load_model_weights(); load_engram_weights()
+    _load_user_countries() 
     initialize_dataset(); _ensure_permutation(); _crash_recovery()
     restored = _restore_orchestrator_state()
     if not restored:
