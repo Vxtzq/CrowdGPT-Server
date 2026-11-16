@@ -83,6 +83,8 @@ class AggregationV2Test(unittest.TestCase):
         server.global_weights = torch.zeros(MODEL_SIZE, dtype=torch.float32)
         server.global_engram_weights = torch.zeros(ENG_BUCKETS * ENG_DIM, dtype=torch.float32)
         server.global_step = 0
+        # These tests exercise A3's *step-mode* scaling; token mode has its own StepBudgetTest.
+        server.CROSS_CHECK["TARGET_TOKENS_PER_STEP"] = 0
         server.FL_CONFIG["WEIGHT_DECAY"] = 0.0
         server.FL_CONFIG["SERVER_LR"] = 1.0
         server.FL_CONFIG["MIN_LR_MULT"] = 1.0
@@ -398,3 +400,35 @@ class AggregationV2Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StepBudgetTest(unittest.TestCase):
+    """A1 inversion: tokens per optimizer step is the knob; the step count is derived from the
+    round's micro-step budget (so a round keeps v1's per-step batch instead of 2 huge steps)."""
+
+    def test_accum_from_tokens(self):
+        self.assertEqual(server._ref_accum_steps({"TARGET_TOKENS_PER_STEP": 131072}), 32)
+        self.assertEqual(server._ref_accum_steps({"TARGET_TOKENS_PER_STEP": 0}), 0)
+        self.assertEqual(server._ref_accum_steps({"TARGET_TOKENS_PER_STEP": "junk"}), 0)
+
+    def test_steps_derived_from_round_budget(self):
+        cc = {"TARGET_TOKENS_PER_STEP": 131072, "TARGET_OPT_STEPS": 2}
+        self.assertEqual(server._ref_steps_for_round(500, cc), 16)   # 500 micro-steps / accum 32
+        self.assertEqual(server._ref_steps_for_round(125, cc), 4)    # short round -> fewer steps
+        # a dictated step count is ignored while tokens/step is authoritative
+        self.assertEqual(server._ref_steps_for_round(500, {"TARGET_TOKENS_PER_STEP": 0,
+                                                           "TARGET_OPT_STEPS": 2}), 2)
+        self.assertEqual(server._ref_steps_for_round(500, {"TARGET_TOKENS_PER_STEP": 0,
+                                                           "TARGET_OPT_STEPS": 0}), 0)
+        self.assertEqual(server._ref_steps_for_round(None, cc), 2)   # no budget -> step mode
+
+    def test_accum_payload_is_zero_in_token_mode(self):
+        """The client must derive accum from tokens, not from a stale fixed value."""
+        old = dict(server.CROSS_CHECK)
+        try:
+            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 131072, "TARGET_ACCUM_STEPS": 32})
+            self.assertEqual(server._target_accum_payload(), 0)
+            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 0, "TARGET_ACCUM_STEPS": 32})
+            self.assertEqual(server._target_accum_payload(), 32)
+        finally:
+            server.CROSS_CHECK.clear(); server.CROSS_CHECK.update(old)
