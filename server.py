@@ -796,21 +796,21 @@ CROSS_CHECK = {
     "MAX_OVERFLOW": _env_int("CROWDGPT_COHORT_MAX_OVERFLOW", 1),
     "TARGET_BATCH_SIZE": _env_int("CROWDGPT_TARGET_BATCH_SIZE", 2),
     "TARGET_ACCUM_STEPS": _env_int("CROWDGPT_TARGET_ACCUM_STEPS", 32),
-    "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 125),
-    # Round budget actually handed to a pool: base (nominally 125 micro-steps) times a hardware
-    # factor.  §13 measured per-token efficiency falling as the round grows (accum = round/H),
-    # so the factor is capped at 1.0 by default: slower clients get shorter rounds, faster ones
-    # do not get longer ones.
-    "ROUND_BASE_STEPS": _env_int("CROWDGPT_ROUND_BASE_STEPS", 125),
-    "ROUND_HW_MULT_MAX": _env_float("CROWDGPT_ROUND_HW_MULT_MAX", 1.0),
+    "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 500),
+    # Round budget handed to a pool: base × a hardware factor, exactly v1's pacing
+    # (500 × min(5.0, max(0.25, VRAM/8)) → 125…2500 micro-steps).  §13 shows the round size is
+    # the training-efficiency lever, but shortening it multiplies uploads, so it stays at v1's
+    # value by default; lower these (e.g. 125 / 1.0) to trade upload bandwidth for tokens-to-loss.
+    "ROUND_BASE_STEPS": _env_int("CROWDGPT_ROUND_BASE_STEPS", 500),
+    "ROUND_HW_MULT_MAX": _env_float("CROWDGPT_ROUND_HW_MULT_MAX", 5.0),
     # A1 (descent-consistent aggregation): optimizer steps a pool must take per round, whatever
     # its micro-step budget is.  0 = legacy: the client derives `accum` from bs*sl.
-    "TARGET_OPT_STEPS": _env_int("CROWDGPT_TARGET_OPT_STEPS", 16),
+    "TARGET_OPT_STEPS": _env_int("CROWDGPT_TARGET_OPT_STEPS", 0),
     # Tokens per optimizer step is the authority for the inner batch size (v1's parameterisation).
     # When set, the step count is *derived* from the round's micro-step budget instead of dictated,
     # so a round keeps v1's per-step batch instead of grouping 500 micro-steps into 2 huge ones.
     # 131072 = 32 micro-batches of 2x2048 = v1's value.
-    "TARGET_TOKENS_PER_STEP": _env_int("CROWDGPT_TARGET_TOKENS_PER_STEP", 0),
+    "TARGET_TOKENS_PER_STEP": _env_int("CROWDGPT_TARGET_TOKENS_PER_STEP", 131072),
     "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "any").strip().lower(),
     "TARGET_OPTIMIZER": os.getenv("CROWDGPT_TARGET_OPTIMIZER", "any").strip().lower(),
     # v2.0: threshold raised to 5.0 — cross-arch tolerated, same backend/prec/optim
@@ -1681,7 +1681,6 @@ def _activate_pool(pool: dict):
     hw = client_hardware.get(slowest_client, {})
     vram_gb = hw.get("vram_gb", 8.0)
     client_bs = max(1, hw.get("bs", 1))
-    # Only shorten: a longer round raises accum (round/H) and measured worse per token.
     hw_multiplier = min(float(CROSS_CHECK["ROUND_HW_MULT_MAX"]), max(0.25, vram_gb / 8.0))
     scaled_steps = int(BASE_STEPS * hw_multiplier)
     target_steps = max(100, min(2500, scaled_steps))
@@ -4952,7 +4951,7 @@ def _ref_steps_for_round(local_steps=None, cross_check: Optional[dict] = None) -
     try: local = int(local_steps or 0)
     except (TypeError, ValueError): local = 0
     if accum > 0 and local > 0:
-        return max(1, int(round(local / accum)))
+        return max(1, int(math.ceil(local / accum)))
     return steps
 
 def _delta_opt_steps(md: Optional[dict]) -> Optional[int]:
