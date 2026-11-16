@@ -32,6 +32,12 @@ A round must be a *descent step*, not a consensus of endpoints. Three rules prod
   default stays at v1's pacing (`ROUND_BASE_STEPS=500` × `VRAM/8`, capped at 2500); lower
   `CROWDGPT_ROUND_BASE_STEPS` (e.g. `125`) and `CROWDGPT_ROUND_HW_MULT_MAX` (e.g. `1`) deliberately
   if you'd rather spend bandwidth than tokens.
+- **Normalise a delta by the steps it took, against *its own pool's* round.** Clients report
+  `optimizerSteps` and `accum`; the server scales each delta by `clamp(n_ref / steps, 0.5, 2.0)`
+  with `n_ref = ceil(target_steps / accum)` for that pool (falling back to the count its survivors
+  agree on). One global nominal reference would rescale an entire healthy pool on a big card — a
+  2000 micro-step round runs 63 steps, and `clamp(16/63) = 0.5` would halve its delta every round.
+  Legacy deltas without `optimizerSteps` are applied unscaled.
 
 `MAX_DELTA_APPLY_NORM` (default `12000`) is a tripwire: a delta above it is clipped and a
 warning is logged. It is not a routine nonlinearity.

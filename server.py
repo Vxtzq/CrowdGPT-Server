@@ -2352,16 +2352,19 @@ def _complete_pool_sync(pool: dict):
                     merged = _merge_pool_deltas(pool_id, survivors)
                     if merged:
                         ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
-                                            "deltas": [(merged, 1.0)], **stats})
+                                            "deltas": [(merged, 1.0)],
+                                            "target_steps": pool.get("target_steps"), **stats})
                         log.info(f"📦 Pool {pool_id}: merged {len(survivors)} deltas into 1 "
                                  f"(tokens={stats['tokens']:,}, optSteps={stats['optimizerSteps'] or 'legacy'})")
                     else:
                         log.warning(f"⚠️ Pool {pool_id}: merge failed, keeping {len(survivors)} deltas")
                         ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
-                                            "deltas": survivors, **stats})
+                                            "deltas": survivors,
+                                            "target_steps": pool.get("target_steps"), **stats})
                 else:
                     ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
-                                        "deltas": survivors, **stats})
+                                        "deltas": survivors,
+                                        "target_steps": pool.get("target_steps"), **stats})
             pools.pop(pool_id, None)
             _persist_pool_removed(pool_id)
     except Exception as e:
@@ -3817,9 +3820,21 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     engram_accumulator = {}
     row_lim = HARDEN["ENGRAM_ROW_NORM_MAX"]
     total_applied = 0; total_tokens = 0; clipped_count = 0; rejected_count = 0
-    step_scaled = 0; legacy_steps = 0; step_scales = []
+    step_scaled = 0; legacy_steps = 0; step_scales = []; pool_n_refs = []
     for pool_result, pw in zip(ready_pool_list, pool_w):
         pool_id = pool_result["pool_id"]
+        # A3's reference is the step count *this pool's round* asked for: the round budget is
+        # hardware-scaled, so one global number would rescale a homogeneous pool on a bigger
+        # card (63 steps -> clamp(16/63) = 0.5) and silently halve its delta.  Pools that do not
+        # declare a budget fall back to the count their survivors agree on, then to the global
+        # nominal value.
+        _ptarget = pool_result.get("target_steps")
+        if _ptarget:
+            pool_n_ref = _ref_steps_for_round(_ptarget) or n_ref
+        else:
+            _pstats = _pool_delta_stats(pool_result.get("deltas", []))
+            pool_n_ref = int(_pstats.get("optimizerSteps") or 0) or n_ref
+        pool_n_refs.append(pool_n_ref)
         for path, weight in pool_result["deltas"]:
             try:
                 md = _delta_metadata(path)
@@ -3869,7 +3884,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     step_scale = 1.0
                     legacy_steps += 1
                 else:
-                    step_scale = _step_scale(n_ref, md)
+                    step_scale = _step_scale(pool_n_ref, md)
                     if step_scale != 1.0: step_scaled += 1
                 step_scales.append(round(step_scale, 4))
                 eff = pw * weight * step_scale * scale
@@ -3938,6 +3953,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         with stats_lock: global_step += 1
     PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr,
               poolWeights=[round(x, 4) for x in pool_w], stepScales=sorted(set(step_scales)),
+              poolNRefs=pool_n_refs,
               stepScaled=step_scaled, legacySteps=legacy_steps, maxDeltaApplyNorm=cap)
     log.info(f"✅ SGD step {global_step}: applied {total_applied}, rejected {rejected_count}, "
              f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}, "

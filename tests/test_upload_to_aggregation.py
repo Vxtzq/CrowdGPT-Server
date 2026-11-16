@@ -182,7 +182,7 @@ class UploadToAggregationTest(unittest.TestCase):
         self.assertEqual(stats["optimizerSteps"], 1)
         self.assertEqual(stats["tokens"], 1_000_000)
         server.apply_round_aggregation([{"pool_id": "p1", "chunk_idx": 0,
-                                         "deltas": [(dpath, 1.0)], **stats}])
+                                         "deltas": [(dpath, 1.0)], "target_steps": 64, **stats}])
         applied = server.global_weights.clone()
         expect = torch.tensor(vec, dtype=torch.float32).to(torch.bfloat16).float() * 2.0
         self.assertTrue(torch.allclose(applied, expect, atol=2e-3), (applied, expect))

@@ -117,12 +117,15 @@ class AggregationV2Test(unittest.TestCase):
     def delta_path(self, name):
         return os.path.join(self.tmp, f"delta_{name}.bin")
 
-    def pool(self, name, deltas, tokens=None, opt_steps="auto"):
+    def pool(self, name, deltas, tokens=None, opt_steps="auto", target_steps=None):
         entry = {"pool_id": name, "chunk_idx": 0, "deltas": deltas}
         if tokens is not None:
             entry["tokens"] = tokens
         if opt_steps != "auto":
             entry["optimizerSteps"] = opt_steps
+        if target_steps is not None:
+            # A3's reference is the round budget this pool was asked for (micro-steps).
+            entry["target_steps"] = target_steps
         return entry
 
     # ------------------------------------------------------------------ step scaling (A3.1)
@@ -151,17 +154,51 @@ class AggregationV2Test(unittest.TestCase):
         write_delta(p_h2, vec, opt_steps=2)
         write_delta(p_legacy, vec)          # no optimizerSteps at all
         server.CROSS_CHECK["TARGET_OPT_STEPS"] = 2
-        server.apply_round_aggregation([self.pool("a", [(p_h1, 1.0)])])
+        server.apply_round_aggregation([self.pool("a", [(p_h1, 1.0)], target_steps=64)])
         w_after_h1 = server.global_weights.clone()
         server.global_weights = torch.zeros(MODEL_SIZE, dtype=torch.float32)
-        server.apply_round_aggregation([self.pool("b", [(p_h2, 1.0)])])
+        server.apply_round_aggregation([self.pool("b", [(p_h2, 1.0)], target_steps=64)])
         w_after_h2 = server.global_weights.clone()
         server.global_weights = torch.zeros(MODEL_SIZE, dtype=torch.float32)
-        server.apply_round_aggregation([self.pool("c", [(p_legacy, 1.0)])])
+        server.apply_round_aggregation([self.pool("c", [(p_legacy, 1.0)], target_steps=64)])
         w_after_legacy = server.global_weights.clone()
 
         self.assertAlmostEqual(float(w_after_h1.norm() / w_after_h2.norm()), 2.0, places=4)
         self.assertAlmostEqual(float(w_after_legacy.norm() / w_after_h2.norm()), 1.0, places=4)
+
+    def test_pool_reference_follows_its_own_round_budget(self):
+        """Regression: A3's reference is the pool's own round budget.
+
+        The budget is hardware-scaled (500 x VRAM/8 micro-steps), so a 32 GB pool runs 63
+        optimizer steps.  Referencing a global nominal 500-micro-step round (16 steps) would
+        apply clamp(16/63) = 0.5 and silently halve an entire healthy pool's delta.
+        """
+        vec = [0.05 * (i + 1) for i in range(MODEL_SIZE)]
+        p = self.delta_path("p63")
+        write_delta(p, vec, opt_steps=63)
+        server.CROSS_CHECK["TARGET_LOCAL_STEPS"] = 500
+        server.CROSS_CHECK["TARGET_TOKENS_PER_STEP"] = 131072
+        self._events.clear()
+        server.apply_round_aggregation([self.pool("big", [(p, 1.0)], target_steps=2000)])
+        ev = [kw for name, kw in self._events if name == "aggregation"][-1]
+        self.assertEqual(ev["poolNRefs"], [63])       # derived from 2000 micro-steps / accum 32
+        self.assertEqual(ev["stepScales"], [1.0])     # not rescaled against the 16-step nominal
+
+    def test_outlier_is_corrected_against_its_own_pool(self):
+        """A client that ran 16 steps where its pool asked for 63 is scaled up (clamped at 2x),
+        while the clients that hit the budget stay at 1.0."""
+        vec = [0.05 * (i + 1) for i in range(MODEL_SIZE)]
+        p63 = self.delta_path("q63")
+        p16 = self.delta_path("q16")
+        write_delta(p63, vec, opt_steps=63)
+        write_delta(p16, vec, opt_steps=16)
+        server.CROSS_CHECK["TARGET_TOKENS_PER_STEP"] = 131072
+        self._events.clear()
+        server.apply_round_aggregation([self.pool("big", [(p63, 1.0), (p16, 1.0)],
+                                                  target_steps=2000)])
+        ev = [kw for name, kw in self._events if name == "aggregation"][-1]
+        self.assertEqual(ev["poolNRefs"], [63])
+        self.assertEqual(ev["stepScales"], [1.0, 2.0])
 
     # ------------------------------------------------------------------ pool weights (A3.3)
     def test_pools_weighted_by_tokens(self):
@@ -243,8 +280,8 @@ class AggregationV2Test(unittest.TestCase):
         write_delta(pb, tiny, opt_steps=2, eng=([1], [[0.0, 0.0]]))
         server.global_engram_weights = torch.zeros(ENG_BUCKETS * ENG_DIM)
         server.apply_round_aggregation([
-            self.pool("a", [(pa, 1.0)], tokens=1_000_000),
-            self.pool("b", [(pb, 1.0)], tokens=1_000_000),
+            self.pool("a", [(pa, 1.0)], tokens=1_000_000, target_steps=64),
+            self.pool("b", [(pb, 1.0)], tokens=1_000_000, target_steps=64),
         ])
         row = server.global_engram_weights[1 * ENG_DIM:2 * ENG_DIM]
         # eff_a = 0.5 * 2 = 1.0, eff_b = 0.5 * 1 = 0.5 -> mean = (3,4) * 1.0/1.5 * lr(1.0) * trust(1.0)
