@@ -161,9 +161,11 @@ try:
     from orchestrator.records import (build_round_record, digest_of, merkle_root,
                                       record_hash, sign_record)
     from orchestrator.adversarial import plausible_loss
+    from orchestrator.compression import iter_frames
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     _ORCH_IMPORT_ERROR = _orch_import_err
+    iter_frames = None
     def plausible_loss(x):   # fallback when the orchestrator package is absent (the real one is imported above otherwise)
         try: v = float(x); return math.isfinite(v) and 0.0 <= v <= 100.0
         except (TypeError, ValueError): return False
@@ -2217,7 +2219,7 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
             deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
             bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
             bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
-            code_versions=("3.2",))
+            code_versions=("3.4",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
         ORCH.publication.publish_round(rnd, rec)
         _write_nutrition(rec, rnd, rec.get("eval"))
@@ -3079,6 +3081,10 @@ threading.Thread(target=round_watchdog, daemon=True).start()
 threading.Thread(target=hf_status_loop, daemon=True).start()
 
 # ============ SUBMISSION PROCESSING ============
+NG_DELTA_CODECS = ("ngd1", "ngd1r")
+NG_DELTA_CODEC_RESIDUAL = {"ngd1": False, "ngd1r": True}
+
+
 def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str, request: Request, init_meta: Optional[dict] = None):
     _ticket_reason = _ticket_rejection(client_key,
         task_id=((init_meta or {}).get("taskId")),
@@ -3117,10 +3123,40 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS:
                 raise HTTPException(status_code=400, detail="Invalid engramSparseCount")
             bpp = _bytes_per_param(fmt)
+            codec = str(body.get("deltaCodec") or "").lower()
+            if codec not in ("", "off") + NG_DELTA_CODECS:
+                raise HTTPException(status_code=400, detail=f"Unsupported deltaCodec: {codec}")
+            if codec in NG_DELTA_CODECS and fmt != "bf16":
+                raise HTTPException(status_code=400, detail=f"{codec} delta requires weightFormat bf16")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as tdf:
                 temp_delta_path = tdf.name
             norm_sq = 0.0; offset = 0; has_nan_inf = False
             with open(temp_delta_path, 'wb') as td:
+                if codec in NG_DELTA_CODECS:
+                    # Framed delta: the body is an NGD2/NGD3 container, not a dense stream,
+                    # so it must never be read through the dense loop below.
+                    if iter_frames is None:
+                        raise HTTPException(status_code=400, detail=f"{codec} codec unavailable on this server")
+                    blob = dec_f.read()
+                    if has_engram and engram_sparse_count > 0:
+                        tail_len = engram_sparse_count * 4 + engram_sparse_count * MODEL_CONFIG["dim"] * bpp
+                        if len(blob) < tail_len:
+                            raise HTTPException(status_code=400, detail=f"Truncated {codec} engram tail")
+                        dec_f.seek(-tail_len, os.SEEK_END)
+                        blob = blob[:-tail_len]
+                    try:
+                        for block in iter_frames(blob, max_total_params=MODEL_SIZE,
+                                                 expect_residual=NG_DELTA_CODEC_RESIDUAL[codec]):
+                            arr = np.asarray(block, dtype=np.float32)
+                            if not np.all(np.isfinite(arr)):
+                                has_nan_inf = True; break
+                            norm_sq += float(np.sum(arr * arr, dtype=np.float64))
+                            td.write(_encode_float32_to_bf16_bytes(torch.from_numpy(arr)))
+                            offset += int(arr.size)
+                    except (ValueError, struct.error, zlib.error) as exc:
+                        raise HTTPException(status_code=400, detail=f"Invalid {codec} payload: {exc}")
+                    if not has_nan_inf and offset != MODEL_SIZE:
+                        raise HTTPException(status_code=400, detail=f"{codec} payload size mismatch")
                 while offset < MODEL_SIZE:
                     read_params = min(10_000_000, MODEL_SIZE - offset)
                     chunk_bytes = dec_f.read(read_params * bpp)
@@ -3254,6 +3290,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
                 "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
                 "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
+                "deltaCodec": codec or "off",
             }
             if delta_norm > max_allowed:
                 scale_factor = max_allowed / delta_norm
