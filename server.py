@@ -283,6 +283,46 @@ ENG_NUM_BUCKETS = 227865
 ENG_PARAMS = ENG_NUM_BUCKETS * MODEL_CONFIG["dim"]
 log.info(f"🧠 Engram size: {ENG_PARAMS:,} params (~{ENG_PARAMS*4/1024/1024:.2f} MB FP32)")
 
+# Fresh-run initialisation (PLAN.md §4): N(0,0.02) for every weight matrix, LayerNorm
+# weight 1 / bias 0.  "flat" keeps the pre-v2 behaviour of drawing N(0,0.02) for *all*
+# base parameters, LayerNorm included — that is what v1 actually ran with, and its
+# ln1.weight started at rms 0.02 instead of 1.  Kept selectable so the two runs stay
+# comparable; the documented init is the default.
+INIT_MODE = (os.getenv("CROWDGPT_INIT_MODE", "ln_identity") or "ln_identity").strip().lower()
+if INIT_MODE not in ("ln_identity", "flat"): INIT_MODE = "ln_identity"
+
+def flat_ln_slices(cfg: dict):
+    """(offset, numel, fill) of every LayerNorm entry in the flat base-weight buffer.
+
+    The order is the one clients see in `named_parameters()` (see sidecar
+    `packing/pack_flat.py::flat_layout`): wte, then per block ln1.w/ln1.b/q/k/v/o/
+    ln2.w/ln2.b/w1/w2/w3, then the final ln.w/ln.b.
+    """
+    d = cfg["dim"]; h = cfg.get("mlpHidden", 4 * d)
+    hd = cfg["headDim"]; nh = cfg["nHeads"]; nkv = cfg["nKvHeads"]
+    out = []
+    off = cfg["vocabSize"] * d
+    for _ in range(cfg["nLayers"]):
+        out.append((off, d, 1.0)); off += d          # ln1.weight
+        out.append((off, d, 0.0)); off += d          # ln1.bias
+        off += d * nh * hd + d * nkv * hd * 2 + d * d
+        out.append((off, d, 1.0)); off += d          # ln2.weight
+        out.append((off, d, 0.0)); off += d          # ln2.bias
+        off += d * h * 2 + h * d
+    out.append((off, d, 1.0)); off += d              # ln.weight
+    out.append((off, d, 0.0)); off += d              # ln.bias
+    assert off == calculate_model_size(cfg), (off, calculate_model_size(cfg))
+    return out
+def expected_init_norm(cfg: dict) -> float:
+    """‖W‖ a fresh run should report from its initialisation (G0)."""
+    slices = flat_ln_slices(cfg)
+    ones = sum(n for _o, n, f in slices if f == 1.0)
+    total = calculate_model_size(cfg)
+    if INIT_MODE == "flat":
+        return math.sqrt(4e-4 * total)
+    return math.sqrt(4e-4 * (total - 2 * ones) + ones)
+
+
 # ============ MEMORY GUARDS ============
 def _avail_mem_gb() -> float:
     if _HAS_PSUTIL: return psutil.virtual_memory().available / (1024 ** 3)
@@ -648,6 +688,7 @@ def _restore_orchestrator_state() -> bool:
                         "targetSeed": pv.target_seed,
                         "targetLocalSteps": pv.target_steps or CROSS_CHECK["TARGET_LOCAL_STEPS"],
                         "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
+                        "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
                         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
                         "targetAutocast": pv.target_autocast or CROSS_CHECK["TARGET_AUTOCAST"],
                         "targetOptimizer": pv.target_optimizer or CROSS_CHECK["TARGET_OPTIMIZER"],
@@ -679,7 +720,9 @@ FL_CONFIG = {
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
     "SERVER_LR": 1.0, "WEIGHT_DECAY": 0.00,
     "MAX_WEIGHT_NORM": 10000000000.0,
-    "MAX_DELTA_APPLY_NORM": 1200.0,
+    # A3: per-delta clip is a tripwire, not a routine nonlinearity (~10x the norm a normal
+    # round produces).  When it fires it is logged; tune it from the sweep's measured ‖Δ‖.
+    "MAX_DELTA_APPLY_NORM": 12000.0,
     "LR_DECAY_STEPS": 50_000, "MIN_LR_MULT": 0.05,
     "IP_TIMEOUT_S": 900, "SHARD_TIMEOUT_S": 1800, "CLEANUP_INTERVAL_S": 60,
     "SHUFFLE_CHUNKS": True,
@@ -697,6 +740,9 @@ def _env_int(name, default):
 def _env_float(name, default):
     try: return float(os.getenv(name, str(default)))
     except Exception: return default
+# FL_CONFIG is built before _env_float exists; apply the env override here.
+FL_CONFIG["MAX_DELTA_APPLY_NORM"] = _env_float("CROWDGPT_MAX_DELTA_APPLY_NORM",
+                                               FL_CONFIG["MAX_DELTA_APPLY_NORM"])
 def _parse_cidrs(raw):
     nets = []
     for part in (raw or "").split(","):
@@ -750,6 +796,9 @@ CROSS_CHECK = {
     "TARGET_BATCH_SIZE": _env_int("CROWDGPT_TARGET_BATCH_SIZE", 2),
     "TARGET_ACCUM_STEPS": _env_int("CROWDGPT_TARGET_ACCUM_STEPS", 32),
     "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 500),
+    # A1 (descent-consistent aggregation): optimizer steps a pool must take per round, whatever
+    # its micro-step budget is.  0 = legacy: the client derives `accum` from bs*sl.
+    "TARGET_OPT_STEPS": _env_int("CROWDGPT_TARGET_OPT_STEPS", 0),
     "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "any").strip().lower(),
     "TARGET_OPTIMIZER": os.getenv("CROWDGPT_TARGET_OPTIMIZER", "any").strip().lower(),
     # v2.0: threshold raised to 5.0 — cross-arch tolerated, same backend/prec/optim
@@ -771,6 +820,7 @@ if POOL_BF16 not in ("off", "arch", "strict", "on"): POOL_BF16 = "arch"
 if CROSS_CHECK["MAX_OVERFLOW"] < 0: CROSS_CHECK["MAX_OVERFLOW"] = 0
 if CROSS_CHECK["MAX_OVERFLOW"] > 2: CROSS_CHECK["MAX_OVERFLOW"] = 2
 if CROSS_CHECK["TARGET_BATCH_SIZE"] < 0: CROSS_CHECK["TARGET_BATCH_SIZE"] = 0
+if CROSS_CHECK["TARGET_OPT_STEPS"] < 0: CROSS_CHECK["TARGET_OPT_STEPS"] = 0
 if CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"] < 1.01: CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"] = 1.01
 if CROSS_CHECK["TARGET_AUTOCAST"] not in ("bf16", "fp32", "any"): CROSS_CHECK["TARGET_AUTOCAST"] = "bf16"
 if CROSS_CHECK["TARGET_OPTIMIZER"] not in ("adamw_fp32", "adamw8bit", "any"):
@@ -1631,6 +1681,7 @@ def _activate_pool(pool: dict):
         "round": round_state["current_round"], "createdAt": int(time.time() * 1000),
         "poolClients": list(pool["clients"]), "targetSeed": target_seed,
         "targetLocalSteps": target_steps, "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
+        "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
         "targetAutocast": pool_autocast,
         "targetOptimizer": pool_optimizer,
@@ -1731,6 +1782,12 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
                 log.error(f"Merge: cannot open {path}: {e}")
                 return None
         total_tokens = sum(df.tokens for df in dfs)
+        merged_steps = None
+        for path, _w in survivors:
+            merged_steps = _delta_opt_steps(_delta_metadata(path))
+            if merged_steps is not None: break
+        meta_common = {"tokensProcessed": total_tokens, "tokens": total_tokens}
+        if merged_steps is not None: meta_common["optimizerSteps"] = int(merged_steps)
         weights = [w for _, w in survivors]
         wsum = sum(weights)
         if wsum <= 0: wsum = 1.0
@@ -1739,7 +1796,7 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
         engram_acc = {}
         with open(merged_path, 'wb') as out_f:
             out_f.write(struct.pack('<I', _MERGE_META_PAD))
-            out_f.write(_merge_meta_bytes({"delta_norm": 0.0, "tokensProcessed": total_tokens, "tokens": total_tokens}))
+            out_f.write(_merge_meta_bytes({"delta_norm": 0.0, **meta_common}))
             for offset in range(0, MODEL_SIZE, chunk_size):
                 read_size = min(chunk_size, MODEL_SIZE - offset)
                 sum_chunk = torch.zeros(read_size, dtype=torch.float32)
@@ -1784,7 +1841,7 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
                 out_f.write(struct.pack('<I', 0))
             out_f.seek(0)       # real header (same fixed length) now that the norm is known
             out_f.write(struct.pack('<I', _MERGE_META_PAD))
-            out_f.write(_merge_meta_bytes({"delta_norm": math.sqrt(norm_sq), "tokensProcessed": total_tokens, "tokens": total_tokens}))
+            out_f.write(_merge_meta_bytes({"delta_norm": math.sqrt(norm_sq), **meta_common}))
         for path, _ in survivors:
             try: os.remove(path)
             except Exception: pass
@@ -1803,13 +1860,18 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
 def _merge_power_solo(pool: dict, survivors: list):
     entry = next((e for e in ready_pools if e.get("pool_id") == POWER_POOL_ID), None)
     if entry is None:
-        entry = {"pool_id": POWER_POOL_ID, "chunk_idx": pool.get("chunk_idx"), "deltas": [], "_tokens": {}}
+        entry = {"pool_id": POWER_POOL_ID, "chunk_idx": pool.get("chunk_idx"), "deltas": [],
+                 "_tokens": {}, "tokens": 0, "optimizerSteps": None}
         ready_pools.append(entry)
     for path, _w in survivors:
         try: tok = max(1, int(open_delta(path, MODEL_SIZE).tokens))
         except Exception: tok = 1
         entry["_tokens"][path] = tok
     total = sum(entry["_tokens"].values()) or 1
+    entry["tokens"] = total
+    _stats = _pool_delta_stats(survivors)
+    if _stats.get("optimizerSteps") is not None:
+        entry["optimizerSteps"] = _stats["optimizerSteps"]
     paths_weights = [(p, POWER["SOLO_WEIGHT"] * t / total) for p, t in entry["_tokens"].items()]
     total_w = sum(w for _, w in paths_weights)
     if len(paths_weights) > 1:
@@ -1961,14 +2023,18 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
             "targetSeed": pool["target_seed"],
             "targetLocalSteps": pool.get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
+            "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
             "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
             "targetAutocast": pool.get("target_autocast") or CROSS_CHECK["TARGET_AUTOCAST"],
             "targetOptimizer": pool.get("target_optimizer") or CROSS_CHECK["TARGET_OPTIMIZER"],
             "harmonizeMode": "strict" if CROSS_CHECK["TARGET_BATCH_SIZE"] > 0 else "per_client_bs",
             "instruction": ("Train on the assigned shard with EXACTLY: "
                 "seed=targetSeed, micro_steps=targetLocalSteps, "
-                "batch_size=min(your_max_bs, targetBatchSize), "
-                "accum_steps=targetAccumSteps, autocast=targetAutocast. "
+                "batch_size=min(your_max_bs, targetBatchSize), autocast=targetAutocast. "
+                "If targetOptimizerSteps > 0, group those micro steps into that many optimizer "
+                "steps (accum = ceil(targetLocalSteps / targetOptimizerSteps)) and report "
+                "optimizerSteps and accum in the submit body; otherwise use "
+                "accum_steps=targetAccumSteps. "
                 "If targetOptimizer is set (adamw_fp32/adamw8bit), use that optimizer. "
                 "Report actualOptimizer in submit body.")},
     }
@@ -2255,6 +2321,8 @@ def _complete_pool_sync(pool: dict):
         _persist_pool_status(pool, "completing")
         survivors = _run_pool_cross_check(pool)
         _pub_pool_result(pool, survivors)
+        # read the A3 metadata before taking the pool lock (it touches the delta headers on disk)
+        stats = _pool_delta_stats(survivors) if survivors else {"tokens": 0, "optimizerSteps": None}
         with pool_lock:
             if survivors and pool.get("power") and len(pool["clients"]) == 1:
                 _merge_power_solo(pool, survivors)
@@ -2262,13 +2330,17 @@ def _complete_pool_sync(pool: dict):
                 if len(survivors) > 1:
                     merged = _merge_pool_deltas(pool_id, survivors)
                     if merged:
-                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": [(merged, 1.0)]})
-                        log.info(f"📦 Pool {pool_id}: merged {len(survivors)} deltas into 1")
+                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
+                                            "deltas": [(merged, 1.0)], **stats})
+                        log.info(f"📦 Pool {pool_id}: merged {len(survivors)} deltas into 1 "
+                                 f"(tokens={stats['tokens']:,}, optSteps={stats['optimizerSteps'] or 'legacy'})")
                     else:
                         log.warning(f"⚠️ Pool {pool_id}: merge failed, keeping {len(survivors)} deltas")
-                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
+                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
+                                            "deltas": survivors, **stats})
                 else:
-                    ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
+                    ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
+                                        "deltas": survivors, **stats})
             pools.pop(pool_id, None)
             _persist_pool_removed(pool_id)
     except Exception as e:
@@ -2360,8 +2432,16 @@ def initialize_model():
     global global_weights, global_engram_weights
     torch.manual_seed(42)
     global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
+    if INIT_MODE == "ln_identity":
+        for off, n, fill in flat_ln_slices(MODEL_CONFIG):
+            global_weights[off:off + n] = fill
     global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
-    log.info(f"🎲 initialized {MODEL_SIZE:,} base + {ENG_PARAMS:,} engram weights (FP32 master)")
+    wn = float(torch.norm(global_weights))
+    exp = expected_init_norm(MODEL_CONFIG)
+    log.info(f"🎲 initialized {MODEL_SIZE:,} base + {ENG_PARAMS:,} engram weights (FP32 master), "
+             f"mode={INIT_MODE}, ‖W‖={wn:.2f} (expected ≈{exp:.2f})")
+    if abs(wn - exp) > 0.5:
+        log.warning(f"⚠️ G0 init check failed: ‖W‖={wn:.2f}, expected ≈{exp:.2f} for mode={INIT_MODE}")
 
 def load_global_state():
     global global_step, global_stats, lora_stats
@@ -2615,6 +2695,7 @@ def update_and_save_status(push_hf: bool = True):
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"], "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
+            "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"]},
         "matchmaking": mm_snapshot, "byzantineFlagCounts": dict(byzantine_flag_counts)}
     try:
@@ -3270,6 +3351,17 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             except Exception: local_steps = 1
             if local_steps <= 0: local_steps = 1
             local_steps = min(local_steps, HARDEN["MAX_LOCAL_STEPS"])
+            # A3: the client reports the optimizer steps it actually took (and its accum), so the
+            # aggregate can be normalised by steps instead of by an assumed trajectory length.
+            # Absent fields mean a legacy client; they are stored as absent, never guessed.
+            try: opt_steps = int(body.get("optimizerSteps") or 0)
+            except Exception: opt_steps = 0
+            if opt_steps < 0: opt_steps = 0
+            if opt_steps > local_steps: opt_steps = local_steps
+            try: accum_steps = int(body.get("accum") or 0)
+            except Exception: accum_steps = 0
+            if accum_steps < 0: accum_steps = 0
+            if accum_steps > HARDEN["MAX_LOCAL_STEPS"]: accum_steps = HARDEN["MAX_LOCAL_STEPS"]
             loss_raw = body.get("loss", (init_meta or {}).get("loss")); loss_float = None
             try:
                 if loss_raw is not None:
@@ -3293,6 +3385,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "checksum": ((init_meta or {}).get("checksum") or body.get("checksum")),
                 "delta_norm": delta_norm, "rank": rank, "loss": loss_float,
                 "localSteps": local_steps, "tokensProcessed": _bounded_tokens(body, client_key, local_steps),
+                **({"optimizerSteps": opt_steps, "accum": accum_steps} if opt_steps > 0 else {}),
                 "normalized": False, "submittedAt": int(time.time() * 1000), "weightFormat": "bf16",
                 "shardId": shard_id_for_meta, "taskId": task_id, "crossCheckUsed": cc_used,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
@@ -3513,6 +3606,7 @@ def _log_cross_check_summary():
     if not CROSS_CHECK["ENABLED"]: log.info(f"🔍 Cross-check: DISABLED"); return
     log.info(f"🔍 Cross-check: ENABLED — pool={MATCHMAKING['POOL_SIZE']} (MANDATORY)")
     log.info(f"   → targetBatchSize={CROSS_CHECK['TARGET_BATCH_SIZE']} targetLocalSteps={CROSS_CHECK['TARGET_LOCAL_STEPS']}")
+    log.info(f"   → targetOptimizerSteps={CROSS_CHECK['TARGET_OPT_STEPS'] or 'legacy (client-derived)'}")
     log.info(f"   → targetOptimizer={CROSS_CHECK['TARGET_OPTIMIZER']}")
     log.info(f"   → distance threshold={CROSS_CHECK['DISTANCE_THRESHOLD_RATIO']}x (2% absolute floor)")
     log.info(f"   → ban at {CROSS_CHECK['BAN_THRESHOLD']} subnet strikes")
@@ -3663,11 +3757,25 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     wd = FL_CONFIG["WEIGHT_DECAY"]
     cap = FL_CONFIG["MAX_DELTA_APPLY_NORM"]
     mxn = FL_CONFIG["MAX_WEIGHT_NORM"]
+    n_ref = int(CROSS_CHECK.get("TARGET_OPT_STEPS") or 0)
     step_before = global_step
     n_pools = len(ready_pool_list)
-    pool_norm = 1.0 / n_pools if n_pools > 0 else 1.0
+    # A3: weight pools by the tokens their merged delta represents instead of 1/n_pools.
+    # Unknown counts count as one average pool so a pool is never silently dropped.
+    raw_tokens = [_pool_token_count(pr) for pr in ready_pool_list]
+    if sum(raw_tokens) > 0:
+        known = [t for t in raw_tokens if t > 0]
+        fill = max(1, int(sum(known) / len(known)))
+        w = [t if t > 0 else fill for t in raw_tokens]
+        tot = float(sum(w))
+        pool_w = [x / tot for x in w]
+    else:
+        pool_w = [1.0 / n_pools] * n_pools if n_pools else []
+    if len(pool_w) != n_pools:            # never silently drop a pool
+        pool_w = [1.0 / n_pools] * n_pools if n_pools else []
     log.info(f"🧮 Merging {n_pools} pool result(s) "
-             f"(lr={lr:.4f}, pool_norm={pool_norm:.4f}, wd={wd}, delta_cap={cap}, max_norm={mxn})")
+             f"(lr={lr:.4f}, pool_w={[round(x, 4) for x in pool_w]}, wd={wd}, "
+             f"delta_cap={cap}, max_norm={mxn}, targetOptSteps={n_ref or 'legacy'})")
     if not _mem_guard(1.5, "pool aggregation"):
         log.error("❌ Skipping aggregation — memory pressure. Round advances WITHOUT model update.")
         for pool_result in ready_pool_list:
@@ -3686,7 +3794,8 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     engram_accumulator = {}
     row_lim = HARDEN["ENGRAM_ROW_NORM_MAX"]
     total_applied = 0; total_tokens = 0; clipped_count = 0; rejected_count = 0
-    for pool_result in ready_pool_list:
+    step_scaled = 0; legacy_steps = 0; step_scales = []
+    for pool_result, pw in zip(ready_pool_list, pool_w):
         pool_id = pool_result["pool_id"]
         for path, weight in pool_result["deltas"]:
             try:
@@ -3727,10 +3836,22 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     except Exception: pass
                     continue
                 scale = (cap / dnorm) if (dnorm > cap > 0) else 1.0
-                if scale < 1.0: clipped_count += 1
+                if scale < 1.0:
+                    clipped_count += 1
+                    log.warning(f"⚠️ Delta cap tripped for {path}: ‖δ‖={dnorm:.1f} > cap={cap:.1f}; scaled by {scale:.4f}")
+                # A3: normalise by the number of optimizer steps the delta actually took, so a
+                # volunteer that ran fewer/more steps than the round target contributes the
+                # right *rate*, not the right *distance*.  Legacy deltas are applied as-is.
+                if _delta_opt_steps(md) is None:
+                    step_scale = 1.0
+                    legacy_steps += 1
+                else:
+                    step_scale = _step_scale(n_ref, md)
+                    if step_scale != 1.0: step_scaled += 1
+                step_scales.append(round(step_scale, 4))
+                eff = pw * weight * step_scale * scale
                 if weight > 0:
-                    # was: stream_add_base_delta(global_weights, df, lr * weight * scale)
-                    with shard_lock: stream_add_base_delta(global_weights, df, lr * pool_norm * weight * scale)
+                    with shard_lock: stream_add_base_delta(global_weights, df, lr * eff)
                     eng_idx, eng_val = read_engram_tail(df, MODEL_CONFIG["dim"])
                     if eng_idx is not None and len(eng_idx) > 0:
                         evf = eng_val.float()
@@ -3741,9 +3862,12 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                         for idx, val, okk in zip(eng_idx.tolist(), evf, ok.tolist()):
                             if not okk or not (0 <= idx < ENG_NUM_BUCKETS): continue
                             if idx not in engram_accumulator:
-                                engram_accumulator[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0]
-                            engram_accumulator[idx][0] += val * weight * scale
-                            engram_accumulator[idx][1] += weight
+                                # [weighted sum, raw weight (trust ramp), effective weight (average)]
+                                engram_accumulator[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0, 0.0]
+                            acc = engram_accumulator[idx]
+                            acc[0] += val * eff
+                            acc[1] += weight
+                            acc[2] += eff
                 total_applied += 1
                 total_tokens += df.tokens
             except Exception as e:
@@ -3780,18 +3904,21 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         if engram_accumulator:
             log.info(f"🧠 Updating {len(engram_accumulator)} engram buckets")
             ftw = HARDEN["ENGRAM_FULL_TRUST_WEIGHT"]
-            for idx, (vs, ws) in engram_accumulator.items():
-                if ws > 0:
+            for idx, (vs, ws, weff) in engram_accumulator.items():
+                if weff > 0:
                     trust = min(1.0, ws / ftw) if ftw > 0 else 1.0
-                    avg = vs / ws
+                    avg = vs / weff
                     sp = idx * MODEL_CONFIG["dim"]; ep = sp + MODEL_CONFIG["dim"]
-                    global_engram_weights[sp:ep] += avg * (lr * pool_norm * trust)   # ← add pool_norm
+                    global_engram_weights[sp:ep] += avg * (lr * trust)   # pool_w/step_scale/trust folded into avg
             del engram_accumulator
             gc.collect()
         with stats_lock: global_step += 1
-    PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr)
+    PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr,
+              poolWeights=[round(x, 4) for x in pool_w], stepScales=sorted(set(step_scales)),
+              stepScaled=step_scaled, legacySteps=legacy_steps, maxDeltaApplyNorm=cap)
     log.info(f"✅ SGD step {global_step}: applied {total_applied}, rejected {rejected_count}, "
-             f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}")
+             f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}, "
+             f"step_scaled={step_scaled}, legacy_steps={legacy_steps}")
     if HARDEN["LOSS_CHECK_MODE"] == "off": handle_checkpoints()
     gc.collect()
 
@@ -4177,6 +4304,7 @@ async def submit_init(request: Request):
         "checksum": checksum, "weightFormat": fmt, "hasEngram": has_engram,
         "engramSparseCount": engram_sparse_count, "loss": data.get("loss"),
         "localSteps": data.get("localSteps"), "tokensProcessed": data.get("tokensProcessed"),
+        "optimizerSteps": data.get("optimizerSteps"), "accum": data.get("accum"),
         "loraRank": data.get("loraRank"), "isDelta": data.get("isDelta", True),
         "crossCheckUsed": data.get("crossCheckUsed", False),
         "actualSeed": data.get("actualSeed"), "actualSteps": data.get("actualSteps"),
@@ -4577,6 +4705,7 @@ async def chunk_state(secret: str = ""):
         "is_aggregating": round_state.get("is_aggregating", False),
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
+            "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"]},
         "matchmaking": {"poolSize": MATCHMAKING["POOL_SIZE"], "poolTimeoutS": MATCHMAKING["POOL_TIMEOUT_S"],
             "bf16SoloDissolveS": MATCHMAKING["BF16_SOLO_DISSOLVE_S"],
@@ -4764,6 +4893,58 @@ def _delta_metadata(path: str) -> Optional[dict]:
             return json.loads(f.read(n))
     except Exception: return None
 
+def _delta_opt_steps(md: Optional[dict]) -> Optional[int]:
+    """Optimizer steps a delta actually took, or None for a legacy client (field absent).
+
+    None is deliberately not 1: a legacy delta carries ~15 optimizer steps, and scaling it
+    by n_ref/1 would double its magnitude instead of leaving it alone.
+    """
+    if not md: return None
+    raw = md.get("optimizerSteps")
+    if raw is None: return None
+    try: n = int(raw)
+    except (TypeError, ValueError): return None
+    return n if n > 0 else None
+
+def _step_scale(n_ref: int, md: Optional[dict]) -> float:
+    """A3: target optimizer steps / delta optimizer steps, clamped to [0.5, 2.0].
+
+    The clamp keeps bad or hostile metadata from inverting or blowing up a delta; legacy
+    deltas (no `optimizerSteps`) are applied unscaled.
+    """
+    if n_ref <= 0: return 1.0
+    n = _delta_opt_steps(md)
+    if n is None: return 1.0
+    return min(2.0, max(0.5, float(n_ref) / float(n)))
+
+def _pool_delta_stats(survivors: list) -> dict:
+    """Token count and agreed optimizer-step count of one pool's survivors (A3 metadata)."""
+    tokens = 0; steps = []
+    for path, _w in survivors:
+        md = _delta_metadata(path) or {}
+        try: tokens += max(0, int(md.get("tokensProcessed") or md.get("tokens") or 0))
+        except (TypeError, ValueError): pass
+        n = _delta_opt_steps(md)
+        if n is not None: steps.append(n)
+    agreed = None
+    if steps:
+        agreed = max(set(steps), key=steps.count)
+        if len(set(steps)) > 1:
+            log.warning(f"⚠️ pool members disagree on optimizerSteps={sorted(set(steps))}; using {agreed}")
+    return {"tokens": tokens, "optimizerSteps": agreed}
+
+def _pool_token_count(pool_result: dict) -> int:
+    """Tokens a ready pool entry represents; 0 when the metadata is absent."""
+    try: t = int(pool_result.get("tokens") or 0)
+    except (TypeError, ValueError): t = 0
+    if t > 0: return t
+    total = 0
+    for path, _w in pool_result.get("deltas", []):
+        md = _delta_metadata(path) or {}
+        try: total += max(0, int(md.get("tokensProcessed") or md.get("tokens") or 0))
+        except (TypeError, ValueError): pass
+    return total
+
 def _find_user_uuid(user_id: str = "", username: str = "") -> Optional[str]:
     if user_id and user_id in users_db["users"]: return user_id
     if username:
@@ -4929,6 +5110,7 @@ async def get_stats(request: Request):
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"], "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
+            "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"],
             "banThreshold": CROSS_CHECK["BAN_THRESHOLD"]},
         "matchmaking": mm, "byzantineFlagCounts": dict(byzantine_flag_counts),
@@ -5042,6 +5224,7 @@ async def get_model_info():
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"], "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
+            "targetOptimizerSteps": CROSS_CHECK["TARGET_OPT_STEPS"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"]},
         "matchmaking": {"poolSize": MATCHMAKING["POOL_SIZE"], "poolTimeoutS": MATCHMAKING["POOL_TIMEOUT_S"],
             "formingTimeoutS": MATCHMAKING["FORMING_TIMEOUT_S"],

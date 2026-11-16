@@ -13,6 +13,26 @@ The client lives in the main repository. For the model and training setup, see [
 5. **Aggregation.** Surviving deltas from all pools are applied to the global model at the end of the round (4 h at most). Submissions outside a pool go through Krum instead.
 6. **Publish.** The new checkpoint is pushed to Hugging Face, where clients download it for the next round.
 
+### How the aggregate is applied
+
+A round must be a *descent step*, not a consensus of endpoints. Three rules produce that
+(see `approach-fix/PLAN.md` in the audit sidecar):
+
+- **Optimizer steps, not micro-steps.** `CROWDGPT_TARGET_OPT_STEPS` tells clients how many
+  optimizer steps a round may take (`2` ⇒ `accum = ceil(targetLocalSteps / 2)`), so a delta is
+  a short trajectory from the base weights. `0` keeps the legacy client-derived `accum`.
+- **Normalise by the steps a delta actually took.** Clients report `optimizerSteps` and
+  `accum` with the upload; the server scales each delta by
+  `clamp(targetOptimizerSteps / optimizerSteps, 0.5, 2)` before applying it, so a volunteer
+  whose hardware gave it fewer steps contributes the right *rate*. Deltas from clients that
+  do not report the count are applied unscaled — never as if they took one step.
+- **Weight pools by tokens, not by pool count.** `pool_w` is each pool's token share of the
+  round (equal weights when the metadata is absent), and the same factor is applied to the
+  engram rows.
+
+`MAX_DELTA_APPLY_NORM` (default `12000`) is a tripwire: a delta above it is clipped and a
+warning is logged. It is not a routine nonlinearity.
+
 ## Requirements
 
 - Python 3 and a machine with enough disk for checkpoints and pending deltas. The server refuses new tasks below 10 GB free and new uploads below 2 GB.
@@ -57,7 +77,10 @@ All settings are environment variables. Defaults are the values used when the va
 | `CROWDGPT_TARGET_BATCH_SIZE` | `2` | Batch size given to pool members |
 | `CROWDGPT_TARGET_ACCUM_STEPS` | `32` | Gradient accumulation steps |
 | `CROWDGPT_TARGET_LOCAL_STEPS` | `500` | Micro-steps per task |
+| `CROWDGPT_TARGET_OPT_STEPS` | `0` | Optimizer steps per round; clients derive `accum = ceil(local_steps / this)`. `0` = legacy |
 | `CROWDGPT_TARGET_AUTOCAST` | `any` | Force a precision for pools (`bf16`, `fp32`, `any`) |
+| `CROWDGPT_INIT_MODE` | `ln_identity` | Fresh-run init: `ln_identity` = N(0,0.02) + LayerNorm 1/0 (`‖W‖ ≈ 581.7`), `flat` = N(0,0.02) for every parameter, LayerNorm included (`‖W‖ ≈ 512.9`, what v1 ran with) |
+| `CROWDGPT_MAX_DELTA_APPLY_NORM` | `12000` | Per-delta clip at aggregation time. A tripwire that logs a warning, not a normaliser |
 | `CROWDGPT_MAX_CHECKPOINTS` | `5` | Local checkpoints to keep |
 
 **Verification**
