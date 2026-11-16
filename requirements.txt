@@ -1,0 +1,15 @@
+# Runtime dependencies for server.py and the orchestrator package.
+# Install with: pip install -r requirements.txt
+#
+# torch is CUDA-enabled by default on Linux; a CPU-only host can install the
+# CPU wheel instead: pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+fastapi
+uvicorn
+requests
+numpy
+torch
+cryptography
+slowapi
+psutil
+huggingface_hub
+safetensors

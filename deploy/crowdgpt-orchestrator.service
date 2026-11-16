@@ -1,0 +1,28 @@
+[Unit]
+Description=CrowdGPT orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crowdgpt
+Group=crowdgpt
+WorkingDirectory=/opt/crowdgpt
+EnvironmentFile=/etc/crowdgpt/orchestrator.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/crowdgpt/.venv/bin/python /opt/crowdgpt/server.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# server.py writes checkpoints/, data/, pending_uploads/, work_tmp/, users.json
+# and server.log next to its own file, so the application directory must stay
+# writable. The orchestrator database and object store live in /var/lib/crowdgpt.
+ReadWritePaths=/opt/crowdgpt /var/lib/crowdgpt
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

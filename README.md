@@ -21,7 +21,7 @@ The client lives in the main repository. For the model and training setup, see [
 ## Running
 
 ```bash
-pip install fastapi uvicorn torch numpy requests slowapi huggingface_hub safetensors psutil
+pip install -r requirements.txt
 
 export CROWDGPT_ADMIN_SECRET="$(openssl rand -hex 32)"
 export HF_TOKEN="hf_..."        # without it, Hugging Face uploads are disabled
@@ -29,7 +29,16 @@ export HF_TOKEN="hf_..."        # without it, Hugging Face uploads are disabled
 python server.py                 # listens on 0.0.0.0:5006
 ```
 
-Logs go to stdout and to `server.log` (rotated at 50 MB, 5 files).
+Or run it in a container:
+
+```bash
+cp .env.example .env            # set CROWDGPT_ADMIN_SECRET and CROWDGPT_PUBLIC_URL
+docker compose up -d --build
+```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for systemd, persistence and reverse-proxy notes.
+
+Logs go to stdout and to `server.log` (rotated at 50 MB, 5 files). Under Docker, configure rotation on the JSON log driver.
 
 If the server sits behind a reverse proxy or tunnel, set `CROWDGPT_TRUSTED_PROXIES` to the proxy's address range. Otherwise every client appears to come from the proxy, which breaks per-IP limits and bans.
 
