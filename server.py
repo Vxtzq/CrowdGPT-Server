@@ -730,11 +730,37 @@ HARDEN = {
     "LOSS_CHECK_URL": os.getenv("CROWDGPT_LOSS_CHECK_URL", "").strip(),
     "LOSS_CHECK_TOKEN": os.getenv("CROWDGPT_LOSS_CHECK_TOKEN", "").strip(),
     "LOSS_TOLERANCE": _env_float("CROWDGPT_LOSS_TOLERANCE", 0.0),
-    "LOSS_FAIL_OPEN": os.getenv("CROWDGPT_LOSS_FAIL_OPEN", "1") == "1",
+    # An unreachable or unsigned evaluator must not silently accept the round:
+    # the ratchet is the only thing standing between a client and the weights.
+    "LOSS_FAIL_OPEN": os.getenv("CROWDGPT_LOSS_FAIL_OPEN", "0") == "1",
     "LOSS_TIMEOUT_S": _env_int("CROWDGPT_LOSS_TIMEOUT_S", 1800),
+    "LOSS_RECEIPT_REQUIRED": os.getenv("CROWDGPT_LOSS_RECEIPT_REQUIRED", "1") == "1",
+    "LOSS_RECEIPT_MAX_AGE_S": _env_int("CROWDGPT_LOSS_RECEIPT_MAX_AGE_S", 3600),
     "PUBLIC_URL": os.getenv("CROWDGPT_PUBLIC_URL", "https://server.crowdgpt.net").rstrip("/"),
 }
 if HARDEN["LOSS_CHECK_MODE"] not in ("off", "log", "enforce"): HARDEN["LOSS_CHECK_MODE"] = "off"
+
+def _parse_loss_evaluator_keys(raw: str) -> Dict[str, str]:
+    """Parse ``name:pubkeyhex`` (or bare ``pubkeyhex``) entries into a trust map.
+
+    Only 64-hex Ed25519 public keys are accepted; anything else is dropped with
+    no fallback, because a typo here must disable the evaluator rather than
+    widen what the coordinator trusts.
+    """
+    keys: Dict[str, str] = {}
+    for token in str(raw or "").replace(";", ",").replace("\n", ",").split(","):
+        token = token.strip()
+        if not token: continue
+        name, _, pub = token.partition(":") if ":" in token else ("", "", token)
+        pub = pub.strip().lower()
+        if len(pub) != 64 or any(c not in "0123456789abcdef" for c in pub): continue
+        keys[(name.strip().lower() or pub[:16])] = pub
+    return keys
+
+LOSS_EVALUATOR_KEYS = _parse_loss_evaluator_keys(os.getenv("CROWDGPT_LOSS_EVALUATOR_KEYS", ""))
+if HARDEN["LOSS_CHECK_MODE"] != "off" and not LOSS_EVALUATOR_KEYS:
+    log.warning("⚠️ CROWDGPT_LOSS_CHECK_MODE is set but CROWDGPT_LOSS_EVALUATOR_KEYS is empty: "
+                "every signed receipt will be rejected, so rounds will fail closed")
 ADMIN_SECRET = os.getenv("CROWDGPT_ADMIN_SECRET") or ADMIN_SECRET
 
 def _admin_ok(secret: str) -> bool:
@@ -2722,7 +2748,8 @@ def handle_checkpoints():
 LOSS_STATE_FILE = CHECKPOINT_DIR / "loss_ratchet.json"
 CANDIDATE_MODEL_FILE = CHECKPOINT_DIR / "candidate_model_bf16.bin"
 CANDIDATE_ENGRAM_FILE = CHECKPOINT_DIR / "candidate_engram_bf16.bin"
-loss_ratchet_state = {"lastAcceptedLoss": None, "lastAcceptedStep": None, "history": []}
+loss_ratchet_state = {"lastAcceptedLoss": None, "lastAcceptedStep": None,
+                      "history": [], "receipts": []}
 _candidate_token: Optional[str] = None
 
 def _load_loss_state():
@@ -2761,19 +2788,97 @@ def _clear_candidate():
     for p in (CANDIDATE_MODEL_FILE, CANDIDATE_ENGRAM_FILE):
         try: p.unlink(missing_ok=True)
         except Exception: pass
-def _query_evaluator(step: int, cand: dict) -> Optional[float]:
+def _loss_canonical(value) -> str:
+    """Byte-identical to ``orchestrator.records.canonical_json``.
+
+    Duplicated on purpose: the ratchet must verify receipts even on a
+    deployment that copied only ``server.py`` and has no orchestrator package.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def _verify_ed25519(payload, signature_hex: str, pubkey_hex: str) -> bool:
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(pubkey_hex)))
+        pub.verify(bytes.fromhex(str(signature_hex)), _loss_canonical(payload).encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+def _loss_receipt_problem(receipt, *, step: int, rnd: int, request_id: str, cand: dict,
+                          signature: str = "", pubkey: str = "") -> Optional[str]:
+    """Return a rejection reason for one evaluator receipt, or ``None`` if it is sound.
+
+    The receipt is the only thing that ties a number to a measurement: without
+    these checks the coordinator trusts whatever JSON the configured URL
+    returns, and ``previousAcceptedLoss`` let the caller talk the ratchet down.
+    """
+    if not isinstance(receipt, dict) or not receipt: return "receipt_missing"
+    pub = str(pubkey or "").strip().lower()
+    if pub not in LOSS_EVALUATOR_KEYS.values(): return "receipt_untrusted_key"
+    if not _verify_ed25519(receipt, signature, pub): return "receipt_signature_invalid"
+    try:
+        if int(receipt.get("step", -1)) != int(step): return "receipt_step_mismatch"
+        if int(receipt.get("round", -1)) != int(rnd): return "receipt_round_mismatch"
+    except (TypeError, ValueError):
+        return "receipt_binding_invalid"
+    if str(receipt.get("requestId") or "") != str(request_id): return "receipt_request_mismatch"
+    for field in ("modelSha256", "engramSha256"):
+        if str(receipt.get(field) or "") != str(cand.get(field) or ""):
+            return "receipt_candidate_mismatch"
+    raw_loss = receipt.get("loss")
+    if isinstance(raw_loss, bool) or not isinstance(raw_loss, (int, float)):
+        return "receipt_loss_invalid"
+    if not math.isfinite(float(raw_loss)): return "receipt_loss_invalid"
+    max_age = int(HARDEN["LOSS_RECEIPT_MAX_AGE_S"])
+    if max_age > 0:
+        try: issued = float(receipt.get("issuedAt"))
+        except (TypeError, ValueError): return "receipt_issued_at_invalid"
+        if abs(time.time() - issued) > max_age: return "receipt_stale"
+    digest = hashlib.sha256(_loss_canonical(receipt).encode("utf-8")).hexdigest()
+    if digest in (loss_ratchet_state.get("receipts") or []): return "receipt_replayed"
+    return None
+
+def _query_evaluator(step: int, cand: dict) -> tuple:
+    """Held-out loss of the staged candidate: ``(loss, problem)``.
+
+    ``problem`` is set when the reply is unusable or its receipt does not verify.
+    Both cases mean "no trustworthy measurement", and the caller decides what
+    that costs — but a bad receipt is never treated as a good number, even when
+    ``LOSS_FAIL_OPEN`` is on.
+    """
     if not HARDEN["LOSS_CHECK_URL"]:
-        log.warning("⚠️ LOSS_CHECK_MODE on but URL empty"); return None
+        log.warning("⚠️ LOSS_CHECK_MODE on but URL empty"); return None, "evaluator_unconfigured"
+    request_id = secrets.token_hex(16)
     headers = {"Content-Type": "application/json"}
     if HARDEN["LOSS_CHECK_TOKEN"]: headers["Authorization"] = f"Bearer {HARDEN['LOSS_CHECK_TOKEN']}"
+    # No previousAcceptedLoss: the evaluator measures, the coordinator compares.
     payload = {"step": step, "round": round_state["current_round"],
-               "previousAcceptedLoss": loss_ratchet_state.get("lastAcceptedLoss"), "candidate": cand}
+               "requestId": request_id, "candidate": cand}
     try:
         r = requests.post(HARDEN["LOSS_CHECK_URL"], json=payload, headers=headers, timeout=HARDEN["LOSS_TIMEOUT_S"])
         r.raise_for_status()
-        loss = float(r.json()["loss"])
-        return loss if math.isfinite(loss) else float("nan")
-    except Exception as e: log.error(f"❌ Evaluator failed: {e}"); return None
+        body = r.json()
+    except Exception as e:
+        log.error(f"❌ Evaluator failed: {e}"); return None, "evaluator_unavailable"
+    try: loss = float(body["loss"])
+    except (TypeError, ValueError, KeyError): return None, "evaluator_bad_response"
+    receipt = body.get("receipt")
+    if not HARDEN["LOSS_RECEIPT_REQUIRED"] and not receipt:
+        log.warning("⚠️ UNSIGNED evaluator reply accepted (CROWDGPT_LOSS_RECEIPT_REQUIRED=0)")
+        return (loss if math.isfinite(loss) else float("nan")), None
+    problem = _loss_receipt_problem(
+        receipt, step=step, rnd=round_state["current_round"], request_id=request_id, cand=cand,
+        signature=body.get("signature") or "", pubkey=body.get("pubkey") or "")
+    if problem:
+        log.error(f"🛑 Loss receipt rejected at step {step}: {problem}")
+        return None, problem
+    if abs(float(receipt.get("loss")) - loss) > 1e-9: return None, "receipt_loss_mismatch"
+    if not math.isfinite(loss): return None, "receipt_loss_invalid"
+    digest = hashlib.sha256(_loss_canonical(receipt).encode("utf-8")).hexdigest()
+    loss_ratchet_state.setdefault("receipts", []).append(digest)
+    loss_ratchet_state["receipts"] = loss_ratchet_state["receipts"][-200:]
+    return loss, None
 def _ensure_rollback_point():
     ok = (LATEST_CHECKPOINT_FILE.exists() and ENGRAM_CHECKPOINT_FILE.exists()
           and LATEST_CHECKPOINT_FILE.stat().st_size == MODEL_SIZE * 4
@@ -2784,13 +2889,19 @@ def _finish_with_loss_check(step_before: int) -> bool:
     global global_step
     mode = HARDEN["LOSS_CHECK_MODE"]; step = global_step
     verdict, reason, loss = "accept", "", None
+    problem = None
     try:
         cand = _stage_candidate()
-        loss = _query_evaluator(step, cand)
-    except Exception as e: log.error(f"❌ Staging failed: {e}"); loss = None
+        loss, problem = _query_evaluator(step, cand)
+    except Exception as e: log.error(f"❌ Staging failed: {e}"); loss, problem = None, "candidate_staging_failed"
     finally: _clear_candidate()
     last = loss_ratchet_state.get("lastAcceptedLoss")
-    if loss is None:
+    if problem:
+        # An unsigned, forged, stale, replayed or misfiled measurement is a
+        # rejection in every mode; LOSS_FAIL_OPEN only covers an evaluator that
+        # could not be reached at all.
+        verdict, reason = "reject", f"evaluator untrusted ({problem})"
+    elif loss is None:
         if HARDEN["LOSS_FAIL_OPEN"]: reason = "evaluator unavailable (fail-open)"
         else: verdict, reason = "reject", "evaluator unavailable (fail-closed)"
     elif not math.isfinite(loss): verdict, reason = "reject", "non-finite held-out loss"
@@ -4606,6 +4717,10 @@ async def admin_loss_ratchet(secret: str = "", mode: str = ""):
         log.warning(f"🔧 Loss ratchet mode → {mode}")
     return {"mode": HARDEN["LOSS_CHECK_MODE"], "failOpen": HARDEN["LOSS_FAIL_OPEN"],
             "tolerance": HARDEN["LOSS_TOLERANCE"], "evaluatorConfigured": bool(HARDEN["LOSS_CHECK_URL"]),
+            "receiptRequired": HARDEN["LOSS_RECEIPT_REQUIRED"],
+            "receiptMaxAgeS": HARDEN["LOSS_RECEIPT_MAX_AGE_S"],
+            "trustedEvaluatorKeys": sorted(LOSS_EVALUATOR_KEYS),
+            "receiptsSeen": len(loss_ratchet_state.get("receipts") or []),
             "lastAcceptedLoss": loss_ratchet_state.get("lastAcceptedLoss"),
             "lastAcceptedStep": loss_ratchet_state.get("lastAcceptedStep"),
             "recent": loss_ratchet_state["history"][-10:]}
