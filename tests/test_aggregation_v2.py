@@ -362,27 +362,6 @@ class AggregationV2Test(unittest.TestCase):
         self.assertEqual((opt_steps, accum), (2, 250))
 
     # ------------------------------------------------------------------ task payload
-    def test_task_payload_carries_target_optimizer_steps(self):
-        """`/fl/task` must tell the client how many optimizer steps the round has (A1)."""
-        saved_di = dict(server.dataset_info)
-        server.dataset_info["totalChunks"] = 10
-        try:
-            pool = {"pool_id": "p1", "clients": ["ck1"], "chunk_idx": 0, "task_id": "task-1",
-                    "target_seed": 5, "target_steps": 500, "target_autocast": "bf16",
-                    "target_optimizer": "adamw_fp32"}
-            server.CROSS_CHECK["TARGET_OPT_STEPS"] = 2
-            md = server._build_task_payload(pool, "ck1")
-            self.assertEqual(md["crossCheck"]["targetOptimizerSteps"], 2)
-            self.assertIn("optimizerSteps", md["crossCheck"]["instruction"])
-            self.assertEqual(md["crossCheck"]["targetLocalSteps"], 500)
-            server.CROSS_CHECK["TARGET_OPT_STEPS"] = 0
-            md = server._build_task_payload(pool, "ck1")
-            self.assertEqual(md["crossCheck"]["targetOptimizerSteps"], 0)
-            self.assertEqual(md["crossCheck"]["targetAccumSteps"], 32)
-        finally:
-            server.dataset_info.clear(); server.dataset_info.update(saved_di)
-
-    # ------------------------------------------------------------------ init (G0 / §4)
     def test_flat_layout_matches_the_client_parameter_order(self):
         """`flat_ln_slices` must agree with the packing layout clients iterate."""
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sidecar" / "Crowd-v1" / "packing"))
@@ -439,42 +418,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class StepBudgetTest(unittest.TestCase):
-    """A1 inversion: tokens per optimizer step is the knob; the step count is derived from the
-    round's micro-step budget (so a round keeps v1's per-step batch instead of 2 huge steps)."""
 
-    def test_accum_from_tokens(self):
-        self.assertEqual(server._ref_accum_steps({"TARGET_TOKENS_PER_STEP": 131072}), 32)
-        self.assertEqual(server._ref_accum_steps({"TARGET_TOKENS_PER_STEP": 0}), 0)
-        self.assertEqual(server._ref_accum_steps({"TARGET_TOKENS_PER_STEP": "junk"}), 0)
 
-    def test_steps_derived_from_round_budget(self):
-        cc = {"TARGET_TOKENS_PER_STEP": 131072, "TARGET_OPT_STEPS": 2}
-        self.assertEqual(server._ref_steps_for_round(500, cc), 16)   # 500 micro-steps / accum 32
-        self.assertEqual(server._ref_steps_for_round(125, cc), 4)    # short round -> fewer steps
-        # a dictated step count is ignored while tokens/step is authoritative
-        self.assertEqual(server._ref_steps_for_round(500, {"TARGET_TOKENS_PER_STEP": 0,
-                                                           "TARGET_OPT_STEPS": 2}), 2)
-        self.assertEqual(server._ref_steps_for_round(500, {"TARGET_TOKENS_PER_STEP": 0,
-                                                           "TARGET_OPT_STEPS": 0}), 0)
-        self.assertEqual(server._ref_steps_for_round(None, cc), 2)   # no budget -> step mode
+class RoundRefStepsTest(unittest.TestCase):
+    """A3's reference: the optimizer steps a round of N chunks contains, derived from mainline's
+    own accumulation target (TARGET_ACCUM_STEPS=32)."""
 
-    def test_accum_payload_is_zero_when_a_budget_is_live(self):
-        """The client must derive accum from the live budget (steps or tokens), never from a
-        stale fixed value that contradicts the round."""
+    def test_steps_follow_the_round_length(self):
+        self.assertEqual(server._round_ref_steps(500), 16)    # 8 GB card
+        self.assertEqual(server._round_ref_steps(250), 8)     # 4 GB card
+        self.assertEqual(server._round_ref_steps(2000), 63)   # 32 GB card
+        self.assertEqual(server._round_ref_steps(2500), 79)   # 80 GB card
+        self.assertEqual(server._round_ref_steps(0), 0)
+        self.assertEqual(server._round_ref_steps(None), 0)
+
+    def test_reference_honours_a_custom_accum(self):
         old = dict(server.CROSS_CHECK)
         try:
-            # token budget live -> derive from tokens
-            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 131072, "TARGET_OPT_STEPS": 0,
-                                       "TARGET_ACCUM_STEPS": 32})
-            self.assertEqual(server._target_accum_payload(), 0)
-            # step budget live -> derive from the step count
-            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 0, "TARGET_OPT_STEPS": 16,
-                                       "TARGET_ACCUM_STEPS": 32})
-            self.assertEqual(server._target_accum_payload(), 0)
-            # no budget at all -> the configured accum passes through (legacy)
-            server.CROSS_CHECK.update({"TARGET_TOKENS_PER_STEP": 0, "TARGET_OPT_STEPS": 0,
-                                       "TARGET_ACCUM_STEPS": 32})
-            self.assertEqual(server._target_accum_payload(), 32)
+            server.CROSS_CHECK["TARGET_ACCUM_STEPS"] = 16
+            self.assertEqual(server._round_ref_steps(500), 32)
         finally:
             server.CROSS_CHECK.clear(); server.CROSS_CHECK.update(old)

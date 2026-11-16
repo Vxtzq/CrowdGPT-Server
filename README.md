@@ -18,26 +18,18 @@ The client lives in the main repository. For the model and training setup, see [
 A round must be a *descent step*, not a consensus of endpoints. Three rules produce that
 (see `approach-fix/PLAN.md` in the audit sidecar):
 
-- **Pin tokens per optimizer step; let the round size decide the step count.** `CROWDGPT_TARGET_TOKENS_PER_STEP`
-  (default `131072` = 32 micro-batches of 2×2048) is v1's parameterisation: the inner batch is
-  fixed, so `accum` is 32 on every card and the optimizer-step count falls out of the round
-  (`500` micro-steps ⇒ 16 steps, `2000` ⇒ 63). Same batch, same step size, same trajectory as
-  v1 — but derived and reported instead of hardcoded, which is what lets A3 normalise a client
-  whose round ended up a different length. `CROWDGPT_TARGET_OPT_STEPS` remains as a step-mode
-  fallback (dictate the steps, derive `accum`).
-- **The round size is the training-efficiency lever — and it costs uploads.** With the step count
-  derived, shortening the round shrinks `accum` and buys more optimizer updates per token: 125
-  micro-steps (`accum=8`) measured −0.17 held-out BPB at equal tokens versus 500 micro-steps, and
-  reached the same loss in ~4× fewer tokens. That trade multiplies uploads/merges by 4, so the
-  default stays at v1's pacing (`ROUND_BASE_STEPS=500` × `VRAM/8`, capped at 2500); lower
-  `CROWDGPT_ROUND_BASE_STEPS` (e.g. `125`) and `CROWDGPT_ROUND_HW_MULT_MAX` (e.g. `1`) deliberately
-  if you'd rather spend bandwidth than tokens.
+- **Same batch as v1: `accum = 32`.** `CROWDGPT_TARGET_ACCUM_STEPS` is sent to clients and they
+  use it verbatim, so the inner batch is 32 micro-batches (131 072 tokens) on every card, exactly
+  as v1 did. Rounds are longer on bigger cards (`500 × VRAM/8` chunks, capped at 2500), so a
+  2000-chunk round simply contains 63 updates instead of 16. Measured alternative: pinning the
+  step count instead (e.g. 32 updates where the round allows 16) gave −0.038 BPB on an 8 GB card
+  but degrades once the round is long enough that the batch has to grow to reach the pin.
 - **Normalise a delta by the steps it took, against *its own pool's* round.** Clients report
   `optimizerSteps` and `accum`; the server scales each delta by `clamp(n_ref / steps, 0.5, 2.0)`
   with `n_ref = ceil(target_steps / accum)` for that pool (falling back to the count its survivors
-  agree on). One global nominal reference would rescale an entire healthy pool on a big card — a
-  2000 micro-step round runs 63 steps, and `clamp(16/63) = 0.5` would halve its delta every round.
-  Legacy deltas without `optimizerSteps` are applied unscaled.
+  agree on). One global reference would rescale an entire healthy pool on a big card — a 2000-chunk
+  round runs 63 steps, and `clamp(16/63) = 0.5` would halve its delta every round. Legacy deltas
+  without `optimizerSteps` are applied unscaled.
 
 `MAX_DELTA_APPLY_NORM` (default `12000`) is a tripwire: a delta above it is clipped and a
 warning is logged. It is not a routine nonlinearity.
@@ -85,11 +77,7 @@ All settings are environment variables. Defaults are the values used when the va
 | `CROWDGPT_TIER0` / `TIER1` / `TIER2` | `1` | Matching levels: backend + precision + optimizer / backend + precision / backend only |
 | `CROWDGPT_TARGET_BATCH_SIZE` | `2` | Batch size given to pool members |
 | `CROWDGPT_TARGET_ACCUM_STEPS` | `32` | Gradient accumulation steps; sent to clients as `0` whenever a step or token budget is live, so the client derives it |
-| `CROWDGPT_TARGET_LOCAL_STEPS` | `500` | Micro-steps per task (fallback; the live budget is `ROUND_BASE_STEPS` × hardware factor) |
-| `CROWDGPT_ROUND_BASE_STEPS` | `500` | Round budget before the hardware factor (v1's pacing) |
-| `CROWDGPT_ROUND_HW_MULT_MAX` | `5.0` | Upper clamp on that factor (`500×5 = 2500` = v1's cap). Set `1.0` to stop big cards getting longer rounds |
-| `CROWDGPT_TARGET_TOKENS_PER_STEP` | `131072` | Tokens per optimizer step (v1's batch); the step count is derived from the round budget |
-| `CROWDGPT_TARGET_OPT_STEPS` | `0` | Step-mode fallback: dictate the optimizer steps per round and derive `accum`. `0` = tokens/step decides |
+| `CROWDGPT_TARGET_LOCAL_STEPS` | `500` | Micro-steps per task (base for the `VRAM/8` hardware factor) |
 | `CROWDGPT_TARGET_AUTOCAST` | `any` | Force a precision for pools (`bf16`, `fp32`, `any`) |
 | `CROWDGPT_INIT_MODE` | `ln_identity` | Fresh-run init: `ln_identity` = N(0,0.02) + LayerNorm 1/0 (`‖W‖ ≈ 581.7`), `flat` = N(0,0.02) for every parameter, LayerNorm included (`‖W‖ ≈ 512.9`, what v1 ran with) |
 | `CROWDGPT_MAX_DELTA_APPLY_NORM` | `12000` | Per-delta clip at aggregation time. A tripwire that logs a warning, not a normaliser |

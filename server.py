@@ -688,9 +688,7 @@ def _restore_orchestrator_state() -> bool:
                         "targetSeed": pv.target_seed,
                         "targetLocalSteps": pv.target_steps or CROSS_CHECK["TARGET_LOCAL_STEPS"],
                         "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
-                        "targetOptimizerSteps": _ref_steps_for_round(pv.target_steps or CROSS_CHECK["TARGET_LOCAL_STEPS"]),
-                        "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
-                        "targetAccumSteps": _target_accum_payload(),
+                        "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
                         "targetAutocast": pv.target_autocast or CROSS_CHECK["TARGET_AUTOCAST"],
                         "targetOptimizer": pv.target_optimizer or CROSS_CHECK["TARGET_OPTIMIZER"],
                     }
@@ -797,20 +795,6 @@ CROSS_CHECK = {
     "TARGET_BATCH_SIZE": _env_int("CROWDGPT_TARGET_BATCH_SIZE", 2),
     "TARGET_ACCUM_STEPS": _env_int("CROWDGPT_TARGET_ACCUM_STEPS", 32),
     "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 500),
-    # Round budget handed to a pool: base × a hardware factor, exactly v1's pacing
-    # (500 × min(5.0, max(0.25, VRAM/8)) → 125…2500 micro-steps).  §13 shows the round size is
-    # the training-efficiency lever, but shortening it multiplies uploads, so it stays at v1's
-    # value by default; lower these (e.g. 125 / 1.0) to trade upload bandwidth for tokens-to-loss.
-    "ROUND_BASE_STEPS": _env_int("CROWDGPT_ROUND_BASE_STEPS", 500),
-    "ROUND_HW_MULT_MAX": _env_float("CROWDGPT_ROUND_HW_MULT_MAX", 5.0),
-    # A1 (descent-consistent aggregation): optimizer steps a pool must take per round, whatever
-    # its micro-step budget is.  0 = legacy: the client derives `accum` from bs*sl.
-    "TARGET_OPT_STEPS": _env_int("CROWDGPT_TARGET_OPT_STEPS", 0),
-    # Tokens per optimizer step is the authority for the inner batch size (v1's parameterisation).
-    # When set, the step count is *derived* from the round's micro-step budget instead of dictated,
-    # so a round keeps v1's per-step batch instead of grouping 500 micro-steps into 2 huge ones.
-    # 131072 = 32 micro-batches of 2x2048 = v1's value.
-    "TARGET_TOKENS_PER_STEP": _env_int("CROWDGPT_TARGET_TOKENS_PER_STEP", 131072),
     "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "any").strip().lower(),
     "TARGET_OPTIMIZER": os.getenv("CROWDGPT_TARGET_OPTIMIZER", "any").strip().lower(),
     # v2.0: threshold raised to 5.0 — cross-arch tolerated, same backend/prec/optim
@@ -832,12 +816,6 @@ if POOL_BF16 not in ("off", "arch", "strict", "on"): POOL_BF16 = "arch"
 if CROSS_CHECK["MAX_OVERFLOW"] < 0: CROSS_CHECK["MAX_OVERFLOW"] = 0
 if CROSS_CHECK["MAX_OVERFLOW"] > 2: CROSS_CHECK["MAX_OVERFLOW"] = 2
 if CROSS_CHECK["TARGET_BATCH_SIZE"] < 0: CROSS_CHECK["TARGET_BATCH_SIZE"] = 0
-if CROSS_CHECK["TARGET_OPT_STEPS"] < 0: CROSS_CHECK["TARGET_OPT_STEPS"] = 0
-if CROSS_CHECK["TARGET_TOKENS_PER_STEP"] < 0: CROSS_CHECK["TARGET_TOKENS_PER_STEP"] = 0
-if CROSS_CHECK["TARGET_TOKENS_PER_STEP"] > 0:
-    log.info(f"   → step budget: tokens/step={CROSS_CHECK['TARGET_TOKENS_PER_STEP']} — optimizer "
-             f"steps are derived per round (TARGET_OPT_STEPS={CROSS_CHECK['TARGET_OPT_STEPS'] or 'unset'} "
-             f"no longer sets accum)")
 if CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"] < 1.01: CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"] = 1.01
 if CROSS_CHECK["TARGET_AUTOCAST"] not in ("bf16", "fp32", "any"): CROSS_CHECK["TARGET_AUTOCAST"] = "bf16"
 if CROSS_CHECK["TARGET_OPTIMIZER"] not in ("adamw_fp32", "adamw8bit", "any"):
@@ -1676,12 +1654,12 @@ def _activate_pool(pool: dict):
     pool_id = pool["pool_id"]
     task_id = f"round_{round_state['current_round']}_{pool_id}"
     target_seed = _cohort_seed(pool_id)
-    BASE_STEPS = max(1, int(CROSS_CHECK["ROUND_BASE_STEPS"]))
+    BASE_STEPS = 500
     slowest_client = min(pool["clients"], key=lambda c: client_hardware.get(c, {}).get("vram_gb", 100.0))
     hw = client_hardware.get(slowest_client, {})
     vram_gb = hw.get("vram_gb", 8.0)
     client_bs = max(1, hw.get("bs", 1))
-    hw_multiplier = min(float(CROSS_CHECK["ROUND_HW_MULT_MAX"]), max(0.25, vram_gb / 8.0))
+    hw_multiplier = max(0.25, vram_gb / 8.0)
     scaled_steps = int(BASE_STEPS * hw_multiplier)
     target_steps = max(100, min(2500, scaled_steps))
     pool_autocast = _pool_target_autocast(pool)
@@ -1698,9 +1676,7 @@ def _activate_pool(pool: dict):
         "round": round_state["current_round"], "createdAt": int(time.time() * 1000),
         "poolClients": list(pool["clients"]), "targetSeed": target_seed,
         "targetLocalSteps": target_steps, "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
-        "targetOptimizerSteps": _ref_steps_for_round(target_steps),
-        "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
-        "targetAccumSteps": _target_accum_payload(),
+        "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
         "targetAutocast": pool_autocast,
         "targetOptimizer": pool_optimizer,
     }
@@ -2041,21 +2017,15 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
             "targetSeed": pool["target_seed"],
             "targetLocalSteps": pool.get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"],
-            "targetOptimizerSteps": _ref_steps_for_round(pool.get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"])),
-            "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
-            "targetAccumSteps": _target_accum_payload(),
+            "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
             "targetAutocast": pool.get("target_autocast") or CROSS_CHECK["TARGET_AUTOCAST"],
             "targetOptimizer": pool.get("target_optimizer") or CROSS_CHECK["TARGET_OPTIMIZER"],
             "harmonizeMode": "strict" if CROSS_CHECK["TARGET_BATCH_SIZE"] > 0 else "per_client_bs",
             "instruction": ("Train on the assigned shard with EXACTLY: "
                 "seed=targetSeed, micro_steps=targetLocalSteps, "
                 "batch_size=min(your_max_bs, targetBatchSize), autocast=targetAutocast. "
-                "Set the inner batch size from targetTokensPerStep when it is > 0 "
-                "(accum = round(targetTokensPerStep / (batch_size*seq_len))); otherwise use "
-                "targetAccumSteps when it is > 0; only if both are 0 fall back to "
-                "accum = ceil(targetLocalSteps / targetOptimizerSteps). The optimizer-step count "
-                "is then whatever the round budget allows — report the actual optimizerSteps and "
-                "accum in the submit body. "
+                "Use accum_steps=targetAccumSteps; report the actual optimizerSteps and accum in "
+                "the submit body. "
                 "If targetOptimizer is set (adamw_fp32/adamw8bit), use that optimizer. "
                 "Report actualOptimizer in submit body.")},
     }
@@ -2719,8 +2689,6 @@ def update_and_save_status(push_hf: bool = True):
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"], "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
-            "targetOptimizerSteps": _ref_steps_for_round(CROSS_CHECK["TARGET_LOCAL_STEPS"]),
-            "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"]},
         "matchmaking": mm_snapshot, "byzantineFlagCounts": dict(byzantine_flag_counts)}
     try:
@@ -3631,8 +3599,7 @@ def _log_cross_check_summary():
     if not CROSS_CHECK["ENABLED"]: log.info(f"🔍 Cross-check: DISABLED"); return
     log.info(f"🔍 Cross-check: ENABLED — pool={MATCHMAKING['POOL_SIZE']} (MANDATORY)")
     log.info(f"   → targetBatchSize={CROSS_CHECK['TARGET_BATCH_SIZE']} targetLocalSteps={CROSS_CHECK['TARGET_LOCAL_STEPS']}")
-    log.info(f"   → targetOptimizerSteps={_ref_steps_for_round(CROSS_CHECK.get('TARGET_LOCAL_STEPS')) or 'legacy (client-derived)'}"
-             f" (tokensPerStep={CROSS_CHECK['TARGET_TOKENS_PER_STEP'] or 'unset'})")
+    log.info(f"   → accum={CROSS_CHECK['TARGET_ACCUM_STEPS']} (mainline), derived steps={_round_ref_steps(CROSS_CHECK.get('TARGET_LOCAL_STEPS')) or 'legacy'}")
     log.info(f"   → targetOptimizer={CROSS_CHECK['TARGET_OPTIMIZER']}")
     log.info(f"   → distance threshold={CROSS_CHECK['DISTANCE_THRESHOLD_RATIO']}x (2% absolute floor)")
     log.info(f"   → ban at {CROSS_CHECK['BAN_THRESHOLD']} subnet strikes")
@@ -3783,7 +3750,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     wd = FL_CONFIG["WEIGHT_DECAY"]
     cap = FL_CONFIG["MAX_DELTA_APPLY_NORM"]
     mxn = FL_CONFIG["MAX_WEIGHT_NORM"]
-    n_ref = _ref_steps_for_round(CROSS_CHECK.get("TARGET_LOCAL_STEPS"))
+    n_ref = _round_ref_steps(CROSS_CHECK.get("TARGET_LOCAL_STEPS"))
     step_before = global_step
     n_pools = len(ready_pool_list)
     # A3: weight pools by the tokens their merged delta represents instead of 1/n_pools.
@@ -3830,7 +3797,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         # nominal value.
         _ptarget = pool_result.get("target_steps")
         if _ptarget:
-            pool_n_ref = _ref_steps_for_round(_ptarget) or n_ref
+            pool_n_ref = _round_ref_steps(_ptarget) or n_ref
         else:
             _pstats = _pool_delta_stats(pool_result.get("deltas", []))
             pool_n_ref = int(_pstats.get("optimizerSteps") or 0) or n_ref
@@ -4744,8 +4711,6 @@ async def chunk_state(secret: str = ""):
         "is_aggregating": round_state.get("is_aggregating", False),
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
-            "targetOptimizerSteps": _ref_steps_for_round(CROSS_CHECK["TARGET_LOCAL_STEPS"]),
-            "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"]},
         "matchmaking": {"poolSize": MATCHMAKING["POOL_SIZE"], "poolTimeoutS": MATCHMAKING["POOL_TIMEOUT_S"],
             "bf16SoloDissolveS": MATCHMAKING["BF16_SOLO_DISSOLVE_S"],
@@ -4935,40 +4900,17 @@ def _delta_metadata(path: str) -> Optional[dict]:
 
 REF_MICRO_BATCH_TOKENS = 4096     # bs=2 x sl=2048: the nominal client micro-batch
 
-def _target_accum_payload() -> int:
-    """Accum sent to clients.
+def _round_ref_steps(local_steps=None) -> int:
+    """Optimizer steps a round of `local_steps` chunks contains (A3's `n_ref`).
 
-    0 whenever a step budget or a token budget is in effect: the client then derives accum from
-    whichever budget is live (H=16 over a 125-micro-step round -> accum 8), instead of pinning a
-    stale fixed value that would contradict the round.
+    Derived from mainline's own accumulation target: `ceil(chunks / TARGET_ACCUM_STEPS)`,
+    i.e. 16 steps for a 500-chunk round and 63 for a 2000-chunk round.  0 when unknown.
     """
-    if _ref_accum_steps() > 0 or _ref_steps_for_round() > 0: return 0
-    return max(0, int(CROSS_CHECK.get("TARGET_ACCUM_STEPS") or 0))
-
-def _ref_accum_steps(cross_check: Optional[dict] = None) -> int:
-    """Micro-batches per optimizer step implied by the token budget (0 = not in token mode)."""
-    cc = CROSS_CHECK if cross_check is None else cross_check
-    try: tps = int(cc.get("TARGET_TOKENS_PER_STEP") or 0)
-    except (TypeError, ValueError): return 0
-    if tps <= 0: return 0
-    return max(1, int(round(tps / REF_MICRO_BATCH_TOKENS)))
-
-def _ref_steps_for_round(local_steps=None, cross_check: Optional[dict] = None) -> int:
-    """Optimizer steps a round should contain: A3's `n_ref`, and the target sent to clients.
-
-    Token mode fixes tokens per optimizer step and *derives* the step count from the round's
-    micro-step budget (500 micro-steps at 131072 tokens/step -> 16 steps, i.e. v1).  Step mode
-    keeps the configured count.  0 means legacy: no reference and no scaling.
-    """
-    cc = CROSS_CHECK if cross_check is None else cross_check
-    try: steps = max(0, int(cc.get("TARGET_OPT_STEPS") or 0))
-    except (TypeError, ValueError): steps = 0
-    accum = _ref_accum_steps(cc)
     try: local = int(local_steps or 0)
     except (TypeError, ValueError): local = 0
-    if accum > 0 and local > 0:
-        return max(1, int(math.ceil(local / accum)))
-    return steps
+    try: accum = max(1, int(CROSS_CHECK.get("TARGET_ACCUM_STEPS") or 32))
+    except (TypeError, ValueError): accum = 32
+    return max(1, int(math.ceil(local / accum))) if local > 0 else 0
 
 def _delta_opt_steps(md: Optional[dict]) -> Optional[int]:
     """Optimizer steps a delta actually took, or None for a legacy client (field absent).
@@ -5187,8 +5129,6 @@ async def get_stats(request: Request):
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"], "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
-            "targetOptimizerSteps": _ref_steps_for_round(CROSS_CHECK["TARGET_LOCAL_STEPS"]),
-            "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"],
             "banThreshold": CROSS_CHECK["BAN_THRESHOLD"]},
         "matchmaking": mm, "byzantineFlagCounts": dict(byzantine_flag_counts),
@@ -5302,8 +5242,6 @@ async def get_model_info():
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
             "maxOverflow": CROSS_CHECK["MAX_OVERFLOW"], "threshold": CROSS_CHECK["DISTANCE_THRESHOLD_RATIO"],
             "targetBatchSize": CROSS_CHECK["TARGET_BATCH_SIZE"], "targetLocalSteps": CROSS_CHECK["TARGET_LOCAL_STEPS"],
-            "targetOptimizerSteps": _ref_steps_for_round(CROSS_CHECK["TARGET_LOCAL_STEPS"]),
-            "targetTokensPerStep": CROSS_CHECK["TARGET_TOKENS_PER_STEP"],
             "targetOptimizer": CROSS_CHECK["TARGET_OPTIMIZER"]},
         "matchmaking": {"poolSize": MATCHMAKING["POOL_SIZE"], "poolTimeoutS": MATCHMAKING["POOL_TIMEOUT_S"],
             "formingTimeoutS": MATCHMAKING["FORMING_TIMEOUT_S"],
