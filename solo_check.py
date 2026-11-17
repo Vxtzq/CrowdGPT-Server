@@ -204,3 +204,63 @@ def select_by_objective(paths, *, open_delta, model_size, evaluate=None,
     total = sum(tokens)
     return ([getattr(d, "path", str(d)) for d, _ in kept], [t / total for t in tokens],
             [getattr(d, "path", str(d)) for d in rejected], unreadable, verdicts)
+
+
+def check_round_modules(declarations):
+    """Check the module declarations of one round against each other.
+
+    ``declarations`` is any iterable of mappings carrying what a client sends in its
+    submission metadata: ``submissionId``, ``soloModule``, ``soloModules`` and
+    ``soloSplit``. Returns ``{"problems": [...], "modules": {...}, "missing": [...],
+    "splits": [...]}``.
+
+    This is deliberately **advisory**. A delta is one flat vector with no per-tensor
+    offsets, so the server cannot prove which module a peer actually trained; what it
+    can prove is that the round's declarations are internally consistent — one shared
+    split, no module claimed twice, and a record of which modules nobody covered.
+    """
+    claimed = {}
+    splits = {}
+    problems = []
+    for declaration in declarations or ():
+        if not declaration:
+            continue
+        sid = str(declaration.get("submissionId") or declaration.get("submission_id") or "?")
+        module = declaration.get("soloModule")
+        if module is None:
+            continue
+        try:
+            module = int(module)
+            count = int(declaration.get("soloModules"))
+        except (TypeError, ValueError):
+            problems.append(f"{sid}: unreadable SOLO module declaration")
+            continue
+        if not 0 <= module < count:
+            problems.append(f"{sid}: module {module} is outside 0..{count - 1}")
+            continue
+        try:
+            split = tuple((int(lo), int(hi)) for lo, hi in (declaration.get("soloSplit") or []))
+        except (TypeError, ValueError):
+            problems.append(f"{sid}: unreadable SOLO split")
+            continue
+        if len(split) != count:
+            problems.append(f"{sid}: split has {len(split)} ranges but declares {count} modules")
+            continue
+        splits.setdefault(split, []).append(sid)
+        claimed.setdefault(module, []).append(sid)
+
+    if len(splits) > 1:
+        problems.append(
+            "peers disagree about the split: "
+            + "; ".join(f"{sorted(sids)} use {list(split)}" for split, sids in splits.items())
+        )
+    for module, sids in sorted(claimed.items()):
+        if len(sids) > 1:
+            problems.append(f"module {module} claimed by more than one peer: {', '.join(sorted(sids))}")
+    count = len(next(iter(splits))) if splits else 0
+    return {
+        "problems": problems,
+        "modules": {module: sorted(sids) for module, sids in sorted(claimed.items())},
+        "missing": [module for module in range(count) if module not in claimed],
+        "splits": [list(split) for split in splits],
+    }

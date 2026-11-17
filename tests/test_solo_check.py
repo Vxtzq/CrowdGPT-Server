@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from solo_check import (  # noqa: E402
+    check_round_modules,
     DEFAULT_FLOOR,
     SubmissionScopeError,
     accept_unmeasured,
@@ -210,3 +211,55 @@ def test_a_round_where_every_delta_regresses_keeps_nothing():
         evaluate=lambda p: 6.0, base_loss=5.0, margin=0.01)
     assert kept == [] and weights == []
     assert rejected == ["a", "b"] and unreadable == []
+
+
+# --- check_round_modules: one round's declarations must agree ----------------
+
+_SPLIT4 = [[0, 6], [6, 12], [12, 18], [18, 24]]
+
+
+def _decl(sid, module, split=_SPLIT4, count=4):
+    return {"submissionId": sid, "soloModule": module, "soloModules": count,
+            "soloSplit": split}
+
+
+def test_a_consistent_round_has_no_problems():
+    out = check_round_modules([_decl("a", 0), _decl("b", 1), _decl("c", 2), _decl("d", 3)])
+    assert out["problems"] == []
+    assert out["missing"] == []
+    assert out["modules"] == {0: ["a"], 1: ["b"], 2: ["c"], 3: ["d"]}
+
+
+def test_two_peers_on_the_same_module_is_a_problem():
+    out = check_round_modules([_decl("a", 1), _decl("b", 1)])
+    assert any("more than one peer" in p for p in out["problems"])
+    assert out["missing"] == [0, 2, 3]
+
+
+def test_peers_disagreeing_about_the_split_is_a_problem():
+    other = [[0, 12], [12, 24]]
+    out = check_round_modules([_decl("a", 0), _decl("b", 0, split=other, count=2)])
+    assert any("disagree about the split" in p for p in out["problems"])
+
+
+def test_a_round_missing_a_module_reports_it():
+    out = check_round_modules([_decl("a", 0), _decl("b", 1), _decl("c", 2)])
+    assert out["missing"] == [3]
+    assert out["problems"] == []
+
+
+def test_legacy_submissions_have_no_module_declarations():
+    out = check_round_modules([{"submissionId": "a"}, {"submissionId": "b"}])
+    assert out["problems"] == []
+    assert out["missing"] == []
+    assert out["modules"] == {}
+
+
+def test_an_out_of_range_module_is_a_problem():
+    out = check_round_modules([_decl("a", 9)])
+    assert any("outside 0..3" in p for p in out["problems"])
+
+
+def test_a_split_of_the_wrong_length_is_a_problem():
+    out = check_round_modules([_decl("a", 0, split=[[0, 12]], count=4)])
+    assert any("split has 1 ranges but declares 4 modules" in p for p in out["problems"])

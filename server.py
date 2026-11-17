@@ -130,8 +130,8 @@ def read_exact(file_obj, num_bytes):
     return bytes(data)
 
 from krum_stream import plan_round, stream_add_base_delta, read_engram_tail, open_delta, streaming_pairwise_sq_l2
-from solo_check import (DEFAULT_FLOOR, accept_unmeasured, select_by_objective,
-                        summarise, verdict_by_replay)
+from solo_check import (DEFAULT_FLOOR, accept_unmeasured, check_round_modules,
+                        select_by_objective, summarise, verdict_by_replay)
 from public_log import PUB   # public event log + loss history
 
 # ============ CONFIGURATION ============
@@ -2114,6 +2114,16 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
 
     paths = [p for _, p in client_paths]
 
+    decls = [_SOLO_DECL[k] for k, _ in client_paths if k in _SOLO_DECL]
+    if decls:
+        modules = check_round_modules(decls)
+        _LAST_OBJECTIVE_CHECK["modules"] = modules
+        if modules["problems"]:
+            log.warning("🧩 Pool %s: SOLO module declarations inconsistent — %s",
+                        pool_id, "; ".join(modules["problems"]))
+        if modules["missing"]:
+            log.info("🧩 Pool %s: modules nobody trained: %s", pool_id, modules["missing"])
+
     with _cross_check_lock:
         if not _mem_guard(0.8, f"pool {pool_id} cross-check"):
             log.error(f"❌ Pool {pool_id}: memory pressure — cross-check MANDATORY, DISCARDING all")
@@ -3283,6 +3293,14 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             cc_actual_steps = body.get("actualSteps")
             cc_actual_bs = body.get("actualBatchSize")
             cc_actual_opt = (body.get("actualOptimizer") or "").lower()
+            cc_solo_module = body.get("soloModule")
+            cc_solo_modules = body.get("soloModules")
+            cc_solo_split = body.get("soloSplit")
+            if cc_solo_module is not None:
+                _SOLO_DECL[client_key] = {"submissionId": client_key,
+                                          "soloModule": cc_solo_module,
+                                          "soloModules": cc_solo_modules,
+                                          "soloSplit": cc_solo_split}
             tgt_autocast = task_meta.get("targetAutocast")
             if tgt_autocast and tgt_autocast != "any" and cc_used:
                 hw = client_hardware.get(client_key) or {}
@@ -3372,6 +3390,8 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "shardId": shard_id_for_meta, "taskId": task_id, "crossCheckUsed": cc_used,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
                 "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
+                **({"soloModule": cc_solo_module, "soloModules": cc_solo_modules,
+                    "soloSplit": cc_solo_split} if cc_solo_module is not None else {}),
                 "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
             }
             if delta_norm > max_allowed:
@@ -3634,6 +3654,10 @@ def process_compressed_payload(compressed_path: str, client_ip: str, client_key:
 # ============ CROSS-CHECK COHORT ============
 _REPLAY = {"evaluate": None, "base_loss": None, "margin": None}
 _LAST_OBJECTIVE_CHECK = {}
+# SOLO module declarations per client, so a round can be checked as a whole
+# ("every module covered exactly once, one shared split"). Advisory only: a delta
+# is a single flat vector, so the server cannot prove which module a peer trained.
+_SOLO_DECL = {}
 
 
 def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None):
