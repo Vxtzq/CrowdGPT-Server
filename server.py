@@ -130,6 +130,8 @@ def read_exact(file_obj, num_bytes):
     return bytes(data)
 
 from krum_stream import plan_round, stream_add_base_delta, read_engram_tail, open_delta, streaming_pairwise_sq_l2
+from solo_check import (DEFAULT_FLOOR, accept_unmeasured, select_by_objective,
+                        summarise, verdict_by_replay)
 from public_log import PUB   # public event log + loss history
 
 # ============ CONFIGURATION ============
@@ -3630,7 +3632,70 @@ def process_compressed_payload(compressed_path: str, client_ip: str, client_key:
             except Exception: pass
 
 # ============ CROSS-CHECK COHORT ============
+_REPLAY = {"evaluate": None, "base_loss": None, "margin": None}
+_LAST_OBJECTIVE_CHECK = {}
+
+
+def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None):
+    """Register the held-out replay used to accept or reject a round's deltas.
+
+    ``evaluate(path)`` must apply that delta to the base weights and return the
+    held-out loss. Left unset, the objective gate accepts what it cannot measure
+    (``accept_unmeasured``) — a server that cannot replay must not reject, which
+    is what made the old distance gate invent false positives.
+    """
+    _REPLAY["evaluate"] = evaluate
+    _REPLAY["base_loss"] = base_loss
+    _REPLAY["margin"] = margin
+
+
+def objective_check_summary() -> dict:
+    """The last round's per-delta verdicts, advisory for the round record."""
+    return dict(_LAST_OBJECTIVE_CHECK)
+
+
+def _objective_cross_check_cohort(paths: List[str], model_size: int):
+    """Accept deltas unless they measurably raise held-out loss.
+
+    The decision lives in ``solo_check.select_by_objective`` so it can be tested
+    without importing this module (which binds a port). The old Krum gate judged
+    the *geometry* of stochastic deltas, which differs between honest clients
+    that trained on different shards or for different token counts; at n=2 it
+    discarded both of them on a 10% disagreement. Accepting on the objective
+    means the only way to be rejected is to be measured as harmful, and a server
+    with no replay evaluator accepts what it cannot measure.
+    """
+    global _LAST_OBJECTIVE_CHECK
+    if not paths:
+        _LAST_OBJECTIVE_CHECK = {}
+        return [], [], [], []
+    evaluate = _REPLAY["evaluate"]; base_loss = _REPLAY["base_loss"]
+    margin = _REPLAY["margin"] if _REPLAY["margin"] is not None else DEFAULT_FLOOR
+    kept, weights, rejected, unreadable, verdicts = select_by_objective(
+        paths, open_delta=open_delta, model_size=model_size,
+        evaluate=evaluate, base_loss=base_loss, margin=margin)
+    summary = summarise(verdicts); _LAST_OBJECTIVE_CHECK = summary
+    for p in unreadable:
+        log.error(f"Cannot open delta {p}")
+    if rejected:
+        log.warning(f"⚠️ Cross-check: {len(rejected)} delta(s) rejected on a measured "
+                    f"held-out regression (max {summary['max_regression']}, margin {margin})")
+    if kept:
+        log.info(f"✅ Cross-check: {summary['accepted']}/{summary['submissions']} accepted by replay"
+                 + (" (no evaluator wired: accepted unmeasured, no rejection possible)"
+                    if evaluate is None else f", margin {margin}"))
+    return kept, weights, rejected, unreadable
+
+
 def _cross_check_cohort(paths: List[str], model_size: int):
+    """Dispatch: objective acceptance (default) or the legacy geometry gate."""
+    mode = (os.environ.get("CROWDGPT_CROSS_CHECK", "objective") or "objective").strip().lower()
+    if mode != "legacy":
+        return _objective_cross_check_cohort(paths, model_size)
+    return _legacy_cross_check_cohort(paths, model_size)
+
+
+def _legacy_cross_check_cohort(paths: List[str], model_size: int):
     n = len(paths)
     if n == 0: return [], [], [], []
     if n == 1: return paths, [1.0], [], []
