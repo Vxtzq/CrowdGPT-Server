@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from solo_check import (  # noqa: E402
     check_round_modules,
+    check_round_paradigms,
     DEFAULT_FLOOR,
     SubmissionScopeError,
     accept_unmeasured,
@@ -263,3 +264,51 @@ def test_an_out_of_range_module_is_a_problem():
 def test_a_split_of_the_wrong_length_is_a_problem():
     out = check_round_modules([_decl("a", 0, split=[[0, 12]], count=4)])
     assert any("split has 1 ranges but declares 4 modules" in p for p in out["problems"])
+
+
+# --- check_round_paradigms: one training rule per pool -------------------------
+
+
+def _pdecl(sid, paradigm="backprop", inner=0):
+    return {"submissionId": sid, "paradigm": paradigm, "dilocoInner": inner}
+
+
+def test_a_uniform_round_of_backprop_peers_has_no_problems():
+    result = check_round_paradigms([_pdecl("a"), _pdecl("b"), _pdecl("c")])
+    assert result["problems"] == []
+    assert result["paradigms"] == {"backprop": ["a", "b", "c"]}
+    assert result["innerSteps"] == {0: ["a", "b", "c"]}
+
+
+def test_a_uniform_round_of_mosaic_peers_with_the_same_inner_steps_is_fine():
+    result = check_round_paradigms([_pdecl("a", "mosaic", 25), _pdecl("b", "mosaic", 25)])
+    assert result["problems"] == []
+    assert result["paradigms"] == {"mosaic": ["a", "b"]}
+
+
+def test_mixed_paradigms_in_one_round_are_reported():
+    result = check_round_paradigms([_pdecl("a"), _pdecl("b", "relora")])
+    assert len(result["problems"]) == 1
+    assert "training paradigm" in result["problems"][0]
+    assert "relora" in result["problems"][0]
+
+
+def test_mixed_diloco_inner_steps_are_reported_separately():
+    result = check_round_paradigms([_pdecl("a", "solo", 1), _pdecl("b", "solo", 500)])
+    assert len(result["problems"]) == 1
+    assert "inner steps" in result["problems"][0]
+
+
+def test_a_missing_paradigm_field_reads_as_backprop():
+    result = check_round_paradigms([{"submissionId": "a"}])
+    assert result["problems"] == []
+    assert result["paradigms"] == {"backprop": ["a"]}
+
+
+def test_an_unreadable_diloco_inner_step_is_reported():
+    result = check_round_paradigms([{"submissionId": "a", "dilocoInner": "many"}])
+    assert any("unreadable dilocoInner" in p for p in result["problems"])
+
+
+def test_empty_declarations_are_ignored():
+    assert check_round_paradigms([None, {}])["problems"] == []

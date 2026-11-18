@@ -264,3 +264,48 @@ def check_round_modules(declarations):
         "missing": [module for module in range(count) if module not in claimed],
         "splits": [list(split) for split in splits],
     }
+
+
+def check_round_paradigms(declarations):
+    """Check that a round's submissions agree about how they were trained.
+
+    ``declarations`` is any iterable of mappings carrying ``submissionId``,
+    ``paradigm`` and ``dilocoInner`` (what a v2 client puts in ``submit_extra``).
+    Returns ``{"problems": [...], "paradigms": {...}, "innerSteps": {...}}``.
+
+    Mixing training rules inside one pool is not a security question, it is a
+    correctness one: the pool averages uploads, and a ReLoRA adapter delta, a
+    MOSAIC slice delta and a whole-model backprop delta do not mean the same
+    thing. DiLoCo inner steps matter for the same reason — a peer that took 500
+    local steps contributed a different-sized step than one that took 1.
+
+    Advisory only, and deliberately so: a delta arrives as one flat vector with
+    no per-tensor offsets, so the server cannot prove which paradigm produced
+    it. What it can prove is that the round's declarations are consistent.
+    """
+    problems = []
+    paradigms = {}
+    inner = {}
+    for decl in declarations:
+        if not decl:
+            continue
+        sid = decl.get("submissionId") or decl.get("submission_id") or "?"
+        name = str(decl.get("paradigm") or "backprop").strip().lower()
+        if not name:
+            name = "backprop"
+        paradigms.setdefault(name, []).append(sid)
+        try:
+            steps = int(decl.get("dilocoInner") or 0)
+        except (TypeError, ValueError):
+            problems.append(f"{sid}: unreadable dilocoInner declaration")
+            continue
+        inner.setdefault(steps, []).append(sid)
+    if len(paradigms) > 1:
+        parts = "; ".join(f"{n}: {', '.join(sorted(set(v)))}" for n, v in sorted(paradigms.items()))
+        problems.append(f"peers disagree about the training paradigm: {parts}")
+    if len(inner) > 1:
+        parts = "; ".join(f"inner={n}: {', '.join(sorted(set(v)))}" for n, v in sorted(inner.items()))
+        problems.append(f"peers disagree about DiLoCo inner steps: {parts}")
+    return {"problems": problems,
+            "paradigms": {n: sorted(set(v)) for n, v in paradigms.items()},
+            "innerSteps": {n: sorted(set(v)) for n, v in inner.items()}}

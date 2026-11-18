@@ -131,7 +131,8 @@ def read_exact(file_obj, num_bytes):
 
 from krum_stream import plan_round, stream_add_base_delta, read_engram_tail, open_delta, streaming_pairwise_sq_l2
 from solo_check import (DEFAULT_FLOOR, accept_unmeasured, check_round_modules,
-                        select_by_objective, summarise, verdict_by_replay)
+                        check_round_paradigms, select_by_objective, summarise,
+                        verdict_by_replay)
 from public_log import PUB   # public event log + loss history
 
 # ============ CONFIGURATION ============
@@ -2124,6 +2125,17 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
         if modules["missing"]:
             log.info("🧩 Pool %s: modules nobody trained: %s", pool_id, modules["missing"])
 
+    pdecls = [_PARADIGM_DECL[k] for k, _ in client_paths if k in _PARADIGM_DECL]
+    if pdecls:
+        paradigms = check_round_paradigms(pdecls)
+        _LAST_OBJECTIVE_CHECK["paradigms"] = paradigms
+        if paradigms["problems"]:
+            log.warning("🧠 Pool %s: training declarations inconsistent — %s",
+                        pool_id, "; ".join(paradigms["problems"]))
+        elif len(paradigms["paradigms"]) == 1:
+            name = next(iter(paradigms["paradigms"]))
+            log.info("🧠 Pool %s: %d peer(s) on paradigm %s", pool_id, len(pdecls), name)
+
     with _cross_check_lock:
         if not _mem_guard(0.8, f"pool {pool_id} cross-check"):
             log.error(f"❌ Pool {pool_id}: memory pressure — cross-check MANDATORY, DISCARDING all")
@@ -3296,6 +3308,20 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             cc_solo_module = body.get("soloModule")
             cc_solo_modules = body.get("soloModules")
             cc_solo_split = body.get("soloSplit")
+            # Which training rule produced this delta, and how many local steps
+            # it took between synchronisations. Both are advisory: a delta is one
+            # flat vector, so the server cannot prove them, only check the round
+            # agrees (see solo_check.check_round_paradigms).
+            cc_paradigm = (body.get("paradigm") or "backprop")
+            try: cc_diloco_inner = int(body.get("dilocoInner") or 0)
+            except (TypeError, ValueError): cc_diloco_inner = 0
+            _PARADIGM_DECL[client_key] = {"submissionId": client_key,
+                                         "paradigm": cc_paradigm,
+                                         "dilocoInner": cc_diloco_inner}
+            if str(cc_paradigm).strip().lower() != "backprop":
+                log.info("🧠 %s: submitted a %s update (inner=%d); the merge path is "
+                         "still the whole-model layout, so this is recorded not verified",
+                         client_key, cc_paradigm, cc_diloco_inner)
             if cc_solo_module is not None:
                 _SOLO_DECL[client_key] = {"submissionId": client_key,
                                           "soloModule": cc_solo_module,
@@ -3392,6 +3418,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
                 **({"soloModule": cc_solo_module, "soloModules": cc_solo_modules,
                     "soloSplit": cc_solo_split} if cc_solo_module is not None else {}),
+                "paradigm": cc_paradigm, "dilocoInner": cc_diloco_inner,
                 "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
             }
             if delta_norm > max_allowed:
@@ -3658,6 +3685,10 @@ _LAST_OBJECTIVE_CHECK = {}
 # ("every module covered exactly once, one shared split"). Advisory only: a delta
 # is a single flat vector, so the server cannot prove which module a peer trained.
 _SOLO_DECL = {}
+# Advisory per-client record of the training rule and DiLoCo inner steps declared
+# in submit_extra; a delta is one flat vector, so the server can only check that
+# the round agrees (solo_check.check_round_paradigms), not verify the claim.
+_PARADIGM_DECL = {}
 
 
 def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None):
@@ -4391,6 +4422,8 @@ async def submit_init(request: Request):
         "actualSeed": data.get("actualSeed"), "actualSteps": data.get("actualSteps"),
         "actualBatchSize": data.get("actualBatchSize"),
         "actualOptimizer": data.get("actualOptimizer"),
+        "paradigm": data.get("paradigm") or "backprop",
+        "dilocoInner": data.get("dilocoInner") or 0,
         "ticketId": data.get("ticketId"),
         "checksum": checksum,
         "receipt": data.get("receipt"),
