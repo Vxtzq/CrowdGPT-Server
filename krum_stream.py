@@ -63,6 +63,18 @@ def stream_add_base_delta(weights, df, scale):
     v = _read_base(df)
     weights[: df.model_size] += v * scale
 
+def stream_add_base_delta_pair(weights, w_scale, extra, e_scale, df):
+    """One read of the delta, two scaled accumulations.
+
+    The aggregator needs the delta twice once outer momentum is on: folded into
+    the weights at the merged scale, and folded into the carried gradient buffer
+    at the (unscaled) effective weight. Reading the file twice would double the
+    round's I/O for a 1.3 GB delta, so both adds share one decode.
+    """
+    v = _read_base(df)
+    weights[: df.model_size] += v * w_scale
+    extra[: df.model_size] += v * e_scale
+
 def read_engram_tail(df, dim):
     with open(df.path, "rb") as f:
         f.seek(df.base_offset + df.model_size * 2)
