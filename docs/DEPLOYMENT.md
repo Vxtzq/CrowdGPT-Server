@@ -102,6 +102,65 @@ back to them. The orchestrator needs one inbound HTTPS endpoint — a public IP
 behind a reverse proxy, a tunnel, or a private mesh. TLS is not built in;
 terminate it at Caddy/Nginx.
 
+## Loss ratchet (`LOSS_CHECK_MODE`)
+
+With `CROWDGPT_LOSS_CHECK_MODE=enforce`, every completed round is scored by an
+external evaluator before the weights move, and a round that loses to the
+evaluator's tolerance is rolled back. That evaluator is the only measurement in
+the system the coordinator did not compute itself, so its reply is now signed.
+
+The coordinator `POST`s this to `CROWDGPT_LOSS_CHECK_URL`:
+
+```json
+{"step": 500, "round": 7, "requestId": "<32 hex>",
+ "candidate": {"modelUrl": "…", "engramUrl": "…", "modelSha256": "…", "engramSha256": "…"}}
+```
+
+Note what is *not* in it: the coordinator no longer tells the evaluator the last
+accepted loss. The evaluator measures; the coordinator compares.
+
+The evaluator must reply with a receipt that vouches for its own number:
+
+```json
+{"loss": 4.2517,
+ "pubkey": "<64 hex Ed25519 public key>",
+ "signature": "<hex signature over canonical_json(receipt)>",
+ "receipt": {"step": 500, "round": 7, "requestId": "<the same 32 hex>",
+             "modelSha256": "…", "engramSha256": "…", "loss": 4.2517,
+             "issuedAt": 1763412345.6, "evaluator": "primary"}}
+```
+
+`canonical_json` is sorted-key, compact, UTF-8 JSON (`sort_keys=True,
+separators=(",", ":")`), the same encoding `orchestrator.records` uses.
+
+The reply is rejected — and, in `enforce` mode, the round is rolled back — when:
+
+- the signing key is not in `CROWDGPT_LOSS_EVALUATOR_KEYS`,
+- the signature does not verify,
+- `step`, `round` or `requestId` does not match the request,
+- `modelSha256`/`engramSha256` do not match the candidate the coordinator staged
+  (so a receipt cannot be reused for different weights),
+- the signed `loss` differs from the top-level `loss`,
+- `issuedAt` is older than `CROWDGPT_LOSS_RECEIPT_MAX_AGE_S`,
+- the receipt digest has been seen before (replay).
+
+Environment:
+
+| variable | default | meaning |
+|---|---|---|
+| `CROWDGPT_LOSS_EVALUATOR_KEYS` | *(empty)* | `name:pubkeyhex` pairs, comma or semicolon separated. Empty means every receipt is rejected. |
+| `CROWDGPT_LOSS_RECEIPT_REQUIRED` | `1` | `0` restores the pre-receipt behaviour of trusting an unsigned `{"loss": …}` reply, for a migration window only. |
+| `CROWDGPT_LOSS_RECEIPT_MAX_AGE_S` | `3600` | Maximum clock skew, in seconds. `0` disables the check. |
+| `CROWDGPT_LOSS_FAIL_OPEN` | `0` | `1` accepts a round when the evaluator cannot be reached at all. A bad receipt is a rejection in every mode. |
+| `CROWDGPT_LOSS_TOLERANCE` | `0.0` | Allowed loss increase between accepted rounds, in nats. |
+| `CROWDGPT_LOSS_TIMEOUT_S` | `1800` | Evaluator call timeout. |
+
+**Migration.** A deployment that already runs a loss-check service must either
+teach it to sign (`CROWDGPT_LOSS_EVALUATOR_KEYS` plus the receipt above) or set
+`CROWDGPT_LOSS_RECEIPT_REQUIRED=0` while it does. Leaving the default in place
+against an unsigned evaluator fails closed: rounds complete training and then
+roll back, with `evaluator untrusted (receipt_missing)` in the round history.
+
 ## Backup
 
 With the service stopped, copy the state paths listed above:

@@ -131,7 +131,12 @@ rejection, and a tampered object rejected at finalize.
 `_publish_round_record()` now attaches an evaluation instead of `eval=None`:
 
 - a configured loss-check result (`LOSS_CHECK_MODE` not `off`) becomes
-  `{mode, loss, source: "loss_check"}`;
+  `{mode, loss, source: "loss_check"}`, and the loss is only used when the
+  evaluator's signed receipt verifies (see `docs/DEPLOYMENT.md`, "Loss ratchet"):
+  the receipt binds the number to the step, the round, the request nonce and the
+  staged candidate's `modelSha256`/`engramSha256`, is single-use, and is
+  rejected when stale. An unsigned, forged, replayed or misfiled receipt is a
+  rejection regardless of `CROWDGPT_LOSS_FAIL_OPEN`;
 - otherwise `CROWDGPT_EVAL_URL` is called at `POST /eval` and its
   `{loss, ciLow, ciHigh, windows, manifestSha256, modelSha256}` is stored;
 - with neither configured, `eval` stays `null` and `nutrition.json` says
