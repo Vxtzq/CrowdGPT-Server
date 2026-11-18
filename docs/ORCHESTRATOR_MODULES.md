@@ -177,3 +177,43 @@ bytes/param) on a synthetic 4M-value fixture, projecting ~83.2 MB for
 657,787,392 base parameters; a captured production delta is still unmeasured.
 Malformed, truncated, oversized, or trailing frame data is rejected with a
 `400` reason.
+
+### Residual (two-plane) variant — `ngd1r` / `NGD3`
+
+One sign bit per value cannot express *magnitude* error: every value decodes to
+`±scale`, so the residual of a block is `|x| - scale`, not zero-mean noise. The
+`ngd1r` codec keeps that error instead of discarding it, by adding a second
+sign plane over the leftover:
+
+```
+x1 = s1 * sign(b1)          s1 = mean|x|,                  b1 = (x >= 0)
+r  = x - x1
+x2 = s2 * sign(b2)          s2 = mean|r|,                  b2 = (r >= 0)
+x_hat = x1 + x2                                        (2 bits per value)
+```
+
+Frame and container layouts are the `ngd1` ones with one extra plane:
+
+| | `ngd1` | `ngd1r` |
+|---|---|---|
+| frame magic | `NGD1` | `NGD1R` |
+| frame body | `s1 + b1` | `s1 + s2 + b2 + b1` |
+| container magic | `NGD2` | `NGD3` |
+| `deltaCodec` | `ngd1` | `ngd1r` |
+
+`decompress_delta` sniffs the frame magic, so one server decodes both, and
+`pack_frames(..., residual=True)` writes `NGD3`. `iter_frames(...,
+expect_residual=...)` rejects a container whose magic contradicts the
+`deltaCodec` the upload declared, so a client cannot silently downgrade.
+
+This is a **variance reduction, not an error bound**: an element whose true
+residual is smaller than `s2` overshoots, so individual errors can grow even
+though the mean absolute error falls. Measured on a 5,120-value fixture with
+`sigma = 0.01`: mean absolute error `0.0048 -> 0.0026` (~1.8x better) for
+~1.96x the bytes. The size win over dense bf16 is still roughly 16x.
+
+The final block of every frame is zero-padded to 1024 values, and zero padding
+reconstructs to `+/-s1` rather than to zero, so `compress_delta` zeroes the
+padding before deriving `s2`; without that the last block's residual scale is
+inflated by `1024 / real_length`. Scales that decode to `NaN`/`Inf` are
+rejected as `ValueError` instead of producing silently corrupt weights.
