@@ -216,6 +216,45 @@ def check_module_scope(names: Iterable[str], *, split: tuple[int, int],
     return problems
 
 
+# A round is only *verified* when the gate can replay the delta AND has enough
+# windows to estimate how much a loss may move for a legitimate reason. Below
+# this many windows the paired margin degenerates towards its floor (measured:
+# 1e-4 at one window, 2.1e-3 at four, 3.9e-3 at eight), so the verdict is a
+# constant dressed up as a measurement.
+MIN_PAIRED_WINDOWS = 4
+
+
+def gate_state(*, evaluate, base_windows=None, bf16_band: float = 0.0,
+               min_windows: int = MIN_PAIRED_WINDOWS) -> dict:
+    """Report what the objective gate can actually prove, in one dict.
+
+    A gate that accepts everything is indistinguishable from a gate that
+    accepts everything *honestly*: both produce "accepted" for every delta. The
+    only defence is to state the gate's own capability next to the verdicts, so
+    ``level == "unmeasured"`` is visible in the log and in the status endpoint
+    instead of being inferred from a server that never rejects anything.
+
+    ``level`` is ``"ok"`` (paired margin on enough windows), ``"degraded"``
+    (it can measure, but the margin is weak) or ``"unmeasured"`` (nothing can
+    be rejected).
+    """
+    windows = len(list(base_windows or ()))
+    state = {"measured": evaluate is not None, "paired": False, "windows": windows,
+             "bf16Band": float(bf16_band), "minWindows": int(min_windows)}
+    if evaluate is None:
+        return {**state, "level": "unmeasured", "warning":
+                "no replay evaluator registered: every delta is ACCEPTED without being measured"}
+    if windows == 0:
+        return {**state, "level": "degraded", "warning":
+                "replay returns a single loss: the margin is a fixed floor with no window noise "
+                f"(pass per-window losses and >= {int(min_windows)} base windows)"}
+    if windows < int(min_windows):
+        return {**state, "level": "degraded", "warning":
+                f"paired on {windows} window(s) < {int(min_windows)}: the margin can collapse to "
+                "its floor, so a small honest regression may pass unjudged"}
+    return {**state, "level": "ok", "paired": True, "warning": None}
+
+
 def summarise(verdicts: Sequence[Verdict]) -> dict:
     """Round-level counts for the log and the public status record."""
     accepted = [v for v in verdicts if v.accepted]
@@ -228,6 +267,7 @@ def summarise(verdicts: Sequence[Verdict]) -> dict:
         "max_regression": max((v.regression for v in rejected if v.regression is not None),
                               default=None),
         "margins": sorted({round(v.margin, 8) for v in verdicts if v.margin is not None}),
+        "unmeasured": sum(1 for v in verdicts if v.reason == "accepted_without_replay_evaluator"),
     }
 
 
@@ -374,7 +414,11 @@ def check_round_paradigms(declarations):
 
     Advisory only, and deliberately so: a delta arrives as one flat vector with
     no per-tensor offsets, so the server cannot prove which paradigm produced
-    it. What it can prove is that the round's declarations are consistent.
+    it. What it can prove is that the round's declarations are consistent. The
+    return value carries ``verified: False`` and a reason so a caller cannot
+    mistake agreement for proof — closing that honestly needs a per-tensor
+    checksum plus a recomputation of one step from the declared rule, which is
+    TODO V2I-14, not a nonce.
     """
     problems = []
     paradigms = {}
@@ -401,4 +445,10 @@ def check_round_paradigms(declarations):
         problems.append(f"peers disagree about DiLoCo inner steps: {parts}")
     return {"problems": problems,
             "paradigms": {n: sorted(set(v)) for n, v in paradigms.items()},
-            "innerSteps": {n: sorted(set(v)) for n, v in inner.items()}}
+            "innerSteps": {n: sorted(set(v)) for n, v in inner.items()},
+            # Machine-readable: nothing here proves the training rule. A caller
+            # that gates money, reputation or a round's merge on this would be
+            # trusting a string a peer chose for itself.
+            "verified": False,
+            "verification": ("declarations agree; the wire is one flat vector, so the "
+                             "server cannot tell which rule produced it")}

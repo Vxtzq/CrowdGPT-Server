@@ -398,3 +398,26 @@ def test_select_by_objective_reports_a_replay_that_raises():
         evaluate=boom, base_windows=[5.0, 5.1])
     assert kept == [] and rejected == ["a"] and unreadable == []
     assert verdicts[0].reason == "replay_failed"
+
+
+# --- a declaration is not a proof ---------------------------------------------
+
+
+def test_paradigm_check_reports_itself_unverified():
+    """Agreement between peers must not read as proof of the training rule."""
+    out = check_round_paradigms([
+        {"submissionId": "a", "paradigm": "mosaic", "dilocoInner": 5},
+        {"submissionId": "b", "paradigm": "mosaic", "dilocoInner": 5},
+    ])
+    assert out["problems"] == []
+    assert out["verified"] is False
+    assert "flat vector" in out["verification"]
+
+
+def test_paradigm_check_still_flags_a_mixed_round():
+    out = check_round_paradigms([
+        {"submissionId": "a", "paradigm": "mosaic", "dilocoInner": 5},
+        {"submissionId": "b", "paradigm": "backprop", "dilocoInner": 5},
+    ])
+    assert out["problems"] and "disagree" in out["problems"][0]
+    assert out["verified"] is False

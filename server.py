@@ -129,10 +129,13 @@ def read_exact(file_obj, num_bytes):
         data.extend(chunk)
     return bytes(data)
 
-from krum_stream import plan_round, stream_add_base_delta, read_engram_tail, open_delta, streaming_pairwise_sq_l2
+from krum_stream import (plan_round, stream_add_base_delta, stream_add_base_delta_pair,
+                          read_engram_tail, open_delta, streaming_pairwise_sq_l2)
+from outer_step import nesterov_update as _outer_nesterov_update, resolve_momentum as _resolve_outer_momentum, \
+    streaming_scales as _outer_scales, buffer_bytes as _outer_buffer_bytes
 from solo_check import (DEFAULT_FLOOR, accept_unmeasured, check_round_modules,
-                        check_round_paradigms, select_by_objective, summarise,
-                        verdict_by_replay)
+                        check_round_paradigms, gate_state, select_by_objective,
+                        summarise, verdict_by_replay)
 from public_log import PUB   # public event log + loss history
 
 # ============ CONFIGURATION ============
@@ -2134,7 +2137,8 @@ def _run_pool_cross_check(pool: dict) -> Optional[list]:
                         pool_id, "; ".join(paradigms["problems"]))
         elif len(paradigms["paradigms"]) == 1:
             name = next(iter(paradigms["paradigms"]))
-            log.info("🧠 Pool %s: %d peer(s) on paradigm %s", pool_id, len(pdecls), name)
+            log.info("🧠 Pool %s: %d peer(s) declared paradigm %s "
+                     "(declaration, not verified: the wire is one flat vector)", pool_id, len(pdecls), name)
 
     with _cross_check_lock:
         if not _mem_guard(0.8, f"pool {pool_id} cross-check"):
@@ -3681,6 +3685,38 @@ def process_compressed_payload(compressed_path: str, client_ip: str, client_key:
 # ============ CROSS-CHECK COHORT ============
 _REPLAY = {"evaluate": None, "base_loss": None, "margin": None,
            "base_windows": None, "bf16_band": 0.0}
+# DiLoCo's carried gradient: momentum * (grad_t - grad_{t-1}) needs grad_{t-1},
+# and the server never materialises a mean, so it keeps sum(eff * delta) here.
+_OUTER = {"grad": None, "momentum": None, "rounds": 0}
+
+
+def outer_momentum() -> float:
+    """Configured outer momentum for the round, re-read each time.
+
+    ``CROWDGPT_OUTER_MOMENTUM`` defaults to 0.0 = off, which is what every
+    deployment before DiLoCo shipped with: plain weighted-mean SGD. Turning it on
+    multiplies each round's update by (1 + momentum) and adds the carried term,
+    so it must be an explicit choice.
+    """
+    return _resolve_outer_momentum(os.getenv("CROWDGPT_OUTER_MOMENTUM"))
+
+
+def _outer_grad_buffer():
+    """The carried gradient vector, allocated on first use and reused.
+
+    float32 to match ``global_weights``: a bf16 buffer would need a full-size
+    float32 temporary per accumulation, which costs more peak memory than it saves.
+    """
+    g = _OUTER.get("grad")
+    if g is None:
+        needed = _outer_buffer_bytes(MODEL_SIZE, 4)
+        if not _mem_guard(needed + 1.0, "outer momentum buffer"):
+            log.warning(f"⚠️ Outer momentum disabled this round: {needed:.2f} GB "
+                        f"buffer does not fit under the memory guard")
+            return None
+        g = torch.zeros(MODEL_SIZE, dtype=torch.float32)
+        _OUTER["grad"] = g
+    return g
 _LAST_OBJECTIVE_CHECK = {}
 # SOLO module declarations per client, so a round can be checked as a whole
 # ("every module covered exactly once, one shared split"). Advisory only: a delta
@@ -3688,8 +3724,46 @@ _LAST_OBJECTIVE_CHECK = {}
 _SOLO_DECL = {}
 # Advisory per-client record of the training rule and DiLoCo inner steps declared
 # in submit_extra; a delta is one flat vector, so the server can only check that
-# the round agrees (solo_check.check_round_paradigms), not verify the claim.
+# the round agrees (solo_check.check_round_paradigms), not verify the claim. That
+# function returns verified=False on purpose: a peer-chosen string is not proof,
+# and the round record carries the caveat so nobody reads agreement as assurance.
 _PARADIGM_DECL = {}
+
+
+def objective_gate_state() -> dict:
+    """What the objective gate can prove right now (see ``solo_check.gate_state``)."""
+    return gate_state(evaluate=_REPLAY.get("evaluate"),
+                      base_windows=_REPLAY.get("base_windows"),
+                      bf16_band=_REPLAY.get("bf16_band", 0.0))
+
+
+def _announce_gate() -> dict:
+    """Log the gate's capability loudly enough that it cannot be missed.
+
+    A gate with no evaluator accepts every delta, so a misconfigured production
+    server looks exactly like a healthy one from the outside — the round fills
+    with "accepted" and nobody learns that nothing was measured. This runs at
+    configuration time and again every round.
+    """
+    state = objective_gate_state()
+    level = state["level"]
+    if level == "unmeasured":
+        log.error("🚨 OBJECTIVE GATE UNMEASURED — no replay evaluator is registered, so "
+                  "every delta in every round is ACCEPTED without being measured. "
+                  "Call set_replay_evaluator(evaluate, base_windows=[...], bf16_band=...) "
+                  "before running a production round.")
+    elif level == "degraded":
+        log.warning(f"⚠️ OBJECTIVE GATE DEGRADED — {state['warning']}")
+    else:
+        log.info(f"✅ Objective gate: paired on {state['windows']} windows, "
+                 f"bf16 band {state['bf16Band']:.2e}")
+    try:
+        PUB.event("objective_gate", level=level, windows=state["windows"],
+                  measured=state["measured"], paired=state["paired"],
+                  bf16Band=state["bf16Band"])
+    except Exception:
+        pass
+    return state
 
 
 def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None,
@@ -3716,6 +3790,7 @@ def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None,
     _REPLAY["margin"] = margin
     _REPLAY["base_windows"] = list(base_windows) if base_windows else None
     _REPLAY["bf16_band"] = float(bf16_band)
+    _announce_gate()
 
 
 def objective_check_summary() -> dict:
@@ -3745,7 +3820,12 @@ def _objective_cross_check_cohort(paths: List[str], model_size: int):
         evaluate=evaluate, base_loss=base_loss, margin=margin,
         base_windows=_REPLAY.get("base_windows"),
         bf16_band=_REPLAY.get("bf16_band", 0.0))
-    summary = summarise(verdicts); _LAST_OBJECTIVE_CHECK = summary
+    summary = summarise(verdicts)
+    summary["gate"] = _announce_gate()
+    _LAST_OBJECTIVE_CHECK = summary
+    if summary["gate"]["level"] == "unmeasured" and summary["accepted"]:
+        log.error(f"🚨 {summary['accepted']} delta(s) ACCEPTED WITHOUT MEASUREMENT this round "
+                  f"(gate level '{summary['gate']['level']}'). Any peer can submit any delta.")
     for p in unreadable:
         log.error(f"Cannot open delta {p}")
     if rejected:
@@ -3898,7 +3978,17 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 try: os.remove(path)
                 except Exception: pass
         return
+    mom = outer_momentum()
+    grad_buf = _outer_grad_buffer() if mom > 0 else None
+    if mom > 0 and grad_buf is None:
+        mom = 0.0
+    oscale = _outer_scales(lr=lr, momentum=mom) if mom > 0 else None
     with shard_lock:
+        if grad_buf is not None:
+            # The carried term is added once per round, then the buffer becomes this
+            # round's gradient (accumulated delta by delta below).
+            global_weights.add_(grad_buf, alpha=oscale["carry"])
+            grad_buf.zero_()
         pre_norm_sq = 0.0; cs = 10_000_000
         for i in range(0, MODEL_SIZE, cs):
             chunk = global_weights[i:i + cs].float()
@@ -3978,7 +4068,13 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 step_scales.append(round(step_scale, 4))
                 eff = pw * weight * step_scale * scale
                 if weight > 0:
-                    with shard_lock: stream_add_base_delta(global_weights, df, lr * eff)
+                    with shard_lock:
+                        if grad_buf is None:
+                            stream_add_base_delta(global_weights, df, lr * eff)
+                        else:
+                            stream_add_base_delta_pair(global_weights,
+                                                       oscale["weight"] * eff,
+                                                       grad_buf, oscale["buffer"] * eff, df)
                     eng_idx, eng_val = read_engram_tail(df, MODEL_CONFIG["dim"])
                     if eng_idx is not None and len(eng_idx) > 0:
                         evf = eng_val.float()
@@ -4017,6 +4113,12 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 PUB.event("aggregation_reverted", step=step_before, norm_before=pre_norm, norm_after=norm, ratio=ratio)
                 log.error(f"🚨🚨 AGGREGATION SANITY FAIL: norm {pre_norm:.1f} → {norm:.1f} (ratio={ratio:.3f}). Reverting from disk, NOT advancing step.")
                 load_model_weights(); load_engram_weights()
+                if grad_buf is not None:
+                    # The round was discarded, so its gradient is not a real gradient:
+                    # carrying it would push the next round with momentum from an
+                    # update that never happened.
+                    grad_buf.zero_()
+                    log.warning("Outer momentum buffer reset after revert")
                 with stats_lock: global_step = step_before
                 for pool_result in ready_pool_list:
                     for path, _w in pool_result.get("deltas", []):
@@ -4043,10 +4145,12 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr,
               poolWeights=[round(x, 4) for x in pool_w], stepScales=sorted(set(step_scales)),
               poolNRefs=pool_n_refs,
-              stepScaled=step_scaled, legacySteps=legacy_steps, maxDeltaApplyNorm=cap)
+              stepScaled=step_scaled, legacySteps=legacy_steps, maxDeltaApplyNorm=cap,
+              outerMomentum=mom)
     log.info(f"✅ SGD step {global_step}: applied {total_applied}, rejected {rejected_count}, "
              f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}, "
-             f"step_scaled={step_scaled}, legacy_steps={legacy_steps}")
+             f"step_scaled={step_scaled}, legacy_steps={legacy_steps}"
+             + (f", outer_momentum={mom} (x{1.0 + mom:.2f} update)" if mom > 0 else ""))
     if HARDEN["LOSS_CHECK_MODE"] == "off": handle_checkpoints()
     gc.collect()
 
@@ -4228,7 +4332,8 @@ async def get_round_status(request: Request):
         "force_end_at": round_state.get("force_end_at"),
         "hfDirectDownloads": bool(_build_hf_weights_metadata("bf16")),
         "cohortSize": MATCHMAKING["POOL_SIZE"], "maxCohortSize": MATCHMAKING["POOL_SIZE"],
-        "matchmaking": mm, "controlPlane": dict(CONTROL_PLANE)}
+        "matchmaking": mm, "controlPlane": dict(CONTROL_PLANE),
+        "objectiveGate": objective_gate_state()}
 
 @app.get("/fl/task")
 async def get_task(request: Request, format: str = "bf16", skip_weights: bool = False):

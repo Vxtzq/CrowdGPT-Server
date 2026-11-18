@@ -128,6 +128,88 @@ class AggregationV2Test(unittest.TestCase):
             entry["target_steps"] = target_steps
         return entry
 
+    # ------------------------------------------------------------------ outer momentum (DiLoCo)
+    def _last_event(self, name):
+        for ev, kw in reversed(self._events):
+            if ev == name:
+                return kw
+        return None
+
+    def test_outer_momentum_is_off_by_default(self):
+        """No CROWDGPT_OUTER_MOMENTUM means weighted-mean SGD, exactly as shipped."""
+        p = write_delta(self.delta_path("plain"), [0.1 * (i + 1) for i in range(MODEL_SIZE)])
+        server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        ev = self._last_event("aggregation")
+        self.assertEqual(ev["outerMomentum"], 0.0)
+        # 0.1*(1..8) = 3.6 in decimal; the wire is bf16, so compare loosely.
+        self.assertAlmostEqual(float(server.global_weights.sum()), 3.6, places=2)
+
+    def test_outer_momentum_carries_the_previous_gradient(self):
+        """DiLoCo's step: w_t = w_{t-1} + lr*S_t + lr*beta*(S_t - S_{t-1}).
+
+        S_t is the merged delta sum, recovered from a plain run of the same deltas so
+        the assertion is against the vector definition, not against the code under test.
+        """
+        vec1 = [0.1 * (i + 1) for i in range(MODEL_SIZE)]
+        vec2 = [0.05 * (i + 2) for i in range(MODEL_SIZE)]
+        lr_before = server.FL_CONFIG["SERVER_LR"]
+        server.FL_CONFIG["SERVER_LR"] = 0.01
+        saved_mom = os.environ.pop("CROWDGPT_OUTER_MOMENTUM", None)
+        try:
+            runs = {}
+            for label, mom in (("plain", None), ("mom", "0.9")):
+                if mom is None:
+                    os.environ.pop("CROWDGPT_OUTER_MOMENTUM", None)
+                else:
+                    os.environ["CROWDGPT_OUTER_MOMENTUM"] = mom
+                server._OUTER["grad"] = None
+                server.global_weights = torch.zeros(MODEL_SIZE, dtype=torch.float32)
+                server.global_step = 0
+                weights, lrs = [], []
+                for i, vec in enumerate((vec1, vec2), 1):
+                    path = write_delta(self.delta_path(f"{label}{i}"), vec)   # legacy: no opt steps
+                    server.apply_round_aggregation([self.pool(label, [(path, 1.0)])])
+                    weights.append(server.global_weights.clone())
+                    lrs.append(self._last_event("aggregation")["lr"])
+                runs[label] = (weights, lrs)
+        finally:
+            if saved_mom is None:
+                os.environ.pop("CROWDGPT_OUTER_MOMENTUM", None)
+            else:
+                os.environ["CROWDGPT_OUTER_MOMENTUM"] = saved_mom
+            server.FL_CONFIG["SERVER_LR"] = lr_before
+            server._OUTER["grad"] = None
+
+        (w_plain, lr_plain), (w_mom, lr_mom) = runs["plain"], runs["mom"]
+        s1 = (w_plain[0] - 0.0) / lr_plain[0]
+        s2 = (w_plain[1] - w_plain[0]) / lr_plain[1]
+        beta, lr = 0.9, lr_mom[1]
+        expected1 = lr_mom[0] * (1.0 + beta) * s1          # first round: no history
+        expected2 = w_mom[0] + lr * s2 + lr * beta * (s2 - s1)
+        self.assertTrue(torch.allclose(w_mom[0], expected1, atol=1e-6),
+                        (w_mom[0], expected1))
+        self.assertTrue(torch.allclose(w_mom[1], expected2, atol=1e-6),
+                        (w_mom[1], expected2))
+
+    def test_outer_momentum_buffer_survives_and_resets(self):
+        """The buffer is reused across rounds and cleared by a revert."""
+        saved_mom = os.environ.pop("CROWDGPT_OUTER_MOMENTUM", None)
+        try:
+            os.environ["CROWDGPT_OUTER_MOMENTUM"] = "0.9"
+            server._OUTER["grad"] = None
+            p = write_delta(self.delta_path("buf"), [0.1] * MODEL_SIZE)
+            server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+            g = server._OUTER["grad"]
+            self.assertIsNotNone(g)
+            self.assertEqual(tuple(g.shape), (MODEL_SIZE,))
+            self.assertGreater(float(g.abs().sum()), 0.0)
+        finally:
+            if saved_mom is None:
+                os.environ.pop("CROWDGPT_OUTER_MOMENTUM", None)
+            else:
+                os.environ["CROWDGPT_OUTER_MOMENTUM"] = saved_mom
+            server._OUTER["grad"] = None
+
     # ------------------------------------------------------------------ step scaling (A3.1)
     def test_step_scale_clamped_and_legacy_unscaled(self):
         n_ref = 2
