@@ -3679,7 +3679,8 @@ def process_compressed_payload(compressed_path: str, client_ip: str, client_key:
             except Exception: pass
 
 # ============ CROSS-CHECK COHORT ============
-_REPLAY = {"evaluate": None, "base_loss": None, "margin": None}
+_REPLAY = {"evaluate": None, "base_loss": None, "margin": None,
+           "base_windows": None, "bf16_band": 0.0}
 _LAST_OBJECTIVE_CHECK = {}
 # SOLO module declarations per client, so a round can be checked as a whole
 # ("every module covered exactly once, one shared split"). Advisory only: a delta
@@ -3691,17 +3692,30 @@ _SOLO_DECL = {}
 _PARADIGM_DECL = {}
 
 
-def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None):
+def set_replay_evaluator(evaluate=None, *, base_loss=None, margin=None,
+                         base_windows=None, bf16_band=0.0):
     """Register the held-out replay used to accept or reject a round's deltas.
 
-    ``evaluate(path)`` must apply that delta to the base weights and return the
-    held-out loss. Left unset, the objective gate accepts what it cannot measure
-    (``accept_unmeasured``) — a server that cannot replay must not reject, which
-    is what made the old distance gate invent false positives.
+    ``evaluate(path)`` applies that delta to the base weights and returns the
+    held-out loss; if it returns a **sequence of per-window losses** and
+    ``base_windows`` holds the same number of base-weight losses, the gate judges
+    with the paired rule (``solo_check.judge_paired``). That is the fix for the
+    false positives the author reported from v1: a fixed 1e-4 floor has no
+    notion of window noise (measured 3-sigma is exactly 1e-4 at one window,
+    2.1e-3 at four, 3.9e-3 at eight), so honest peers were rejected for
+    variation that is indistinguishable from a regression.
+
+    ``bf16_band`` is the measured cost of shipping the delta as bf16
+    (``solo_check.bf16_band_from_replay``); it widens the margin instead of
+    silently deciding the verdict. Left unset, the gate still accepts what it
+    cannot measure (``accept_unmeasured``) — a server that cannot replay must not
+    reject, which is what made the old distance gate invent false positives.
     """
     _REPLAY["evaluate"] = evaluate
     _REPLAY["base_loss"] = base_loss
     _REPLAY["margin"] = margin
+    _REPLAY["base_windows"] = list(base_windows) if base_windows else None
+    _REPLAY["bf16_band"] = float(bf16_band)
 
 
 def objective_check_summary() -> dict:
@@ -3728,7 +3742,9 @@ def _objective_cross_check_cohort(paths: List[str], model_size: int):
     margin = _REPLAY["margin"] if _REPLAY["margin"] is not None else DEFAULT_FLOOR
     kept, weights, rejected, unreadable, verdicts = select_by_objective(
         paths, open_delta=open_delta, model_size=model_size,
-        evaluate=evaluate, base_loss=base_loss, margin=margin)
+        evaluate=evaluate, base_loss=base_loss, margin=margin,
+        base_windows=_REPLAY.get("base_windows"),
+        bf16_band=_REPLAY.get("bf16_band", 0.0))
     summary = summarise(verdicts); _LAST_OBJECTIVE_CHECK = summary
     for p in unreadable:
         log.error(f"Cannot open delta {p}")

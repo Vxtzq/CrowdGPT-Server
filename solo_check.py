@@ -74,6 +74,70 @@ def estimate_margin(baseline_losses: Sequence[float], *, sigmas: float = DEFAULT
     return max(float(floor), float(sigmas) * stderr)
 
 
+def paired_margin(base_windows: Sequence[float], cand_windows: Sequence[float], *,
+                  sigmas: float = DEFAULT_SIGMAS, floor: float = DEFAULT_FLOOR,
+                  bf16_band: float = 0.0) -> tuple[float, float]:
+    """Margin for a *paired* comparison: same windows, base vs candidate.
+
+    Why this exists (review note: "way too much false positives with crowd v1,
+    especially with bf16"): ``estimate_margin`` measures repeated evaluations of
+    the *same* weights. On a fixed held-out slice in eval mode those repeat
+    exactly, so its stderr is zero and the margin collapses to ``DEFAULT_FLOOR``
+    (1e-4). Any rounding-level change then counts as a regression, and bf16
+    deltas move the loss by far more than 1e-4 through quantization alone, so an
+    honest client gets rejected. The uncertainty we actually have is *across
+    windows*, and it is much smaller when the comparison is paired on the same
+    windows because the window difficulty cancels.
+
+    Returns ``(margin, mean_delta)`` where ``mean_delta = mean(cand - base)``.
+    ``bf16_band`` is the loss change the same delta produces from bf16 rounding
+    alone (measured by the caller); the margin never drops below it.
+    """
+    pairs = [(float(b), float(c)) for b, c in zip(base_windows, cand_windows)
+             if math.isfinite(float(b)) and math.isfinite(float(c))]
+    n = len(pairs)
+    if n == 0:
+        return max(float(floor), float(bf16_band)), float("inf")
+    deltas = [c - b for b, c in pairs]
+    mean_delta = sum(deltas) / n
+    if n < 2:
+        return max(float(floor), float(bf16_band)), mean_delta
+    var = sum((d - mean_delta) ** 2 for d in deltas) / (n - 1)
+    stderr = math.sqrt(var / n)
+    # max(), not sum(): the bf16 band is measured on these same windows, so it
+    # already contains their sampling noise; adding would double count it.
+    return max(float(floor), float(sigmas) * stderr, float(bf16_band)), mean_delta
+
+
+def judge_paired(base_windows: Sequence[float], cand_windows: Sequence[float], *,
+                 sigmas: float = DEFAULT_SIGMAS, floor: float = DEFAULT_FLOOR,
+                 bf16_band: float = 0.0) -> tuple[bool, float, float]:
+    """Accept unless the candidate regresses beyond the paired margin.
+
+    Returns ``(accepted, mean_delta, margin)``. Equality and improvement are
+    accepted; a delta the measurement cannot distinguish from noise is accepted.
+    """
+    margin, mean_delta = paired_margin(base_windows, cand_windows, sigmas=sigmas,
+                                       floor=floor, bf16_band=bf16_band)
+    if not math.isfinite(mean_delta):
+        return False, mean_delta, margin
+    return (mean_delta <= margin), mean_delta, margin
+
+
+def bf16_band_from_replay(loss_fp32: float, loss_bf16: float, *, margin_factor: float = 1.0) -> float:
+    """Loss change the same delta produces from bf16 rounding alone.
+
+    A delta is stored and shipped as bf16, so the model a peer actually trained
+    and the model the server replays differ by rounding. Measuring both replays
+    turns that into a number instead of leaving it inside a hand-picked
+    threshold: with ``margin_factor=1`` anything inside the band is treated as
+    "the quantization did this, not the peer".
+    """
+    if not (math.isfinite(float(loss_fp32)) and math.isfinite(float(loss_bf16))):
+        return 0.0
+    return abs(float(loss_bf16) - float(loss_fp32)) * float(max(0.0, margin_factor))
+
+
 def judge(base_loss: float, candidate_loss: float, margin: float) -> tuple[bool, float]:
     """Accept unless the candidate measurably regresses the held-out loss.
 
@@ -168,7 +232,8 @@ def summarise(verdicts: Sequence[Verdict]) -> dict:
 
 
 def select_by_objective(paths, *, open_delta, model_size, evaluate=None,
-                       base_loss=None, margin=None):
+                       base_loss=None, margin=None, base_windows=None,
+                       bf16_band=0.0):
     """Pick the deltas a round keeps, by the objective and nothing else.
 
     Pure so it can be tested without importing ``server`` (which binds a port):
@@ -178,6 +243,16 @@ def select_by_objective(paths, *, open_delta, model_size, evaluate=None,
     Returns ``(kept_paths, weights, rejected_paths, unreadable_paths, verdicts)``.
     With no evaluator every readable delta is kept, because a server that cannot
     measure a delta has no business rejecting it.
+
+    ``base_windows`` switches the judgement to the paired rule: if ``evaluate``
+    returns a sequence of per-window losses of the same length, the margin comes
+    from the spread of the *paired* per-window deltas rather than from a fixed
+    floor. That matters because repeated evaluations of identical weights on a
+    fixed slice are identical, so the old ``estimate_margin`` collapsed to its
+    1e-4 floor -- and with only one window it still does (measured: 3-sigma =
+    1e-4 exactly at n=1, 2.1e-3 at n=4, 3.9e-3 at n=8). ``bf16_band`` adds the
+    measured cost of shipping the delta as bf16 so rounding can widen the margin
+    instead of silently deciding the verdict.
     """
     unreadable = []
     readable = []
@@ -190,12 +265,30 @@ def select_by_objective(paths, *, open_delta, model_size, evaluate=None,
     for d in readable:
         sid = getattr(d, "path", str(d))
         advisory = {"tokens": getattr(d, "tokens", None)}
-        if evaluate is None or base_loss is None:
+        if evaluate is None or (base_loss is None and base_windows is None):
             verdicts.append(accept_unmeasured(sid, advisory=advisory))
-        else:
-            verdicts.append(verdict_by_replay(sid, lambda p=sid: evaluate(p),
-                                              base_loss=base_loss, margin=margin,
-                                              advisory=advisory))
+            continue
+        if base_windows:
+            try:
+                cand = evaluate(sid)
+            except Exception as exc:                      # a delta we cannot replay
+                verdicts.append(Verdict(sid, False, "replay_failed",
+                                        advisory={**advisory, "error": str(exc)}))
+                continue
+            if isinstance(cand, (list, tuple)) and len(cand) == len(base_windows):
+                accepted, mean_delta, margin_used = judge_paired(
+                    base_windows, cand, bf16_band=bf16_band)
+                verdicts.append(Verdict(
+                    sid, accepted, "accepted" if accepted else "held_out_regression",
+                    base_loss=sum(base_windows) / len(base_windows),
+                    candidate_loss=sum(cand) / len(cand),
+                    regression=mean_delta, margin=margin_used,
+                    advisory={**advisory, "windows": len(cand), "paired": True,
+                              "bf16Band": bf16_band}))
+                continue
+        verdicts.append(verdict_by_replay(sid, lambda p=sid: evaluate(p),
+                                          base_loss=base_loss, margin=margin,
+                                          advisory=advisory))
     kept = [(d, v) for d, v in zip(readable, verdicts) if v.accepted]
     rejected = [d for d, v in zip(readable, verdicts) if not v.accepted]
     if not kept:

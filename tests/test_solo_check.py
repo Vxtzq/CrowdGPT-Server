@@ -312,3 +312,89 @@ def test_an_unreadable_diloco_inner_step_is_reported():
 
 def test_empty_declarations_are_ignored():
     assert check_round_paradigms([None, {}])["problems"] == []
+
+
+# --- paired margin: the bf16 false-positive fix -------------------------------
+from solo_check import (  # noqa: E402
+    bf16_band_from_replay,
+    judge_paired,
+    paired_margin,
+)
+
+
+def test_paired_margin_collapses_to_the_floor_with_one_window():
+    """Exactly v1's bug: one evaluation window has no measurable spread."""
+    margin, mean_delta = paired_margin([5.0], [5.0])
+    assert margin == DEFAULT_FLOOR
+    assert mean_delta == 0.0
+
+
+def test_paired_margin_grows_with_the_number_of_windows():
+    base = [5.0, 5.2, 4.8, 5.1, 4.9, 5.3, 5.05, 4.95]
+    cand = [b - 0.01 * (i + 1) for i, b in enumerate(base)]
+    m1 = paired_margin(base[:1], cand[:1])[0]
+    m4 = paired_margin(base[:4], cand[:4])[0]
+    m8 = paired_margin(base, cand)[0]
+    assert m1 == DEFAULT_FLOOR
+    assert m4 > m1 and m8 > m4
+
+
+def test_paired_margin_is_widened_by_a_measured_bf16_band():
+    base = [5.0, 5.0, 5.0, 5.0]
+    cand = [5.0, 5.0, 5.0, 5.0]
+    quiet = paired_margin(base, cand)[0]
+    loud = paired_margin(base, cand, bf16_band=0.02)[0]
+    assert quiet == DEFAULT_FLOOR
+    assert loud == 0.02
+
+
+def test_judge_paired_accepts_a_small_honest_improvement_that_a_floor_rejects():
+    """A peer whose delta helps by less than the window noise must not be rejected."""
+    base = [5.00, 5.20, 4.80, 5.10]
+    cand = [4.95, 5.14, 4.79, 5.05]          # small, uneven, genuinely better
+    accepted, mean_delta, margin = judge_paired(base, cand)
+    assert mean_delta < 0
+    assert margin > DEFAULT_FLOOR
+    assert accepted is True
+    # ... and the same margin rejects only a real regression beyond the noise
+    worse = [6.0, 6.2, 5.8, 6.1]
+    assert judge_paired(base, worse)[0] is False
+
+
+def test_judge_paired_rejects_a_non_finite_delta():
+    accepted, mean_delta, _ = judge_paired([5.0], [float("nan")])
+    assert accepted is False and mean_delta == float("inf")
+
+
+def test_bf16_band_is_the_measured_cost_of_shipping_the_delta():
+    assert bf16_band_from_replay(7.020659, 7.020694) == pytest.approx(0.000035, abs=1e-9)
+    assert bf16_band_from_replay(7.0, 7.0, margin_factor=2.0) == 0.0
+    assert bf16_band_from_replay(float("nan"), 7.0) == 0.0
+
+
+def test_select_by_objective_uses_the_paired_rule_when_windows_are_given():
+    base = [5.0, 5.2, 4.8, 5.1]
+    cands = {
+        "a": [4.95, 5.14, 4.79, 5.05],       # honest, small improvement
+        "b": [6.00, 6.20, 5.80, 6.10],       # real regression
+    }
+    kept, weights, rejected, unreadable, verdicts = select_by_objective(
+        ["a", "b"], open_delta=_stub_open({"a": 100, "b": 100}), model_size=8,
+        evaluate=lambda p: cands[p], base_windows=base, bf16_band=0.0)
+    assert kept == ["a"]
+    assert rejected == ["b"]
+    assert sum(weights) == pytest.approx(1.0)
+    assert verdicts[0].advisory["paired"] is True
+    assert verdicts[0].reason == "accepted"
+    assert verdicts[1].reason == "held_out_regression"
+
+
+def test_select_by_objective_reports_a_replay_that_raises():
+    def boom(path):
+        raise RuntimeError("cannot load delta")
+
+    kept, _, rejected, unreadable, verdicts = select_by_objective(
+        ["a"], open_delta=_stub_open({"a": 10}), model_size=8,
+        evaluate=boom, base_windows=[5.0, 5.1])
+    assert kept == [] and rejected == ["a"] and unreadable == []
+    assert verdicts[0].reason == "replay_failed"
