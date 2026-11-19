@@ -76,6 +76,7 @@ class AggregationV2Test(unittest.TestCase):
             load_model_weights=server.load_model_weights,
             load_engram_weights=server.load_engram_weights,
             events=[],
+            anchor=dict(server._ANCHOR),
         )
         server.MODEL_SIZE = MODEL_SIZE
         server.MODEL_CONFIG["dim"] = ENG_DIM
@@ -112,6 +113,172 @@ class AggregationV2Test(unittest.TestCase):
         server.handle_checkpoints = self._saved["handle_checkpoints"]
         server.load_model_weights = self._saved["load_model_weights"]
         server.load_engram_weights = self._saved["load_engram_weights"]
+        server._ANCHOR = self._saved["anchor"]
+
+    # ------------------------------------------------------------------ aggregator anchoring
+    def test_anchor_step_is_off_by_default(self):
+        """No cadence and no step function: the round behaves exactly as before."""
+        p = write_delta(self.delta_path("noanchor"), [0.1 * (i + 1) for i in range(MODEL_SIZE)])
+        server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        self.assertIsNone(self._last_event("anchor_step"))
+        self.assertEqual(server.anchor_state_now()["level"], "disabled")
+        self.assertAlmostEqual(float(server.global_weights.sum()), 3.6, places=2)
+
+    def test_anchor_step_fires_every_n_rounds_after_the_merge(self):
+        """It must run once per N completed rounds, on the merged weights.
+
+        The recorded ``global_step`` inside the hook pins the ordering: the anchor
+        runs after the round's deltas are applied and before the step counter
+        advances, so the anchored weights are what the next round starts from.
+        """
+        seen = []
+
+        def step():
+            seen.append((int(server.global_step), float(server.global_weights.sum())))
+            return 5.0
+
+        saved = os.environ.pop("CROWDGPT_ANCHOR_EVERY", None)
+        try:
+            server.set_anchor_step(step, every=2)
+            # Start from a non-trivial norm: from zero weights every round doubles
+            # the norm (ratio 2.0 > the 1.5 band) and gets reverted, and a reverted
+            # round correctly does not anchor, so the cadence would never arrive.
+            server.global_weights.fill_(1.0)
+            for i in range(1, 5):
+                p = write_delta(self.delta_path(f"anc{i}"), [0.05] * MODEL_SIZE)
+                server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        finally:
+            if saved is not None:
+                os.environ["CROWDGPT_ANCHOR_EVERY"] = saved
+        self.assertEqual([s for s, _ in seen], [1, 3])          # after rounds 2 and 4
+        self.assertTrue(all(total > 0 for _, total in seen), "anchor saw unmerged weights")
+        ev = self._last_event("anchor_step")
+        # The hook sees the counter *before* it advances (1 and 3), while the
+        # published event names the completed round (2 and 4).
+        self.assertEqual((ev["step"], ev["rounds"], ev["every"]), (4, 2, 2))
+        self.assertEqual(server.anchor_state_now()["level"], "ok")
+        self.assertEqual(server.anchor_state_now()["rounds"], 2)
+
+    def test_the_environment_wires_a_factory_into_the_server(self):
+        """The deployment path: CROWDGPT_ANCHOR_FACTORY + _EVERY, no code change."""
+        import types
+
+        module = types.ModuleType("e2e_anchor_factory")
+        module.make = lambda: (lambda: 3.5)
+        sys.modules["e2e_anchor_factory"] = module
+        os.environ["CROWDGPT_ANCHOR_FACTORY"] = "e2e_anchor_factory:make"
+        os.environ["CROWDGPT_ANCHOR_EVERY"] = "4"
+        try:
+            state = server.wire_anchor_from_env()
+        finally:
+            os.environ.pop("CROWDGPT_ANCHOR_FACTORY", None)
+            os.environ.pop("CROWDGPT_ANCHOR_EVERY", None)
+            sys.modules.pop("e2e_anchor_factory", None)
+        self.assertEqual(state["every"], 4)
+        self.assertEqual(server.anchor_state_now()["level"], "ok")
+        self.assertEqual(server._ANCHOR["step"](), 3.5)
+
+    def test_a_real_torch_step_runs_inside_the_round_loop(self):
+        """End to end: the shipped hook, the shipped glue, real gradients.
+
+        ``anchor_runtime.make_anchor_step`` is the code a deployment wires via
+        ``CROWDGPT_ANCHOR_FACTORY``; this runs it against the same
+        ``apply_round_aggregation`` the server uses, with ``sync_in``/``sync_out``
+        bound to the server's own flat weight buffer.
+        """
+        import anchor_runtime
+
+        torch.manual_seed(0)
+        vocab, dim = 2, 3               # 3*2 + 2 == MODEL_SIZE, so the buffer fits
+
+        class Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Parameter(torch.zeros(dim, vocab))
+                self.b = torch.nn.Parameter(torch.zeros(vocab))
+
+            def forward(self, x):
+                return x @ self.a + self.b
+
+        model = Tiny()
+        gen = torch.Generator().manual_seed(3)
+
+        def sync_out(m):
+            off = 0
+            for p in m.parameters():
+                server.global_weights[off:off + p.numel()] = p.detach().reshape(-1)
+                off += p.numel()
+
+        def sync_in(m):
+            off = 0
+            with torch.no_grad():
+                for p in m.parameters():
+                    p.copy_(server.global_weights[off:off + p.numel()].view_as(p))
+                    off += p.numel()
+
+        # Non-zero start: from zeros the second round doubles the norm (2.0 > the
+        # 1.5 band) and is reverted, and a reverted round does not anchor.
+        server.global_weights.fill_(0.5)
+        sync_in(model)
+        batches = [(torch.randn(2, 3, dim, generator=gen),
+                    torch.randint(0, vocab, (2, 3), generator=gen)) for _ in range(2)]
+        step = anchor_runtime.make_anchor_step(model=model, batches=batches,
+                                               sync_in=sync_in, sync_out=sync_out,
+                                               lr=1e-2)
+        server.set_anchor_step(step, every=1)
+        for i in range(2):
+            p = write_delta(self.delta_path(f"torch{i}"), [0.01] * MODEL_SIZE)
+            server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        ev = self._last_event("anchor_step")
+        self.assertIsNotNone(ev, "the anchor event must fire")
+        self.assertTrue(math.isfinite(ev["loss"]))
+        self.assertEqual(ev["rounds"], 2)
+        self.assertEqual(server.anchor_state_now()["level"], "ok")
+
+    def test_a_reverted_round_does_not_anchor(self):
+        """The anchor trains merged weights. If the merge was rolled back there is
+        nothing to anchor: the round did not happen, and ``global_step`` did not
+        advance, so the cadence stays pending for the next real round."""
+        seen = []
+        server.set_anchor_step(lambda: (seen.append(1), 5.0)[1], every=1)
+        for i, size in enumerate((0.05, 5.0)):          # second one blows the norm band
+            p = write_delta(self.delta_path(f"rev{i}"), [size] * MODEL_SIZE)
+            server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        self.assertEqual(len(seen), 1, "the reverted round must not anchor")
+        self.assertEqual(server.global_step, 1)         # only the real round advanced
+
+    def test_a_failing_anchor_does_not_take_the_round_down(self):
+        def boom():
+            raise RuntimeError("no corpus on this deployment")
+
+        saved = os.environ.pop("CROWDGPT_ANCHOR_EVERY", None)
+        try:
+            server.set_anchor_step(boom, every=1)
+            p = write_delta(self.delta_path("boom"), [0.1] * MODEL_SIZE)
+            server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        finally:
+            if saved is not None:
+                os.environ["CROWDGPT_ANCHOR_EVERY"] = saved
+        # The round still landed: the deltas were merged before the hook ran.
+        self.assertGreater(float(server.global_weights.abs().sum()), 0.0)
+        self.assertEqual(server.global_step, 1)
+        self.assertEqual(server.anchor_state_now()["rounds"], 0)
+
+    def test_anchor_cadence_from_the_environment_enables_a_registered_step(self):
+        step_calls = []
+        server.set_anchor_step(lambda: (step_calls.append(1), 4.0)[1], every=0)
+        self.assertEqual(server.anchor_state_now()["level"], "disabled")
+        saved = os.environ.get("CROWDGPT_ANCHOR_EVERY")
+        try:
+            os.environ["CROWDGPT_ANCHOR_EVERY"] = "1"
+            p = write_delta(self.delta_path("env1"), [0.1] * MODEL_SIZE)
+            server.apply_round_aggregation([self.pool("a", [(p, 1.0)])])
+        finally:
+            if saved is None:
+                os.environ.pop("CROWDGPT_ANCHOR_EVERY", None)
+            else:
+                os.environ["CROWDGPT_ANCHOR_EVERY"] = saved
+        self.assertEqual(len(step_calls), 1)
 
     # ------------------------------------------------------------------ helpers
     def delta_path(self, name):
