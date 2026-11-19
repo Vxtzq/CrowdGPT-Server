@@ -1843,7 +1843,9 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
                 out_f.write(sum_chunk.to(torch.bfloat16).view(torch.uint16).numpy().tobytes())
                 norm_sq += float((sum_chunk * sum_chunk).sum().item())
             for f, df, w in zip(fds, dfs, weights):
-                f.seek(df.base_offset + MODEL_SIZE * 2)
+                # Variable-length base blocks (sparse / framed codecs) declare their
+                # size; a dense delta leaves it at MODEL_SIZE * 2 and is unchanged.
+                f.seek(df.base_offset + getattr(df, "base_bytes", MODEL_SIZE * 2))
                 eng_count_bytes = f.read(4)
                 if len(eng_count_bytes) < 4: continue
                 eng_count = struct.unpack('<I', eng_count_bytes)[0]
