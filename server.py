@@ -5670,8 +5670,28 @@ async def startup():
     PUB.event("server_start", step=global_step, round=round_state["current_round"], users=len(users_db["users"]))
     log.info("=" * 60)
 
+def wire_anchor_from_env() -> dict | None:
+    """Register the deployment's anchor step if one was configured.
+
+    See ``anchor_runtime``: ``CROWDGPT_ANCHOR_FACTORY=module:callable`` supplies a
+    step, ``CROWDGPT_ANCHOR_EVERY`` supplies the cadence. Both unset (the default)
+    leaves the server exactly as it was. A broken factory is logged and ignored —
+    anchoring is an optimisation, not a correctness requirement of a round.
+    """
+    try:
+        import anchor_runtime
+        state = anchor_runtime.wire_from_env(set_anchor_step)
+    except Exception as exc:                              # noqa: BLE001 - env wiring
+        log.error("❌ Anchor factory wiring failed: %s", exc)
+        return None
+    if state is not None:
+        log.info("⚓ Anchor factory wired: every %s round(s)", state.get("every"))
+    return state
+
+
 if __name__ == "__main__":
     import uvicorn
+    wire_anchor_from_env()
     from logging.handlers import RotatingFileHandler
     log_file = BASE_DIR / "server.log"
     file_handler = RotatingFileHandler(log_file, maxBytes=50 * 1024 * 1024, backupCount=5)
