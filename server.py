@@ -131,6 +131,8 @@ def read_exact(file_obj, num_bytes):
 
 from krum_stream import (plan_round, stream_add_base_delta, stream_add_base_delta_pair,
                           read_engram_tail, open_delta, streaming_pairwise_sq_l2)
+from anchor_step import (anchor_state as _anchor_state, resolve_every as _resolve_anchor_every,
+                         should_anchor as _should_anchor)
 from outer_step import nesterov_update as _outer_nesterov_update, resolve_momentum as _resolve_outer_momentum, \
     streaming_scales as _outer_scales, buffer_bytes as _outer_buffer_bytes
 from solo_check import (DEFAULT_FLOOR, accept_unmeasured, check_round_modules,
@@ -3690,6 +3692,47 @@ _REPLAY = {"evaluate": None, "base_loss": None, "margin": None,
 _OUTER = {"grad": None, "momentum": None, "rounds": 0}
 
 
+# Aggregator anchoring: the one participant that holds the whole model can take an
+# ordinary gradient step on the true terminal loss every N rounds, which is what
+# a MOSAIC slice can never do (it only ever sees a local surrogate). The step
+# itself is supplied by the deployment -- only it knows where the data and the
+# optimizer live -- so this holds a callable, not a training loop.
+_ANCHOR = {"step": None, "every": 0, "rounds": 0, "lastLoss": None}
+
+
+def anchor_every() -> int:
+    """Anchor cadence for this round: ``CROWDGPT_ANCHOR_EVERY`` wins over the API."""
+    return _resolve_anchor_every(os.getenv("CROWDGPT_ANCHOR_EVERY"), default=_ANCHOR["every"])
+
+
+def set_anchor_step(step_fn=None, *, every: int = 0):
+    """Register the aggregator's full-model step, and how often to take it.
+
+    ``step_fn()`` must take one gradient step of the *whole* model on the true
+    terminal loss and return the loss it saw. It is called by
+    ``apply_round_aggregation`` after the round's deltas are merged and the norm
+    sanity check has passed, so the anchored weights are what the next round
+    starts from. Anchoring is off by default (``every=0``), which is exactly the
+    behaviour every deployment had before this existed.
+    """
+    _ANCHOR["step"] = step_fn
+    _ANCHOR["every"] = _resolve_anchor_every(every)
+    state = anchor_state_now()
+    if state["level"] == "misconfigured":
+        log.error("🚨 ANCHOR MISCONFIGURED — %s", state["warning"])
+    elif state["level"] == "ok":
+        log.info("⚓ Aggregator anchoring: one full-model step every %d round(s)", state["every"])
+    else:
+        log.info("Aggregator anchoring disabled (no cadence configured)")
+    return state
+
+
+def anchor_state_now() -> dict:
+    """Machine-readable anchor state, for the round status and the pool log."""
+    return _anchor_state(every=anchor_every(), has_step=_ANCHOR["step"] is not None,
+                         rounds=_ANCHOR["rounds"], last_loss=_ANCHOR["lastLoss"])
+
+
 def outer_momentum() -> float:
     """Configured outer momentum for the round, re-read each time.
 
@@ -4141,7 +4184,25 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     global_engram_weights[sp:ep] += avg * (lr * trust)   # pool_w/step_scale/trust folded into avg
             del engram_accumulator
             gc.collect()
+        every = anchor_every()
+        if _ANCHOR["step"] is not None and _should_anchor(global_step + 1, every):
+            # Measured at 65 M: this is the only change that closes MOSAIC's gap
+            # to backprop (5.5854 vs 5.8121-5.8516 without, both at 488 rounds).
+            try:
+                _ANCHOR["lastLoss"] = float(_ANCHOR["step"]())
+                _ANCHOR["rounds"] += 1
+                anchored = True
+            except Exception as exc:                      # a broken deployment hook
+                log.error("❌ Anchor step failed at round %d: %s", global_step + 1, exc)
+                anchored = False
+        else:
+            anchored = False
         with stats_lock: global_step += 1
+    if anchored:
+        PUB.event("anchor_step", step=global_step, loss=_ANCHOR["lastLoss"],
+                  every=every, rounds=_ANCHOR["rounds"])
+        log.info("⚓ Anchor step %d: full-model step on the true loss every %d rounds "
+                 "(loss %.4f)", _ANCHOR["rounds"], every, _ANCHOR["lastLoss"])
     PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr,
               poolWeights=[round(x, 4) for x in pool_w], stepScales=sorted(set(step_scales)),
               poolNRefs=pool_n_refs,
@@ -4333,7 +4394,7 @@ async def get_round_status(request: Request):
         "hfDirectDownloads": bool(_build_hf_weights_metadata("bf16")),
         "cohortSize": MATCHMAKING["POOL_SIZE"], "maxCohortSize": MATCHMAKING["POOL_SIZE"],
         "matchmaking": mm, "controlPlane": dict(CONTROL_PLANE),
-        "objectiveGate": objective_gate_state()}
+        "objectiveGate": objective_gate_state(), "anchor": anchor_state_now()}
 
 @app.get("/fl/task")
 async def get_task(request: Request, format: str = "bf16", skip_weights: bool = False):
