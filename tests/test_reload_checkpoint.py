@@ -115,7 +115,13 @@ class ReloadCheckpointTest(unittest.TestCase):
             "global_engram_weights": _FakeTensor(self.old_engram.copy()),
             "global_step": 500,
             "loss_ratchet_state": {"lastAcceptedLoss": 1.0, "lastAcceptedStep": 500},
+            # Admin auth is covered by tests/test_admin_secret_header.py; here the
+            # header path is irrelevant, so resolve straight to the query value.
+            "_admin_secret": lambda request, secret="": secret,
             "_admin_ok": lambda s: s == "ok",
+            # endpoint signature annotations are evaluated at def time (server.py has
+            # no `from __future__ import annotations`), so the names must exist
+            "Request": object, "Optional": __import__("typing").Optional,
             # side effects not under test: recorded, never touch network/disk
             "load_global_state": lambda: self.calls.append("load_global_state"),
             "save_global_state": lambda: self.calls.append("save_global_state"),
@@ -331,7 +337,7 @@ class GlobalDeclarationTest(unittest.TestCase):
     def test_guard_detects_original_reload_bug(self):
         # server.py as it was before the fix, rebuilt in memory only.
         head = ('@app.post("/api/admin/reload")\n'
-                'async def reload_checkpoint(step: int = -1, secret: str = ""):\n')
+                'async def reload_checkpoint(request: Request = None, step: int = -1, secret: str = ""):\n')
         fixed = head + "    global global_weights, global_engram_weights, global_step\n"
         source = SERVER_PY.read_text(encoding="utf-8")
         self.assertEqual(source.count(fixed), 1)

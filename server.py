@@ -865,6 +865,31 @@ ADMIN_SECRET = os.getenv("CROWDGPT_ADMIN_SECRET") or ADMIN_SECRET
 def _admin_ok(secret: str) -> bool:
     return bool(secret) and secrets.compare_digest(str(secret).encode(), str(ADMIN_SECRET).encode())
 
+def _admin_secret(request: Optional[Request], secret: str = "") -> str:
+    """Admin secret from a header, falling back to the deprecated `?secret=` parameter.
+
+    A secret in a query string is copied into every proxy access log, the admin's
+    browser history and any `Referer` a page emits, and it survives in shell
+    history. The header is the supported form:
+
+        X-Admin-Secret: <secret>
+        Authorization: Bearer <secret>
+
+    The query parameter keeps working so existing scripts and bookmarks do not
+    break. A header always wins when both are present.
+    """
+    if request is not None:
+        for name in ("x-admin-secret", "X-Admin-Secret"):
+            try: value = str(request.headers.get(name) or "").strip()
+            except Exception: value = ""
+            if value: return value
+        try: auth = str(request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
+        except Exception: auth = ""
+        if auth[:7].lower() == "bearer ":
+            token = auth[7:].strip()
+            if token: return token
+    return secret
+
 # ============ CROSS-CHECK CONFIG ============
 CROSS_CHECK = {
     "ENABLED": os.getenv("CROWDGPT_CROSS_CHECK_ENABLED", "1") == "1",
@@ -4350,7 +4375,7 @@ def api_geo(mode: str = "active"):
 @app.get("/api/admin/geo_debug")
 def admin_geo_debug(request: Request, secret: str = ""):
     """One-shot diagnostic: tells you exactly what the server sees."""
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     now = time.time()
     peer = request.client.host if request.client else "?"
     return {
@@ -4379,9 +4404,9 @@ def admin_geo_debug(request: Request, secret: str = ""):
 
 
 @app.post("/api/admin/test_country")
-def admin_test_country(secret: str = "", client_key: str = "", country: str = ""):
+async def admin_test_country(request: Request = None, secret: str = "", client_key: str = "", country: str = ""):
     """Inject a fake country for a fake client — proves the map works."""
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     cc = (country or "").upper()
     if len(cc) != 2: raise HTTPException(400, "country must be 2 letters")
     if not client_key: raise HTTPException(400, "client_key required")
@@ -4992,8 +5017,8 @@ async def get_nodes():
     return await get_node()
 
 @app.get("/api/checkpoints")
-def list_checkpoints(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def list_checkpoints(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     checkpoints = []
     for f in CHECKPOINT_DIR.iterdir():
         if f.name.startswith("model_step_") and f.suffix == ".bin":
@@ -5002,8 +5027,8 @@ def list_checkpoints(secret: str = ""):
     return {"current_step": global_step, "checkpoints": sorted(checkpoints, key=lambda x: x["step"], reverse=True)}
 
 @app.get("/api/admin/clients")
-def admin_list_clients(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_list_clients(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     now = time.time()
     with pool_lock:
         client_to_pool = {}
@@ -5032,8 +5057,8 @@ def admin_list_clients(secret: str = ""):
         "clients": clients}
 
 @app.get("/api/chunk_state")
-def chunk_state(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def chunk_state(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with pool_lock:
         pool_snapshot = [{"poolId": p["pool_id"], "status": p["status"], "clients": list(p["clients"]),
             "chunkIdx": p["chunk_idx"], "deltas": len(p["deltas"]),
@@ -5067,8 +5092,8 @@ def chunk_state(secret: str = ""):
                            if k in current_data_shard.get("assignedClients", [])}}
 
 @app.post("/api/admin/dissolve_pool")
-def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_dissolve_pool(request: Request = None, secret: str = "", pool_id: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not pool_id: raise HTTPException(400, "pool_id required")
     with pool_lock:
         pool = pools.pop(pool_id, None)
@@ -5086,9 +5111,9 @@ def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
     return {"status": "dissolved", "pool_id": pool_id, "clients_freed": freed}
 
 @app.post("/api/admin/reload")
-def reload_checkpoint(step: int = -1, secret: str = ""):
+async def reload_checkpoint(request: Request = None, step: int = -1, secret: str = ""):
     global global_weights, global_engram_weights, global_step
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
     else:
         cp_file = CHECKPOINT_DIR / f"model_step_{step}.bin"
@@ -5106,9 +5131,9 @@ def reload_checkpoint(step: int = -1, secret: str = ""):
     return {"status": "reloaded", "step": global_step}
 
 @app.post("/api/admin/push_hf")
-def force_hf_push(secret: str = ""):
+async def force_hf_push(request: Request = None, secret: str = ""):
     global last_hf_upload_time
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     last_hf_upload_time = 0
     ok = upload_to_huggingface()
     update_and_save_status(push_hf=True)
@@ -5123,8 +5148,8 @@ def get_candidate(part: str, token: str = ""):
     return FileResponse(str(p), media_type="application/octet-stream", headers={"X-Global-Step": str(global_step)})
 
 @app.api_route("/api/admin/loss_ratchet", methods=["GET", "POST"])
-def admin_loss_ratchet(secret: str = "", mode: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_loss_ratchet(request: Request = None, secret: str = "", mode: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if mode:
         if mode not in ("off", "log", "enforce"): raise HTTPException(400, "mode must be off|log|enforce")
         HARDEN["LOSS_CHECK_MODE"] = mode
@@ -5136,8 +5161,8 @@ def admin_loss_ratchet(secret: str = "", mode: str = ""):
             "recent": loss_ratchet_state["history"][-10:]}
 
 @app.post("/api/admin/clear_byzantine_flags")
-def admin_clear_byzantine(secret: str = "", client_key: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_clear_byzantine(request: Request = None, secret: str = "", client_key: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if client_key:
         uid = _user_id_from_key(client_key)
         if uid:
@@ -5159,10 +5184,10 @@ def admin_clear_byzantine(secret: str = "", client_key: str = ""):
     raise HTTPException(404, "Not found")
 
 @app.post("/api/admin/set_user_stats")
-def admin_set_user_stats(secret: str = "", user_id: str = "",
+async def admin_set_user_stats(request: Request = None, secret: str = "", user_id: str = "",
     contributions: Optional[int] = None, byzantine_flags: Optional[int] = None,
     total_tokens: Optional[int] = None, total_steps: Optional[int] = None):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not user_id: raise HTTPException(400, "user_id required")
     with users_lock:
         u = users_db["users"].get(user_id)
@@ -5191,10 +5216,10 @@ def _reset_weights_to_init():
     _WN_CACHE.update(step=None, t=0.0, v=0.0)
 
 @app.post("/api/admin/reset")
-def admin_reset(secret: str = "", push: int = 1):
+async def admin_reset(request: Request = None, secret: str = "", push: int = 1):
     """Weights back to init; step, tokens, contributions and loss state to 0.
     push=0 skips the Hugging Face upload (use it if HF_REPO_ID is not the repo you want overwritten)."""
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with shard_lock:
         _reset_weights_to_init()
     save_latest_checkpoint()
@@ -5205,10 +5230,10 @@ def admin_reset(secret: str = "", push: int = 1):
     return {"status": "reset", "pushedToHuggingFace": bool(push), "globalStep": global_step}
 
 @app.post("/api/admin/reset_run")
-def admin_reset_run(secret: str = "", dataset: int = 1, pools_and_round: int = 1, push: int = 0):
+async def admin_reset_run(request: Request = None, secret: str = "", dataset: int = 1, pools_and_round: int = 1, push: int = 0):
     """Full fresh run: weights/step/tokens/contributions (as /reset) + optionally the dataset position and the
     live pools/round. Users, tokens and the leaderboard are NOT touched. HF push is off by default."""
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     cleared = ["weights", "step", "tokens", "contributions", "loss_state"]
     with shard_lock:
         if round_state.get("is_aggregating"): raise HTTPException(409, "Aggregation in progress, retry in a minute")
@@ -5239,8 +5264,8 @@ def admin_reset_run(secret: str = "", dataset: int = 1, pools_and_round: int = 1
             "usersPreserved": len(users_db.get("users", {}))}
 
 @app.post("/api/admin/force_round_end")
-def admin_force_round_end(secret: str = "", minutes: float = 0):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_force_round_end(request: Request = None, secret: str = "", minutes: float = 0):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if minutes < 0 or minutes > 24 * 60: raise HTTPException(400, "minutes must be 0..1440")
     with shard_lock:
         if round_state.get("is_aggregating"): raise HTTPException(409, "Round is already ending — wait for the next round")
@@ -5253,16 +5278,16 @@ def admin_force_round_end(secret: str = "", minutes: float = 0):
         "endsAt": datetime.fromtimestamp(ends_at, tz=timezone.utc).isoformat()}
 
 @app.delete("/api/admin/force_round_end")
-def admin_cancel_force_round_end(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_cancel_force_round_end(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with shard_lock: old = round_state.pop("force_end_at", None)
     _persist_round_state()
     return {"status": "cancelled" if old is not None else "no_pending_force_end",
         "cancelledAt": datetime.fromtimestamp(old, tz=timezone.utc).isoformat() if old else None}
 
 @app.post("/api/admin/force_update")
-def admin_force_update(secret: str = "", min_version: str = "", end_round: bool = True):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_force_update(request: Request = None, secret: str = "", min_version: str = "", end_round: bool = True):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if min_version and not _vtuple(min_version): raise HTTPException(400, "min_version must look like 1.9")
     _set_min_client_version(min_version)
     ended = "skipped"
@@ -5278,8 +5303,8 @@ def admin_force_update(secret: str = "", min_version: str = "", end_round: bool 
             "blockUnversioned": _block_unversioned}
 
 @app.get("/api/admin/force_update")
-def admin_force_update_status(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_force_update_status(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     return {"minClientVersion": _min_client_version or None, "blockUnversioned": _block_unversioned}
 
 def _delta_metadata(path: str) -> Optional[dict]:
@@ -5363,11 +5388,11 @@ def _find_user_uuid(user_id: str = "", username: str = "") -> Optional[str]:
     return None
 
 @app.post("/api/admin/power_user")
-def admin_power_user(secret: str = "", user_id: str = "", username: str = "",
+async def admin_power_user(request: Request = None, secret: str = "", user_id: str = "", username: str = "",
                            enabled: bool = True, note: str = ""):
     """Make an account a power user (enabled=true, default) or remove it (enabled=false).
     Identify the account by user_id (uuid) or username."""
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not user_id and not username: raise HTTPException(400, "user_id or username required")
     with users_lock:
         uid = _find_user_uuid(user_id, username)
@@ -5386,17 +5411,17 @@ def admin_power_user(secret: str = "", user_id: str = "", username: str = "",
     return {"status": "power_enabled" if enabled else "power_removed", "user_id": uid, "username": name}
 
 @app.get("/api/admin/power_users")
-def admin_list_power_users(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_list_power_users(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with users_lock:
         out = [{"user_id": u["uuid"], "username": u["username"], "since": u.get("power_since"),
                 "note": u.get("power_note", "")} for u in users_db["users"].values() if u.get("power")]
     return {"count": len(out), "soloWeight": POWER["SOLO_WEIGHT"], "soloEnabled": POWER["SOLO_ENABLED"], "joinAnyPool": POWER["JOIN_ANY_POOL"], "powerUsers": out}
 
 @app.post("/api/admin/ban_user")
-def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
+async def admin_ban_user(request: Request = None, secret: str = "", user_id: str = "", reason: str = "",
     hours: int = 0, ban_ip: bool = False, purge_pending: bool = True):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not user_id: raise HTTPException(400, "user_id required")
     until = time.time() + hours * 3600 if hours > 0 else 0.0
     purged = 0
@@ -5437,8 +5462,8 @@ def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
         "ips_banned": list(ips) if ban_ip else [], "pending_deltas_purged": purged}
 
 @app.post("/api/admin/unban_user")
-def admin_unban_user(secret: str = "", user_id: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_unban_user(request: Request = None, secret: str = "", user_id: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not user_id: raise HTTPException(400, "user_id required")
     with users_lock:
         had = banned_users.pop(user_id, None)
@@ -5447,15 +5472,15 @@ def admin_unban_user(secret: str = "", user_id: str = ""):
     return {"status": "unbanned" if had else "not_banned", "user_id": user_id}
 
 @app.post("/api/admin/ban_ip")
-def admin_ban_ip(secret: str = "", ip: str = "", reason: str = "", hours: int = 24):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_ban_ip(request: Request = None, secret: str = "", ip: str = "", reason: str = "", hours: int = 24):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not ip: raise HTTPException(400, "ip required")
     ban_subnet(ip, reason or "admin", hours)
     return {"status": "banned", "ip": ip, "subnet": get_subnet(ip), "hours": hours}
 
 @app.post("/api/admin/clear_subnet_bans")
-def admin_clear_subnet_bans(secret: str = "", subnet: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_clear_subnet_bans(request: Request = None, secret: str = "", subnet: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with pool_lock:
         if subnet:
             n = 1 if blacklisted_subnets.pop(subnet, None) else 0
@@ -5470,8 +5495,8 @@ def admin_clear_subnet_bans(secret: str = "", subnet: str = ""):
     return {"status": "cleared", "subnets_cleared": count}
 
 @app.get("/api/admin/bans")
-def admin_list_bans(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_list_bans(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     now = time.time()
     return {"users": [{"user_id": uid, **b} for uid, b in banned_users.items() if not b.get("until") or b["until"] > now],
         "client_keys": [{"client_key": k, "expires_in_s": int(v - now) if v else None}
@@ -5529,8 +5554,8 @@ def get_stats(request: Request):
             "directDownloads": bool(_build_hf_weights_metadata("bf16"))} if HF_ENABLED else {}}
 
 @app.get("/api/admin/disk")
-async def admin_disk(secret: str = ""):
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+async def admin_disk(request: Request = None, secret: str = ""):
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     return await run_in_threadpool(_disk_report)
 
 # ============ PUBLIC LOG ENDPOINTS (no secret needed, no private data inside) ============
@@ -5674,9 +5699,9 @@ def get_model_info():
             "directDownloads": bool(_build_hf_weights_metadata("bf16"))} if HF_ENABLED else {}}
 
 @app.post("/api/admin/restore_from_hf")
-def admin_restore_from_hf(secret: str = "", revision: str = "", step: int = -1):
+async def admin_restore_from_hf(request: Request = None, secret: str = "", revision: str = "", step: int = -1):
     global global_weights, global_engram_weights, global_step
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     if not HF_ENABLED: raise HTTPException(503, "HF disabled")
     if not revision: raise HTTPException(400, "revision required (commit SHA or tag)")
     from huggingface_hub import hf_hub_download

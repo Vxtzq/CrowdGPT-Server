@@ -102,6 +102,25 @@ back to them. The orchestrator needs one inbound HTTPS endpoint — a public IP
 behind a reverse proxy, a tunnel, or a private mesh. TLS is not built in;
 terminate it at Caddy/Nginx.
 
+## Admin authentication
+
+Every `/api/admin/*` endpoint (and `/api/checkpoints`) takes the secret set in
+`CROWDGPT_ADMIN_SECRET`. Send it as a header:
+
+```bash
+curl -fsS -H "X-Admin-Secret: $CROWDGPT_ADMIN_SECRET" \
+  https://node.example/api/admin/clients
+# equivalent, for proxies that inject a standard credential:
+curl -fsS -H "Authorization: Bearer $CROWDGPT_ADMIN_SECRET" \
+  https://node.example/api/admin/clients
+```
+
+`?secret=...` still works and is deprecated: a query string is written to every
+proxy access log, the operator's browser history, the `Referer` header the page
+emits, and shell history. A header wins when both are present. If
+`CROWDGPT_ADMIN_SECRET` is unset the endpoints reject every call, so an
+unconfigured node has no admin surface rather than a guessable one.
+
 ## Backup
 
 With the service stopped, copy the state paths listed above:
