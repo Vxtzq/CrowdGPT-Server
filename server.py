@@ -23,6 +23,13 @@ v2.3 — strict pooling, mandatory cross-check, FP32-first, solo-pool re-matchin
   - Solo FP32 pools dissolve after FP32_SOLO_DISSOLVE_S (default 60 min).
 """
 
+import os as _cap_os
+# Containers with a low pids.max die with "libgomp: Thread creation failed" + heap corruption when
+# torch/OpenMP spawn too many threads. Cap them BEFORE torch/numpy load. Raise with CROWDGPT_TORCH_THREADS.
+_CAP_N = _cap_os.environ.get("CROWDGPT_TORCH_THREADS", "4")
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    _cap_os.environ.setdefault(_k, _CAP_N)
+
 # ==================================================================
 # VOCAB DIAGNOSTIC — read-only. Remove after diagnosis.
 # ==================================================================
@@ -87,7 +94,7 @@ _dg_log("=" * 72)
 
 import os, sys, io, json, zlib, gzip, time, struct, secrets, threading, requests
 import math, random, hashlib, uuid, shutil, tempfile, gc, atexit, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
@@ -97,6 +104,10 @@ log = logging.getLogger(__name__)
 
 import numpy as np
 import torch
+try:
+    torch.set_num_threads(max(1, int(_CAP_N)))
+    torch.set_num_interop_threads(1)
+except Exception: pass
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
@@ -245,7 +256,7 @@ print(f"🌐 Listening on: 0.0.0.0:{PORT}")
 print("=" * 60)
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
-HF_REPO_ID = "Vxtzq/Crowd-v1"
+HF_REPO_ID = "Vxtzq/Crowd-v1.5"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
@@ -329,6 +340,34 @@ def expected_init_norm(cfg: dict, mode: Optional[str] = None) -> float:
         return math.sqrt(4e-4 * total)
     return math.sqrt(4e-4 * (total - 2 * ones) + ones)
 
+
+_WN_CACHE = {"step": None, "t": 0.0, "v": 0.0}
+_WN_LOCK = threading.Lock()
+
+def _weight_norm_for_stats(ttl_s: float = 120.0) -> float:
+    """Cached ||global_weights|| for /api/stats.
+
+    Computing it walks all ~657M parameters in float64 (seconds of CPU, GIL-heavy) and it
+    raced with aggregation rewriting the tensor ("RuntimeError: unknown parameter type"
+    -> HTTP 500 on /api/stats). Stats are display-only, so: recompute at most every
+    `ttl_s` seconds, never while aggregating, never let an error escape, and serve the
+    last good value otherwise.
+    """
+    c = _WN_CACHE
+    now = time.time()
+    if global_weights is None: return 0.0
+    if c["step"] == global_step and now - c["t"] < ttl_s: return c["v"]
+    if round_state.get("is_aggregating", False): return c["v"]
+    if not _WN_LOCK.acquire(blocking=False): return c["v"]
+    try:
+        v = flat_norm(global_weights)
+        c.update(step=global_step, t=now, v=v)
+    except Exception as e:
+        log.warning(f"weightNorm unavailable ({e}); serving last value")
+        c["t"] = now - ttl_s + 15.0   # retry in ~15 s instead of on every request
+    finally:
+        _WN_LOCK.release()
+    return c["v"]
 
 def flat_norm(t, chunk: int = 10_000_000) -> float:
     """‖·‖ of a flat buffer accumulated in float64.
@@ -938,6 +977,20 @@ def load_users_db():
             log.info(f"👥 Loaded {len(users_db['users'])} users from disk")
     except Exception as e:
         log.error(f"❌ load_users_db: {e}"); users_db = {"users": {}, "tokens": {}}
+
+DAILY_KEEP_DAYS = 35
+
+def _utc_day(ts: Optional[float] = None) -> str:
+    return datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc).strftime("%Y-%m-%d")
+
+def _credit_daily(stats: dict, tokens: int, steps: int):
+    """Per-user per-UTC-day counters kept in users.json (stats["daily"]); call with users_lock held."""
+    d = stats.setdefault("daily", {})
+    row = d.setdefault(_utc_day(), {"tokens": 0, "steps": 0, "submissions": 0})
+    row["tokens"] = row.get("tokens", 0) + int(tokens); row["steps"] = row.get("steps", 0) + int(steps)
+    row["submissions"] = row.get("submissions", 0) + 1
+    if len(d) > DAILY_KEEP_DAYS:
+        for k in sorted(d)[:len(d) - DAILY_KEEP_DAYS]: d.pop(k, None)
 
 def save_users_db():
     try:
@@ -3535,6 +3588,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     if ur:
                         ur["stats"]["totalTokens"] = ur["stats"].get("totalTokens", 0) + delta_metadata["tokensProcessed"]
                         ur["stats"]["totalSteps"] = ur["stats"].get("totalSteps", 0) + local_steps
+                        _credit_daily(ur["stats"], delta_metadata["tokensProcessed"], local_steps)
                         save_users_db()
             with _commit_lock:
                 save_global_state(); update_and_save_status(push_hf=False)
@@ -4246,7 +4300,7 @@ async def _stamp_country_middleware(request: Request, call_next):
     return response
 
 @app.get("/api/geo")
-async def api_geo(mode: str = "active"):
+def api_geo(mode: str = "active"):
     """
     mode=active      → clients seen within IP_TIMEOUT_S  (live)
     mode=round       → clients participating in current round
@@ -4294,7 +4348,7 @@ async def api_geo(mode: str = "active"):
 
 
 @app.get("/api/admin/geo_debug")
-async def admin_geo_debug(request: Request, secret: str = ""):
+def admin_geo_debug(request: Request, secret: str = ""):
     """One-shot diagnostic: tells you exactly what the server sees."""
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     now = time.time()
@@ -4325,7 +4379,7 @@ async def admin_geo_debug(request: Request, secret: str = ""):
 
 
 @app.post("/api/admin/test_country")
-async def admin_test_country(secret: str = "", client_key: str = "", country: str = ""):
+def admin_test_country(secret: str = "", client_key: str = "", country: str = ""):
     """Inject a fake country for a fake client — proves the map works."""
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     cc = (country or "").upper()
@@ -4354,7 +4408,7 @@ def _task_alive_for(task_id: str, client_key: str) -> bool:
         return bool(pool) and pool["status"] == "training" and client_key in pool["clients"]
 
 @app.get("/fl/heartbeat")
-async def heartbeat(request: Request, taskId: Optional[str] = None):
+def heartbeat(request: Request, taskId: Optional[str] = None):
     if _banned_reason(request):
         return Response(content='{"status":"blocked"}', media_type="application/json")
     client_key = get_client_key(request)
@@ -4367,7 +4421,7 @@ async def heartbeat(request: Request, taskId: Optional[str] = None):
     return Response(content=json.dumps({"status": "ok", "task": task}), media_type="application/json")
 
 @app.get("/fl/round_status")
-async def get_round_status(request: Request):
+def get_round_status(request: Request):
     _reason = _banned_reason(request)
     if _reason: raise HTTPException(status_code=403, detail=_reason)
     client_key = get_client_key(request)
@@ -4399,7 +4453,7 @@ async def get_round_status(request: Request):
         "objectiveGate": objective_gate_state(), "anchor": anchor_state_now()}
 
 @app.get("/fl/task")
-async def get_task(request: Request, format: str = "bf16", skip_weights: bool = False):
+def get_task(request: Request, format: str = "bf16", skip_weights: bool = False):
     if round_state.get("is_aggregating", False):
         return Response(content=json.dumps({"status": "wait", "message": "Server aggregating"}).encode(),
                         media_type="application/json", headers={"X-Status": "wait"})
@@ -4871,7 +4925,7 @@ async def auth_login(request: Request):
     return {"token": token, "uuid": user["uuid"], "username": user["username"]}
 
 @app.get("/auth/me")
-async def auth_me(request: Request):
+def auth_me(request: Request):
     user = get_current_user(request)
     if not user: raise HTTPException(401, "Invalid or expired token")
     return {"uuid": user["uuid"], "username": user["username"], "email": user.get("email"),
@@ -4880,7 +4934,7 @@ async def auth_me(request: Request):
 
 # ============ ADMIN ROUTES ============
 @app.get("/audit")
-async def audit_page():
+def audit_page():
     return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8">
 <title>CrowdGPT audit</title><style>body{font:14px system-ui;max-width:1100px;margin:2rem auto}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.35rem;text-align:left}
@@ -4907,28 +4961,28 @@ main();
 </script></body></html>""", media_type="text/html")
 
 @app.get("/api/audit/rounds")
-async def audit_rounds():
+def audit_rounds():
     if ORCH is None: return {"rounds": []}
     return {"rounds": ORCH.audit.rounds()}
 
 @app.get("/api/audit/checkpoint")
-async def audit_checkpoint(upto: int | None = None):
+def audit_checkpoint(upto: int | None = None):
     if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
     return ORCH.audit.checkpoint(upto)
 
 @app.get("/api/audit/proof")
-async def audit_proof(round: int):
+def audit_proof(round: int):
     if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
     try: return ORCH.audit.inclusion(round)
     except KeyError: raise HTTPException(404, f"round {round} not published")
 
 @app.get("/api/audit/chain")
-async def audit_chain():
+def audit_chain():
     if ORCH is None: return {"rounds": 0, "broken": [], "ok": True}
     return ORCH.audit.verify_chain()
 
 @app.get("/api/node")
-async def get_node():
+def get_node():
     if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
     nodes = NodeRegistry(ORCH.store).active()
     return {"nodes": [n.record for n in nodes]}
@@ -4938,7 +4992,7 @@ async def get_nodes():
     return await get_node()
 
 @app.get("/api/checkpoints")
-async def list_checkpoints(secret: str = ""):
+def list_checkpoints(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     checkpoints = []
     for f in CHECKPOINT_DIR.iterdir():
@@ -4948,7 +5002,7 @@ async def list_checkpoints(secret: str = ""):
     return {"current_step": global_step, "checkpoints": sorted(checkpoints, key=lambda x: x["step"], reverse=True)}
 
 @app.get("/api/admin/clients")
-async def admin_list_clients(secret: str = ""):
+def admin_list_clients(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     now = time.time()
     with pool_lock:
@@ -4978,7 +5032,7 @@ async def admin_list_clients(secret: str = ""):
         "clients": clients}
 
 @app.get("/api/chunk_state")
-async def chunk_state(secret: str = ""):
+def chunk_state(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     with pool_lock:
         pool_snapshot = [{"poolId": p["pool_id"], "status": p["status"], "clients": list(p["clients"]),
@@ -5013,7 +5067,7 @@ async def chunk_state(secret: str = ""):
                            if k in current_data_shard.get("assignedClients", [])}}
 
 @app.post("/api/admin/dissolve_pool")
-async def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
+def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if not pool_id: raise HTTPException(400, "pool_id required")
     with pool_lock:
@@ -5032,7 +5086,7 @@ async def admin_dissolve_pool(secret: str = "", pool_id: str = ""):
     return {"status": "dissolved", "pool_id": pool_id, "clients_freed": freed}
 
 @app.post("/api/admin/reload")
-async def reload_checkpoint(step: int = -1, secret: str = ""):
+def reload_checkpoint(step: int = -1, secret: str = ""):
     global global_weights, global_engram_weights, global_step
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
@@ -5052,7 +5106,7 @@ async def reload_checkpoint(step: int = -1, secret: str = ""):
     return {"status": "reloaded", "step": global_step}
 
 @app.post("/api/admin/push_hf")
-async def force_hf_push(secret: str = ""):
+def force_hf_push(secret: str = ""):
     global last_hf_upload_time
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     last_hf_upload_time = 0
@@ -5061,7 +5115,7 @@ async def force_hf_push(secret: str = ""):
     return {"status": "uploaded" if ok else "failed"}
 
 @app.get("/api/admin/candidate/{part}")
-async def get_candidate(part: str, token: str = ""):
+def get_candidate(part: str, token: str = ""):
     if not _candidate_token or not token or not secrets.compare_digest(token, _candidate_token):
         raise HTTPException(403, "Invalid or expired token")
     p = CANDIDATE_MODEL_FILE if part == "model" else CANDIDATE_ENGRAM_FILE if part == "engram" else None
@@ -5069,7 +5123,7 @@ async def get_candidate(part: str, token: str = ""):
     return FileResponse(str(p), media_type="application/octet-stream", headers={"X-Global-Step": str(global_step)})
 
 @app.api_route("/api/admin/loss_ratchet", methods=["GET", "POST"])
-async def admin_loss_ratchet(secret: str = "", mode: str = ""):
+def admin_loss_ratchet(secret: str = "", mode: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if mode:
         if mode not in ("off", "log", "enforce"): raise HTTPException(400, "mode must be off|log|enforce")
@@ -5082,7 +5136,7 @@ async def admin_loss_ratchet(secret: str = "", mode: str = ""):
             "recent": loss_ratchet_state["history"][-10:]}
 
 @app.post("/api/admin/clear_byzantine_flags")
-async def admin_clear_byzantine(secret: str = "", client_key: str = ""):
+def admin_clear_byzantine(secret: str = "", client_key: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if client_key:
         uid = _user_id_from_key(client_key)
@@ -5105,7 +5159,7 @@ async def admin_clear_byzantine(secret: str = "", client_key: str = ""):
     raise HTTPException(404, "Not found")
 
 @app.post("/api/admin/set_user_stats")
-async def admin_set_user_stats(secret: str = "", user_id: str = "",
+def admin_set_user_stats(secret: str = "", user_id: str = "",
     contributions: Optional[int] = None, byzantine_flags: Optional[int] = None,
     total_tokens: Optional[int] = None, total_steps: Optional[int] = None):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
@@ -5125,22 +5179,67 @@ async def admin_set_user_stats(secret: str = "", user_id: str = "",
         "stats": {k: s.get(k, 0) for k in ("contributions","byzantine_flags","totalTokens","totalSteps")},
         "trustScore": compute_trust_score(s)}
 
-@app.post("/api/admin/reset")
-async def admin_reset(secret: str = ""):
+def _reset_weights_to_init():
+    """Same initialisation as startup (initialize_model): mode-aware base init + N(0, 0.02) engram."""
     global global_weights, global_engram_weights, global_step, global_stats, lora_stats
-    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
-    torch.manual_seed(42)
-    global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
+    global_weights = build_init_weights()
     global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
     global_step = 0
     loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None, "history": []}); _save_loss_state()
     global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
     lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
-    save_latest_checkpoint(); sync_huggingface_state(); update_and_save_status(push_hf=True)
-    return {"status": "reset"}
+    _WN_CACHE.update(step=None, t=0.0, v=0.0)
+
+@app.post("/api/admin/reset")
+def admin_reset(secret: str = "", push: int = 1):
+    """Weights back to init; step, tokens, contributions and loss state to 0.
+    push=0 skips the Hugging Face upload (use it if HF_REPO_ID is not the repo you want overwritten)."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    with shard_lock:
+        _reset_weights_to_init()
+    save_latest_checkpoint()
+    if push:
+        sync_huggingface_state(); update_and_save_status(push_hf=True)
+    else:
+        update_and_save_status(push_hf=False)
+    return {"status": "reset", "pushedToHuggingFace": bool(push), "globalStep": global_step}
+
+@app.post("/api/admin/reset_run")
+def admin_reset_run(secret: str = "", dataset: int = 1, pools_and_round: int = 1, push: int = 0):
+    """Full fresh run: weights/step/tokens/contributions (as /reset) + optionally the dataset position and the
+    live pools/round. Users, tokens and the leaderboard are NOT touched. HF push is off by default."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    cleared = ["weights", "step", "tokens", "contributions", "loss_state"]
+    with shard_lock:
+        if round_state.get("is_aggregating"): raise HTTPException(409, "Aggregation in progress, retry in a minute")
+        _reset_weights_to_init()
+        if dataset:
+            data_position.update({"currentChunkIdx": 0, "epoch": 0, "totalSamplesSeen": 0,
+                                  "permutation": [], "permutationPos": 0, "consumed_through_pos": -1})
+            dataset_stats.update({"totalShardsProcessed": 0, "epochsCompleted": 0, "samplesProcessed": 0, "lastUpdate": None})
+            try: save_dataset_state()
+            except Exception as e: log.warning(f"save_dataset_state: {e}")
+            cleared.append("dataset_position")
+        if pools_and_round:
+            with pool_lock:
+                pools.clear(); client_pool_map.clear(); ready_pools.clear()
+            task_tickets.clear()
+            round_state.update({"current_round": 1, "round_start_time": time.time(),
+                                "participating_clients": {}, "last_aggregation_time": 0.0, "force_end_at": None})
+            cleared.append("pools_and_round")
+    try: _persist_round_state("open")
+    except Exception: pass
+    save_latest_checkpoint()
+    if push:
+        sync_huggingface_state(); update_and_save_status(push_hf=True)
+    else:
+        update_and_save_status(push_hf=False)
+    log.warning(f"🔁 admin reset_run: {cleared} push={bool(push)}")
+    return {"ok": True, "cleared": cleared, "globalStep": global_step, "pushedToHuggingFace": bool(push),
+            "usersPreserved": len(users_db.get("users", {}))}
 
 @app.post("/api/admin/force_round_end")
-async def admin_force_round_end(secret: str = "", minutes: float = 0):
+def admin_force_round_end(secret: str = "", minutes: float = 0):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if minutes < 0 or minutes > 24 * 60: raise HTTPException(400, "minutes must be 0..1440")
     with shard_lock:
@@ -5154,7 +5253,7 @@ async def admin_force_round_end(secret: str = "", minutes: float = 0):
         "endsAt": datetime.fromtimestamp(ends_at, tz=timezone.utc).isoformat()}
 
 @app.delete("/api/admin/force_round_end")
-async def admin_cancel_force_round_end(secret: str = ""):
+def admin_cancel_force_round_end(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     with shard_lock: old = round_state.pop("force_end_at", None)
     _persist_round_state()
@@ -5162,7 +5261,7 @@ async def admin_cancel_force_round_end(secret: str = ""):
         "cancelledAt": datetime.fromtimestamp(old, tz=timezone.utc).isoformat() if old else None}
 
 @app.post("/api/admin/force_update")
-async def admin_force_update(secret: str = "", min_version: str = "", end_round: bool = True):
+def admin_force_update(secret: str = "", min_version: str = "", end_round: bool = True):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if min_version and not _vtuple(min_version): raise HTTPException(400, "min_version must look like 1.9")
     _set_min_client_version(min_version)
@@ -5179,7 +5278,7 @@ async def admin_force_update(secret: str = "", min_version: str = "", end_round:
             "blockUnversioned": _block_unversioned}
 
 @app.get("/api/admin/force_update")
-async def admin_force_update_status(secret: str = ""):
+def admin_force_update_status(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     return {"minClientVersion": _min_client_version or None, "blockUnversioned": _block_unversioned}
 
@@ -5264,7 +5363,7 @@ def _find_user_uuid(user_id: str = "", username: str = "") -> Optional[str]:
     return None
 
 @app.post("/api/admin/power_user")
-async def admin_power_user(secret: str = "", user_id: str = "", username: str = "",
+def admin_power_user(secret: str = "", user_id: str = "", username: str = "",
                            enabled: bool = True, note: str = ""):
     """Make an account a power user (enabled=true, default) or remove it (enabled=false).
     Identify the account by user_id (uuid) or username."""
@@ -5287,7 +5386,7 @@ async def admin_power_user(secret: str = "", user_id: str = "", username: str = 
     return {"status": "power_enabled" if enabled else "power_removed", "user_id": uid, "username": name}
 
 @app.get("/api/admin/power_users")
-async def admin_list_power_users(secret: str = ""):
+def admin_list_power_users(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     with users_lock:
         out = [{"user_id": u["uuid"], "username": u["username"], "since": u.get("power_since"),
@@ -5295,7 +5394,7 @@ async def admin_list_power_users(secret: str = ""):
     return {"count": len(out), "soloWeight": POWER["SOLO_WEIGHT"], "soloEnabled": POWER["SOLO_ENABLED"], "joinAnyPool": POWER["JOIN_ANY_POOL"], "powerUsers": out}
 
 @app.post("/api/admin/ban_user")
-async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
+def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
     hours: int = 0, ban_ip: bool = False, purge_pending: bool = True):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if not user_id: raise HTTPException(400, "user_id required")
@@ -5338,7 +5437,7 @@ async def admin_ban_user(secret: str = "", user_id: str = "", reason: str = "",
         "ips_banned": list(ips) if ban_ip else [], "pending_deltas_purged": purged}
 
 @app.post("/api/admin/unban_user")
-async def admin_unban_user(secret: str = "", user_id: str = ""):
+def admin_unban_user(secret: str = "", user_id: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if not user_id: raise HTTPException(400, "user_id required")
     with users_lock:
@@ -5348,14 +5447,14 @@ async def admin_unban_user(secret: str = "", user_id: str = ""):
     return {"status": "unbanned" if had else "not_banned", "user_id": user_id}
 
 @app.post("/api/admin/ban_ip")
-async def admin_ban_ip(secret: str = "", ip: str = "", reason: str = "", hours: int = 24):
+def admin_ban_ip(secret: str = "", ip: str = "", reason: str = "", hours: int = 24):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if not ip: raise HTTPException(400, "ip required")
     ban_subnet(ip, reason or "admin", hours)
     return {"status": "banned", "ip": ip, "subnet": get_subnet(ip), "hours": hours}
 
 @app.post("/api/admin/clear_subnet_bans")
-async def admin_clear_subnet_bans(secret: str = "", subnet: str = ""):
+def admin_clear_subnet_bans(secret: str = "", subnet: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     with pool_lock:
         if subnet:
@@ -5371,7 +5470,7 @@ async def admin_clear_subnet_bans(secret: str = "", subnet: str = ""):
     return {"status": "cleared", "subnets_cleared": count}
 
 @app.get("/api/admin/bans")
-async def admin_list_bans(secret: str = ""):
+def admin_list_bans(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     now = time.time()
     return {"users": [{"user_id": uid, **b} for uid, b in banned_users.items() if not b.get("until") or b["until"] > now],
@@ -5383,7 +5482,7 @@ async def admin_list_bans(secret: str = ""):
 
 # ============ PUBLIC STATS ============
 @app.get("/api/stats")
-async def get_stats(request: Request):
+def get_stats(request: Request):
     recent = global_stats["lossHistory"][-10:]
     avg_loss = sum(recent) / len(recent) if recent else 0.0
     loss_history = global_stats["lossHistory"]
@@ -5407,7 +5506,7 @@ async def get_stats(request: Request):
         "trainingLossChange": training_loss_change, "yourContribution": your_contribution,
         "activeNow": active_gpus, "totalSteps": global_stats["totalSteps"], "globalStep": global_step,
         "modelSize": MODEL_SIZE, "lastLoss": global_stats["lastLoss"], "avgLoss": avg_loss,
-        "weightNorm": flat_norm(global_weights) if global_weights is not None else 0.0,
+        "weightNorm": _weight_norm_for_stats(),
         "loraStats": lora_stats, "totalUsers": total_users, "activeContributors": active_gpus,
         "lossHistory": global_stats["lossHistory"][-20:],
         "datasetStats": {"totalChunks": dataset_info["totalChunks"], "currentChunk": data_position["currentChunkIdx"],
@@ -5436,11 +5535,11 @@ async def admin_disk(secret: str = ""):
 
 # ============ PUBLIC LOG ENDPOINTS (no secret needed, no private data inside) ============
 @app.get("/api/public_log")
-async def api_public_log(limit: int = 200, type: str = "", since: int = 0):
+def api_public_log(limit: int = 200, type: str = "", since: int = 0):
     return {"events": PUB.tail(limit, type, since)}
 
 @app.get("/api/loss_history")
-async def api_loss_history(rounds: int = 2000, pools: int = 2000):
+def api_loss_history(rounds: int = 2000, pools: int = 2000):
     with PUB._lock:
         r = list(PUB.rounds)[-max(1, min(rounds, 20000)):]
         p = list(PUB.pools)[-max(1, min(pools, 2000)):]
@@ -5448,7 +5547,7 @@ async def api_loss_history(rounds: int = 2000, pools: int = 2000):
             "heldoutLoss (when present) is the server-side evaluator's loss"}
 
 @app.get("/api/proposals")
-async def list_proposals(limit: int = 100):
+def list_proposals(limit: int = 100):
     if ORCH is None: return {"proposals": []}
     return {"proposals": ORCH.proposals.list(limit)}
 
@@ -5463,7 +5562,7 @@ async def create_proposal(request: Request):
         raise HTTPException(400, {"reason": str(exc)})
 
 @app.post("/api/proposals/{proposal_id}/vote")
-async def vote_proposal(proposal_id: str, request: Request):
+def vote_proposal(proposal_id: str, request: Request):
     if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
     actor = (get_current_user(request) or {}).get("uuid") or get_client_key(request)
     try:
@@ -5474,14 +5573,14 @@ async def vote_proposal(proposal_id: str, request: Request):
         raise HTTPException(403, {"reason": str(exc)})
 
 @app.get("/api/leaderboard/verified")
-async def get_verified_leaderboard(limit: int = 100):
+def get_verified_leaderboard(limit: int = 100):
     if ORCH is None:
         return {"source": "verified", "entries": [],
                 "totals": {"actors": 0, "tokens": 0, "submissions": 0}}
     return ORCH.leaderboard.verified(limit)
 
 @app.get("/api/leaderboard/reported")
-async def get_reported_leaderboard():
+def get_reported_leaderboard():
     with users_lock:
         entries = [{"uuid": u["uuid"], "username": u["username"],
                     "contributions": u["stats"].get("contributions", 0),
@@ -5497,7 +5596,7 @@ async def get_reported_leaderboard():
     return ORCH.leaderboard.legacy(entries)
 
 @app.get("/api/leaderboard")
-async def get_leaderboard():
+def get_leaderboard():
     lb_file = BASE_DIR / "leaderboard.json"
     if lb_file.exists():
         try:
@@ -5513,22 +5612,51 @@ async def get_leaderboard():
             "power": bool(u.get("power", False))} for u in users_db["users"].values()]
     return sorted(users_list, key=lambda x: x["totalTokens"], reverse=True)
 
+@app.get("/api/leaderboard/daily")
+def get_daily_leaderboard(date: str = "", days: int = 1, limit: int = 100):
+    """Tokens processed per user over UTC days. `date=YYYY-MM-DD` (default: today, UTC),
+    `days=N` sums that day and the N-1 days before it (1..30), `limit` caps the rows (1..1000).
+    Counts what each user's accepted submissions claimed, same basis as the all-time leaderboard.
+    History starts when this endpoint was deployed."""
+    try: end = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc) if date else datetime.now(timezone.utc)
+    except ValueError: raise HTTPException(400, "date must be YYYY-MM-DD")
+    days = max(1, min(int(days), 30)); limit = max(1, min(int(limit), 1000))
+    keys = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    rows = []
+    with users_lock:
+        for u in users_db["users"].values():
+            d = (u.get("stats") or {}).get("daily") or {}
+            t = st = sub = 0
+            for k in keys:
+                r = d.get(k)
+                if r: t += r.get("tokens", 0); st += r.get("steps", 0); sub += r.get("submissions", 0)
+            if t > 0:
+                rows.append({"uuid": u["uuid"], "username": u["username"], "tokens": t, "steps": st,
+                             "submissions": sub, "power": bool(u.get("power", False))})
+    rows.sort(key=lambda r: r["tokens"], reverse=True)
+    total = sum(r["tokens"] for r in rows)
+    for i, r in enumerate(rows): r["rank"] = i + 1
+    now = datetime.now(timezone.utc)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return {"from": keys[-1], "to": keys[0], "days": days, "timezone": "UTC",
+            "totalTokens": total, "participants": len(rows), "resetsAt": nxt.isoformat(), "leaderboard": rows[:limit]}
+
 @app.get("/api/checkpoint")
-async def get_checkpoint(request: Request, format: str = "bf16"):
+def get_checkpoint(request: Request, format: str = "bf16"):
     if not LATEST_CHECKPOINT_FILE.exists(): raise HTTPException(404, "No checkpoint")
     return StreamingResponse(_stream_f32_file(LATEST_CHECKPOINT_FILE, MODEL_SIZE, format),
         media_type="application/octet-stream",
         headers={"X-Global-Step": str(global_step), "X-Model-Size": str(MODEL_SIZE)})
 
 @app.get("/api/engram_checkpoint")
-async def get_engram_checkpoint(request: Request, format: str = "bf16"):
+def get_engram_checkpoint(request: Request, format: str = "bf16"):
     if not ENGRAM_CHECKPOINT_FILE.exists(): raise HTTPException(404, "No engram checkpoint")
     return StreamingResponse(_stream_f32_file(ENGRAM_CHECKPOINT_FILE, ENG_PARAMS, format),
         media_type="application/octet-stream",
         headers={"X-Global-Step": str(global_step), "X-Engram-Size": str(ENG_PARAMS)})
 
 @app.get("/api/model_info")
-async def get_model_info():
+def get_model_info():
     return {"architecture": MODEL_CONFIG["architecture"], "parameters": MODEL_SIZE, "engramParams": ENG_PARAMS,
         "config": MODEL_CONFIG, "globalStep": global_step, "currentRound": round_state["current_round"],
         "crossCheck": {"enabled": CROSS_CHECK["ENABLED"], "cohortSize": CROSS_CHECK["COHORT_SIZE"],
@@ -5546,7 +5674,7 @@ async def get_model_info():
             "directDownloads": bool(_build_hf_weights_metadata("bf16"))} if HF_ENABLED else {}}
 
 @app.post("/api/admin/restore_from_hf")
-async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int = -1):
+def admin_restore_from_hf(secret: str = "", revision: str = "", step: int = -1):
     global global_weights, global_engram_weights, global_step
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
     if not HF_ENABLED: raise HTTPException(503, "HF disabled")
@@ -5690,6 +5818,15 @@ def wire_anchor_from_env() -> dict | None:
         log.info("⚓ Anchor factory wired: every %s round(s)", state.get("every"))
     return state
 
+import socket
+def _bind_host():
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)   # dual-stack
+        s.bind(("::", 0)); s.close()
+        return "::"
+    except OSError:
+        return "0.0.0.0"          # no IPv6 in this container
 
 if __name__ == "__main__":
     import uvicorn
@@ -5700,4 +5837,17 @@ if __name__ == "__main__":
     file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().setLevel(logging.INFO)
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=False)
+
+    try:
+        import anyio
+        # The route handlers are plain `def` (threadpool). Bound the pool so a burst of polling clients
+        # cannot exhaust pids.max; it must stay well above the number of requests that can wait on a lock.
+        anyio.to_thread.current_default_thread_limiter().total_tokens = int(os.environ.get("CROWDGPT_REQUEST_THREADS", "24"))
+    except Exception as _e: log.warning(f"thread limiter not set: {_e}")
+    import threading as _th
+    try: import resource; _np = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+    except Exception: _np = '?'
+    log.info(f"🔧 Threads: cpu={os.cpu_count()} torch={torch.get_num_threads()} active={_th.active_count()} "
+             f"nproc_soft={_np}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info",
+                access_log=os.environ.get("CROWDGPT_ACCESS_LOG", "1") == "1")
