@@ -146,6 +146,7 @@ from anchor_step import (anchor_state as _anchor_state, resolve_every as _resolv
                          should_anchor as _should_anchor)
 from outer_step import nesterov_update as _outer_nesterov_update, resolve_momentum as _resolve_outer_momentum, \
     streaming_scales as _outer_scales, buffer_bytes as _outer_buffer_bytes
+import pool_policy as POOL_POLICY
 from solo_check import (DEFAULT_FLOOR, accept_unmeasured, check_round_modules,
                         check_round_paradigms, gate_state, select_by_objective,
                         summarise, verdict_by_replay)
@@ -901,7 +902,13 @@ if CROSS_CHECK["TARGET_OPTIMIZER"] not in ("adamw_fp32", "adamw8bit", "any"):
 
 # ============ MATCHMAKING CONFIG ============
 MATCHMAKING = {
-    "POOL_SIZE":         _env_int("CROWDGPT_POOL_SIZE", 3),
+    # Two peers is the default cohort: a round finishes twice as fast as a trio on
+    # a small pool, and the objective gate still has a second opinion to compare.
+    # A peer that has been waiting past STARVED_ADMIT_S may take one extra seat
+    # ("rescue seat") so a straggler joins a pair instead of waiting forever.
+    "POOL_SIZE":         _env_int("CROWDGPT_POOL_SIZE", 2),
+    "POOL_OVERFLOW_MAX": _env_int("CROWDGPT_POOL_OVERFLOW_MAX", 1),
+    "STARVED_ADMIT_S":   _env_int("CROWDGPT_STARVED_ADMIT_S", 600),
     "POOL_TIMEOUT_S":    _env_int("CROWDGPT_POOL_TIMEOUT_S", 4 * 60 * 60),
     "FORMING_TIMEOUT_S": _env_int("CROWDGPT_FORMING_TIMEOUT_S", 30 * 60),
     "HW_BS_TOLERANCE":   _env_float("CROWDGPT_HW_BS_TOLERANCE", 1.0),
@@ -924,6 +931,50 @@ if MATCHMAKING["FP32_SOLO_DISSOLVE_S"] <= MATCHMAKING["BF16_SOLO_DISSOLVE_S"]:
     MATCHMAKING["FP32_SOLO_DISSOLVE_S"] = (
         MATCHMAKING["BF16_SOLO_DISSOLVE_S"] + MATCHMAKING["FORMING_TIMEOUT_S"]
     )
+MATCHMAKING["POOL_OVERFLOW_MAX"] = POOL_POLICY.resolve_overflow_max(MATCHMAKING["POOL_OVERFLOW_MAX"])
+MATCHMAKING["STARVED_ADMIT_S"] = POOL_POLICY.resolve_starved_s(MATCHMAKING["STARVED_ADMIT_S"])
+
+# Peers currently waiting for a task, with the moment they started waiting. The
+# server stamps this itself: a client cannot claim to have been starved, so the
+# rescue seat cannot be requested by asking nicely.
+_WAITERS: dict = {}
+
+
+def _mark_waiting(client_key: str, hw_sig) -> None:
+    _WAITERS.setdefault(client_key, {"since": time.time(), "hw": hw_sig})
+
+
+def _clear_waiting(client_key: str) -> None:
+    _WAITERS.pop(client_key, None)
+
+
+def _waited_s(client_key: str) -> float:
+    entry = _WAITERS.get(client_key)
+    if entry is None:
+        return 0.0
+    return max(0.0, time.time() - float(entry.get("since", time.time())))
+
+
+def _starved_peer_waiting(pool) -> bool:
+    """Is a compatible, distinct peer waiting past the admit threshold?
+
+    Drives the activation target: a pool that reaches its nominal size holds for
+    one more seat only while somebody is actually starved and could take it.
+    """
+    starved = float(MATCHMAKING["STARVED_ADMIT_S"])
+    for key, entry in list(_WAITERS.items()):
+        if key in pool["clients"]:
+            continue
+        if time.time() - float(entry.get("since", time.time())) < starved:
+            continue
+        hw = entry.get("hw")
+        if hw is None or not _pools_compatible(hw, pool["hardware_sig"]):
+            continue
+        if _pool_contains_same_actor(pool, key):
+            continue
+        return True
+    return False
+
 
 def _cohort_seed(shard_id: str) -> int:
     return int(hashlib.sha256(f"crowdgpt_cohort:{shard_id}".encode()).hexdigest()[:8], 16) % (2**31)
@@ -1987,6 +2038,7 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
 
     If no candidates and no solo pool → create a new pool from hw_sig."""
     hw_sig = _hw_signature(client_key)
+    _mark_waiting(client_key, hw_sig)
     my_cc = _compute_cap_for(client_key)
     with pool_lock:
         pid = client_pool_map.get(client_key)
@@ -2001,6 +2053,7 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
                 if not same_round:
                     client_pool_map.pop(client_key, None)
                 elif pool["status"] == "training":
+                    _clear_waiting(client_key)
                     return pool
                 elif pool["status"] == "forming" and len(pool["clients"]) > 1:
                     return pool
@@ -2015,7 +2068,12 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
         for pool in pools.values():
             if pool is existing_solo: continue
             if pool["status"] != "forming": continue
-            if len(pool["clients"]) >= MATCHMAKING["POOL_SIZE"]: continue
+            n_pool = len(pool["clients"])
+            if not POOL_POLICY.admits(n_pool, _waited_s(client_key),
+                                      pool_size=MATCHMAKING["POOL_SIZE"],
+                                      overflow_max=MATCHMAKING["POOL_OVERFLOW_MAX"],
+                                      starved_s=MATCHMAKING["STARVED_ADMIT_S"]):
+                continue
             if not _pools_compatible(hw_sig, pool["hardware_sig"]): continue
             # NEW: never let one actor occupy two slots in the same pool.
             # Closes:
@@ -2025,7 +2083,7 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
             if _pool_contains_same_actor(pool, client_key):
                 log.info(f"🚫 {client_key}: skipping pool {pool['pool_id']} (same actor already present)")
                 continue
-            if power and not POWER["JOIN_ANY_POOL"] and len(pool["clients"]) + 1 < MATCHMAKING["POOL_SIZE"]: continue
+            if power and not POWER["JOIN_ANY_POOL"] and n_pool + 1 < MATCHMAKING["POOL_SIZE"]: continue
             candidates.append(pool)
 
         best = None
@@ -2069,11 +2127,21 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
             client_pool_map[client_key] = best["pool_id"]
             _persist_pool_join(best, client_key)
             n = len(best["clients"])
+            if n > MATCHMAKING["POOL_SIZE"]:
+                best["overflow"] = int(best.get("overflow", 0)) + 1
+                log.info(f"🪑 {client_key}: rescue seat in pool {best['pool_id']} "
+                         f"({n} > {MATCHMAKING['POOL_SIZE']}, waited {_waited_s(client_key):.0f}s)")
             pool_ac = (best["hardware_sig"][2] if len(best["hardware_sig"]) > 2 else "any")
             log.info(f"👥 {client_key} → pool {best['pool_id']} ({n}/{MATCHMAKING['POOL_SIZE']}, "
                      f"backend={hw_sig[0]}, client_ac={hw_sig[2]}, optim={hw_sig[3]}, "
                      f"pool_ac={pool_ac}, priority=fp32-first)")
-            if n >= MATCHMAKING["POOL_SIZE"]: _activate_pool(best)
+            target = POOL_POLICY.activation_target(
+                pool_size=MATCHMAKING["POOL_SIZE"],
+                overflow_max=MATCHMAKING["POOL_OVERFLOW_MAX"],
+                starved_waiting=_starved_peer_waiting(best),
+                forming_age_s=time.time() - float(best.get("created_at", time.time())),
+                forming_timeout_s=MATCHMAKING["FORMING_TIMEOUT_S"])
+            if n >= target: _activate_pool(best)
             return best
 
         if existing_solo is not None:
