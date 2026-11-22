@@ -1451,11 +1451,26 @@ def _flag_byzantine(client_key: str, client_ip: str, reason: str):
         if byzantine_flag_counts[subnet] >= CROSS_CHECK["BAN_THRESHOLD"]:
             ban_subnet(client_ip, f"subnet has {byzantine_flag_counts[subnet]} byzantine flags")
 
+# Deltas whose client declared an OOM-driven batch reduction. They are still
+# judged by the objective gate; they are only spared the byzantine flag, because a
+# smaller effective batch is a legitimate hardware response, not an attack. Before
+# this, a 16 GB volunteer that halved its batch changed its own hardware signature
+# mid-life and its deltas were flagged as cross-check outliers.
+_OOM_EXEMPT = {"count": 0}
+
+
 def _flag_byzantine_from_delta(path: str, reason: str):
     try:
         with open(path, 'rb') as f:
             ml = struct.unpack('<I', f.read(4))[0]
             md = json.loads(f.read(ml).decode('utf-8'))
+        downscales = int(md.get("oomDownscales") or 0)
+        if downscales > 0:
+            _OOM_EXEMPT["count"] += 1
+            log.info(f"🩹 {md.get('nodeKey', 'unknown')}: declared {downscales} OOM "
+                     f"downscale(s) — not flagging ({reason}); the delta is still judged "
+                     f"by the objective gate")
+            return
         _flag_byzantine(md.get("nodeKey", "unknown"), md.get("nodeIp", "unknown"), reason)
     except Exception as e: log.warning(f"Could not flag delta {path}: {e}")
 
@@ -1649,7 +1664,11 @@ def _hw_signature(client_key: str) -> tuple:
     hw = client_hardware.get(client_key) or {}
     backend  = (hw.get("backend")  or "?").upper()
     bs       = int(hw.get("bs") or 0)
-    bucket   = (1 << (bs.bit_length() - 1)) if bs > 0 else 0
+    # Bucket on the value the client declared at startup, never on the live one:
+    # a 16 GB card that halves its batch after an OOM is the same machine, and
+    # re-bucketing it here is what made its deltas look like a different peer's.
+    declared = int(hw.get("bs_declared") or 0) or bs
+    bucket   = (1 << (declared.bit_length() - 1)) if declared > 0 else 0
     autocast = (hw.get("autocast") or "any").lower()
     if POOL_BF16 == "off": autocast = "fp32"     # pools never train in bf16; fp32 pools accept any client
     optim    = (hw.get("optim")    or "any").lower()
@@ -4468,6 +4487,10 @@ def get_task(request: Request, format: str = "bf16", skip_weights: bool = False)
     client_hardware[client_key] = {
         "backend":  (request.headers.get("X-Client-Backend")    or "").upper(),
         "bs":        int(request.headers.get("X-Client-Batch-Size") or 0),
+        # Declared at startup; an OOM downscale lowers "bs" but not this, so a
+        # volunteer that runs out of VRAM keeps one identity for its whole life.
+        "bs_declared": int(request.headers.get("X-Client-Batch-Size-Declared") or 0),
+        "oom_downscales": int(request.headers.get("X-Client-Oom-Downscales") or 0),
         "vram_gb":   float(request.headers.get("X-Client-Vram-Gb")   or 0.0),
         "gpu":       request.headers.get("X-Client-Gpu-Name")      or "",
         "autocast": (request.headers.get("X-Client-Autocast")   or "any").lower(),
