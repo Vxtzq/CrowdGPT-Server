@@ -56,3 +56,30 @@ class EveryCollectionTrimsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MemoryReportTest(unittest.TestCase):
+    """The report is what turns "RAM grows" into a diagnosable number."""
+
+    def test_report_returns_rss_and_does_not_raise(self):
+        rss = server._memory_report("test")
+        self.assertGreater(rss, 1.0)
+        self.assertLess(rss, 1024 * 1024.0)
+
+    def test_active_upload_bytes_is_zero_with_no_uploads(self):
+        saved = getattr(server, "_active_uploads", None)
+        server._active_uploads = {}
+        try:
+            self.assertEqual(server._active_upload_bytes(), 0)
+        finally:
+            if saved is not None:
+                server._active_uploads = saved
+
+    def test_active_upload_bytes_counts_chunks(self):
+        saved = getattr(server, "_active_uploads", None)
+        server._active_uploads = {"u1": {"chunks": [b"x" * 10, b"y" * 5]}}
+        try:
+            self.assertEqual(server._active_upload_bytes(), 15)
+        finally:
+            if saved is not None:
+                server._active_uploads = saved

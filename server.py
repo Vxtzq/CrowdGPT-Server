@@ -429,7 +429,45 @@ def _trim_heap() -> float:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
-    return _rss_mb()
+    return _memory_report("trim")
+
+
+_RSS_MARK = 0.0
+
+
+def _active_upload_bytes() -> int:
+    """Buffered bytes of chunked uploads that have not been finalised.
+
+    A volunteer that abandons a 1.3 GB upload leaves its chunks in memory until
+    the sweeper collects them. If RSS climbs and this number climbs with it, the
+    retainer is a live object and trimming native arenas cannot help.
+    """
+    total = 0
+    for entry in list((globals().get("_active_uploads") or {}).values()):
+        try:
+            total += sum(len(b) for b in (entry.get("chunks") or []))
+        except Exception:
+            total += 0
+    return total
+
+
+def _memory_report(stage: str) -> float:
+    """One line per round boundary: RSS, its delta, and the two plausible retainers.
+
+    Without this, a growing server looks identical whether the memory is free
+    arenas (malloc_trim fixes it) or a live object (it does not), and the logs
+    say nothing either way, which is exactly what was reported.
+    """
+    global _RSS_MARK
+    rss = _rss_mb()
+    delta = rss - _RSS_MARK
+    _RSS_MARK = rss
+    uploads = globals().get("_active_uploads") or {}
+    log.info("📈 memory %s: RSS %.0f MB (delta %+.0f MB), uploads=%d buffered=%.0f MB, pools=%d",
+             stage, rss, delta, len(uploads),
+             _active_upload_bytes() / (1024.0 * 1024.0),
+             len(globals().get("pools") or {}))
+    return rss
 
 
 def _avail_mem_gb() -> float:
