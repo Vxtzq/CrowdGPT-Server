@@ -732,7 +732,9 @@ def _restore_orchestrator_state() -> bool:
         rnd = ORCH.scheduling.load_round()
         if rnd is None:
             return False
-        if rnd.state != "open" or rnd.round != global_step + 1:
+        # Rounds that end without an update advance the round number but not the
+        # step, so compare the step the round was opened at, not round == step + 1.
+        if rnd.state != "open" or rnd.global_step != global_step:
             log.info(f"🗄️ Not restoring round {rnd.round} (state={rnd.state}, globalStep={global_step})")
             return False
         pools_view = ORCH.scheduling.load_pools(round_no=rnd.round,
@@ -1046,13 +1048,11 @@ BAD_WORDS = ["fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt", "b
     "porn", "xxx", "hentai", "admin", "administrator", "root", "system", "moderator", "mod", "staff", "official"]
 
 def load_users_db():
+    """Raises on an unreadable users.json: starting with an empty DB would overwrite every account on the next save."""
     global users_db
-    try:
-        if USERS_DB_FILE.exists():
-            with open(USERS_DB_FILE, 'r', encoding='utf-8') as f: users_db = json.load(f)
-            log.info(f"👥 Loaded {len(users_db['users'])} users from disk")
-    except Exception as e:
-        log.error(f"❌ load_users_db: {e}"); users_db = {"users": {}, "tokens": {}}
+    if USERS_DB_FILE.exists():
+        with open(USERS_DB_FILE, 'r', encoding='utf-8') as f: users_db = json.load(f)
+        log.info(f"👥 Loaded {len(users_db['users'])} users from disk")
 
 DAILY_KEEP_DAYS = 35
 
@@ -1068,9 +1068,15 @@ def _credit_daily(stats: dict, tokens: int, steps: int):
     if len(d) > DAILY_KEEP_DAYS:
         for k in sorted(d)[:len(d) - DAILY_KEEP_DAYS]: d.pop(k, None)
 
+def _write_json_atomic(path: Path, obj) -> None:
+    """Write to a temp file, fsync, then rename, so a crash mid-write never leaves a truncated file."""
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 def save_users_db():
-    try:
-        with open(USERS_DB_FILE, 'w', encoding='utf-8') as f: json.dump(users_db, f, indent=2)
+    try: _write_json_atomic(USERS_DB_FILE, users_db)
     except Exception as e: log.error(f"❌ save_users_db: {e}")
 
 def hash_password(password: str, salt: str) -> str:
@@ -1538,8 +1544,8 @@ def _flag_byzantine_from_delta(path: str, reason: str):
 # ============ DATASET STATE ============
 def save_dataset_state():
     try:
-        with open(DATASET_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump({"datasetInfo": dataset_info, "dataPosition": data_position, "datasetStats": dataset_stats}, f, indent=2)
+        _write_json_atomic(DATASET_CACHE_FILE, {"datasetInfo": dataset_info, "dataPosition": data_position,
+                                                "datasetStats": dataset_stats})
     except Exception as e: log.error(f"❌ save_dataset_state: {e}")
 
 def load_dataset_state():
@@ -2667,27 +2673,29 @@ def save_global_state():
         os.replace(temp_file, GLOBAL_STATE_FILE)
     except Exception as e: log.error(f"❌ Failed to save global_state.json: {e}")
 
-def load_model_weights():
+def load_model_weights() -> bool:
     global global_weights
     if not LATEST_CHECKPOINT_FILE.exists():
-        log.warning("⚠️ model_latest.bin not found. Weights will be random."); return
+        log.warning("⚠️ model_latest.bin not found. Weights will be random."); return False
     try:
         buf = np.fromfile(LATEST_CHECKPOINT_FILE, dtype=np.float32)
         if len(buf) == MODEL_SIZE:
-            global_weights = torch.from_numpy(buf.copy()); log.info("✅ Loaded base model weights")
-        else: log.error(f"❌ model_latest.bin corrupted: expected {MODEL_SIZE}, got {len(buf)}")
+            global_weights = torch.from_numpy(buf.copy()); log.info("✅ Loaded base model weights"); return True
+        log.error(f"❌ model_latest.bin corrupted: expected {MODEL_SIZE}, got {len(buf)}")
     except Exception as e: log.error(f"❌ Failed to load base model weights: {e}")
+    return False
 
-def load_engram_weights():
+def load_engram_weights() -> bool:
     global global_engram_weights
     if not ENGRAM_CHECKPOINT_FILE.exists():
-        log.warning("⚠️ engram_latest.bin not found. Engram will be random."); return
+        log.warning("⚠️ engram_latest.bin not found. Engram will be random."); return False
     try:
         buf = np.fromfile(ENGRAM_CHECKPOINT_FILE, dtype=np.float32)
         if len(buf) == ENG_PARAMS:
-            global_engram_weights = torch.from_numpy(buf.copy()); log.info("✅ Loaded engram weights")
-        else: log.error(f"❌ engram_latest.bin corrupted")
+            global_engram_weights = torch.from_numpy(buf.copy()); log.info("✅ Loaded engram weights"); return True
+        log.error(f"❌ engram_latest.bin corrupted: expected {ENG_PARAMS}, got {len(buf)}")
     except Exception as e: log.error(f"❌ Failed to load engram weights: {e}")
+    return False
 
 def save_model_weights():
     try:
@@ -2940,12 +2948,12 @@ def hf_status_loop():
         time.sleep(300)
 
 def emergency_save():
+    # Registered from startup() only: an import (tests, tools) must never overwrite real state with defaults.
     log.info("🛑 Shutting down, saving final state...")
     try: save_global_state(); save_model_weights(); save_engram_weights(); save_users_db(); save_dataset_state()
     except Exception as e: log.error(f"emergency_save: {e}")
     try: update_and_save_status(push_hf=False)
     except Exception: pass
-atexit.register(emergency_save)
 
 def _server_lr(step: int) -> float:
     base = FL_CONFIG["SERVER_LR"]
@@ -2977,14 +2985,18 @@ def _link_latest(src, dst) -> bool:
 
 def handle_checkpoints():
     try:
+        # Step files may be hard links of *_latest.bin; writing them in place would truncate the
+        # only good checkpoint, so write a new file and rename it over the old name.
         fp = CHECKPOINT_DIR / f"model_step_{global_step}.bin"
-        with open(fp, 'wb') as f:
+        with open(fp.with_suffix('.bin.tmp'), 'wb') as f:
             for i in range(0, MODEL_SIZE, 10_000_000):
                 global_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
+        os.replace(fp.with_suffix('.bin.tmp'), fp)
         fp_eng = CHECKPOINT_DIR / f"engram_step_{global_step}.bin"
-        with open(fp_eng, 'wb') as f:
+        with open(fp_eng.with_suffix('.bin.tmp'), 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
+        os.replace(fp_eng.with_suffix('.bin.tmp'), fp_eng)
         gc.collect()
         if not (_link_latest(fp, LATEST_CHECKPOINT_FILE) and _link_latest(fp_eng, ENGRAM_CHECKPOINT_FILE)):
             save_model_weights(); save_engram_weights()      # filesystem without hard links: old behaviour
@@ -3088,7 +3100,8 @@ def _finish_with_loss_check(step_before: int) -> bool:
         PUB.event("loss_ratchet_reject", step=step, loss=loss, reason=reason)
         log.warning(f"🛑 LOSS RATCHET: step {step} REJECTED; rolling back to {step_before}")
         with shard_lock:
-            load_model_weights(); load_engram_weights()
+            if not (load_model_weights() and load_engram_weights()):
+                log.error("🚨 LOSS RATCHET: rollback reload FAILED; in-memory weights still contain the rejected round")
             with stats_lock: global_step = step_before
         _save_loss_state(); return False
     if verdict == "reject": log.warning(f"🟡 LOSS RATCHET: would reject ({reason})")
@@ -3196,45 +3209,54 @@ def _sweep_orphans():
 def cleanup_loop():
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
-        now = time.time(); now_ms = int(now * 1000)
-        # prune auth rate-limit buckets so memory stays bounded
-        with _auth_rate_lock:
-            for bucket in (_register_attempts, _login_attempts):
-                for k in list(bucket.keys()):
-                    bucket[k] = [t for t in bucket[k] if now - t < 3600]
-                    if not bucket[k]:
-                        del bucket[k]
-        for key in list(active_clients.keys()):
-            if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
-        for k in list(client_hardware.keys()):
-            hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
-            if now - hw_ls > 24 * 3600: del client_hardware[k]
-        for k in list(client_last_submit.keys()):
-            if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
-        for sn in list(blacklisted_subnets.keys()):
-            if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
-        for k in list(banned_client_keys.keys()):
-            if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
-        for k in list(banned_users.keys()):
-            if banned_users[k].get("until") and banned_users[k]["until"] < now: del banned_users[k]
-        task_timeout_ms = 72 * 60 * 60 * 1000
-        expired_tasks = [tid for tid, meta in db["tasks"].items() if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
-        for tid in expired_tasks: del db["tasks"][tid]
-        stale_shards = [sid for sid, meta in db["shardMeta"].items() if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
-        for sid in stale_shards:
-            db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
-        for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
-            if time.time() - f.stat().st_mtime > 18000:
-                try: f.unlink()
-                except Exception: pass
-        _cleanup_expired_uploads()
-        try: _sweep_orphans()
-        except Exception as e: log.error(f"orphan sweep error: {e}")
-        try: _pool_cleanup_tick()
-        except Exception as e: log.error(f"pool cleanup error: {e}")
-        if expired_tasks or stale_shards:
-            log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
-        gc.collect()
+        try:
+            _cleanup_tick()
+        except Exception:
+            # One bad pass (a file or dict entry vanishing mid-scan) must not stop
+            # cleanup for the life of the process.
+            log.exception("cleanup loop error; retrying next interval")
+
+def _cleanup_tick():
+    now = time.time(); now_ms = int(now * 1000)
+    # prune auth rate-limit buckets so memory stays bounded
+    with _auth_rate_lock:
+        for bucket in (_register_attempts, _login_attempts):
+            for k in list(bucket.keys()):
+                bucket[k] = [t for t in bucket[k] if now - t < 3600]
+                if not bucket[k]:
+                    del bucket[k]
+    for key in list(active_clients.keys()):
+        if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
+    for k in list(client_hardware.keys()):
+        hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
+        if now - hw_ls > 24 * 3600: del client_hardware[k]
+    for k in list(client_last_submit.keys()):
+        if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
+    for sn in list(blacklisted_subnets.keys()):
+        if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
+    for k in list(banned_client_keys.keys()):
+        if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
+    for k, ban in list(banned_users.items()):
+        if ban.get("until") and ban["until"] < now: banned_users.pop(k, None)
+    task_timeout_ms = 72 * 60 * 60 * 1000
+    expired_tasks = [tid for tid, meta in list(db["tasks"].items()) if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
+    for tid in expired_tasks: db["tasks"].pop(tid, None)
+    stale_shards = [sid for sid, meta in list(db["shardMeta"].items()) if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
+    for sid in stale_shards:
+        db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
+    for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
+        try:
+            if time.time() - f.stat().st_mtime > 18000: f.unlink()
+        except FileNotFoundError:
+            pass  # removed by aggregation between glob and stat
+    _cleanup_expired_uploads()
+    try: _sweep_orphans()
+    except Exception as e: log.error(f"orphan sweep error: {e}")
+    try: _pool_cleanup_tick()
+    except Exception as e: log.error(f"pool cleanup error: {e}")
+    if expired_tasks or stale_shards:
+        log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
+    gc.collect()
 
 def _bg_hf_upload_and_status():
     if not _mem_guard(8.0, "HF weights upload"):
@@ -4304,7 +4326,8 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
             if ratio < 0.70 or ratio > 1.50:
                 PUB.event("aggregation_reverted", step=step_before, norm_before=pre_norm, norm_after=norm, ratio=ratio)
                 log.error(f"🚨🚨 AGGREGATION SANITY FAIL: norm {pre_norm:.1f} → {norm:.1f} (ratio={ratio:.3f}). Reverting from disk, NOT advancing step.")
-                load_model_weights(); load_engram_weights()
+                if not (load_model_weights() and load_engram_weights()):
+                    log.error("🚨 Revert reload FAILED; in-memory weights still contain the discarded round")
                 if grad_buf is not None:
                     # The round was discarded, so its gradient is not a real gradient:
                     # carrying it would push the next round with momentum from an
@@ -4347,6 +4370,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         else:
             anchored = False
         with stats_lock: global_step += 1
+        save_global_state()
     if anchored:
         PUB.event("anchor_step", step=global_step, loss=_ANCHOR["lastLoss"],
                   every=every, rounds=_ANCHOR["rounds"])
@@ -5846,7 +5870,15 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
 @app.on_event("startup")
 async def startup():
     load_dataset_state(); load_users_db(); load_global_state(); _load_loss_state()
-    initialize_model(); load_model_weights(); load_engram_weights()
+    initialize_model()
+    weights_ok = load_model_weights()
+    engram_ok = load_engram_weights()
+    if global_step > 0 and not (weights_ok and engram_ok):
+        raise RuntimeError(f"Saved state is at step {global_step} but its checkpoint could not be loaded; "
+                           "refusing to continue on random weights. Restore model_latest.bin / "
+                           "engram_latest.bin or reset the run.")
+    # Registered only now: an exit before state is loaded must not overwrite real files with empty state.
+    atexit.register(emergency_save)
     _load_user_countries() 
     initialize_dataset(); _ensure_permutation(); _crash_recovery()
     restored = _restore_orchestrator_state()
@@ -5854,7 +5886,9 @@ async def startup():
         with pool_lock:
             pools.clear(); client_pool_map.clear(); ready_pools.clear()
         round_state["round_start_time"] = time.time()
-        round_state["current_round"] = global_step + 1
+        last = ORCH.scheduling.load_round() if ORCH is not None else None
+        # Never reuse a round number: records and receipts are keyed by round.
+        round_state["current_round"] = max(global_step + 1, (last.round + 1) if last else 0)
         _persist_round_state()
     try:
         if not restored:
@@ -5893,6 +5927,14 @@ async def startup():
     _log_cross_check_summary()
     PUB.event("server_start", step=global_step, round=round_state["current_round"], users=len(users_db["users"]))
     log.info("=" * 60)
+
+
+@app.on_event("shutdown")
+def shutdown():
+    # uvicorn re-raises SIGTERM/SIGINT after a clean shutdown, which skips atexit hooks, so save here.
+    # Not reached when startup() failed, so state that was never loaded is never written.
+    atexit.unregister(emergency_save)
+    emergency_save()
 
 def wire_anchor_from_env() -> dict | None:
     """Register the deployment's anchor step if one was configured.
