@@ -73,23 +73,30 @@ class ActivationTargetTest(unittest.TestCase):
         kw.update(over)
         return kw
 
-    def test_target_is_the_pool_size(self):
+    def test_a_full_pool_starts_immediately(self):
         self.assertEqual(P.activation_target(**self._kw()), 2)
 
-    def test_a_waiting_starved_peer_raises_the_bar_by_one(self):
-        self.assertEqual(P.activation_target(**self._kw(starved_waiting=True)), 3)
+    def test_a_starved_peer_never_holds_a_full_pool_open(self):
+        # Regression: the bar used to rise to pool_size + 1 while a compatible
+        # peer waited past STARVED_ADMIT_S, so a complete pair sat at 2/2 for up
+        # to FORMING_TIMEOUT_S (30 min) waiting for a third that never came.
+        # A full pool must start; a straggler waits for the next one.
+        self.assertEqual(P.activation_target(**self._kw(starved_waiting=True)), 2)
 
-    def test_no_overflow_leaves_the_bar_alone(self):
-        self.assertEqual(
-            P.activation_target(**self._kw(starved_waiting=True, overflow_max=0)), 2)
-
-    def test_a_pool_that_has_waited_too_long_starts_anyway(self):
-        self.assertEqual(
-            P.activation_target(**self._kw(starved_waiting=True, forming_age_s=1800.0)), 2)
-
-    def test_the_bar_never_exceeds_target_plus_one(self):
-        self.assertEqual(
-            P.activation_target(**self._kw(starved_waiting=True, overflow_max=5)), 3)
+    def test_the_bar_never_exceeds_the_target(self):
+        for pool_size in (2, 3, 8):
+            for overflow in (0, 1, 8):
+                for starved in (False, True):
+                    for age in (0.0, 1800.0):
+                        with self.subTest(pool_size=pool_size, overflow=overflow,
+                                          starved=starved, age=age):
+                            self.assertEqual(
+                                P.activation_target(pool_size=pool_size,
+                                                    overflow_max=overflow,
+                                                    starved_waiting=starved,
+                                                    forming_age_s=age,
+                                                    forming_timeout_s=1800.0),
+                                pool_size)
 
 
 class DescribeTest(unittest.TestCase):
