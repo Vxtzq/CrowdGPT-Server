@@ -141,7 +141,8 @@ def read_exact(file_obj, num_bytes):
     return bytes(data)
 
 from krum_stream import (plan_round, stream_add_base_delta, stream_add_base_delta_pair,
-                          read_engram_tail, open_delta, streaming_pairwise_sq_l2)
+                          read_engram_tail, open_delta, streaming_pairwise_sq_l2,
+                          _parse_sparse as _parse_sparse_block)
 from anchor_step import (anchor_state as _anchor_state, resolve_every as _resolve_anchor_every,
                          should_anchor as _should_anchor)
 from outer_step import nesterov_update as _outer_nesterov_update, resolve_momentum as _resolve_outer_momentum, \
@@ -1822,14 +1823,15 @@ def _activate_pool(pool: dict):
     pool_id = pool["pool_id"]
     task_id = f"round_{round_state['current_round']}_{pool_id}"
     target_seed = _cohort_seed(pool_id)
-    BASE_STEPS = 500
+    # Bounds scale with the configured target; the default 500 keeps the old 100-2500 range.
+    BASE_STEPS = CROSS_CHECK["TARGET_LOCAL_STEPS"]
     slowest_client = min(pool["clients"], key=lambda c: client_hardware.get(c, {}).get("vram_gb", 100.0))
     hw = client_hardware.get(slowest_client, {})
     vram_gb = hw.get("vram_gb", 8.0)
     client_bs = max(1, hw.get("bs", 1))
     hw_multiplier = max(0.25, vram_gb / 8.0)
     scaled_steps = int(BASE_STEPS * hw_multiplier)
-    target_steps = max(100, min(2500, scaled_steps))
+    target_steps = max(max(1, BASE_STEPS // 5), min(BASE_STEPS * 5, scaled_steps))
     pool_autocast = _pool_target_autocast(pool)
     pool_optimizer = _pool_target_optimizer(pool)
     pool["target_autocast"] = pool_autocast
@@ -3400,13 +3402,40 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS:
                 raise HTTPException(status_code=400, detail="Invalid engramSparseCount")
             bpp = _bytes_per_param(fmt)
+            delta_codec = str(body.get("deltaCodec") or "off")
+            base_codec = str(body.get("baseCodec") or "dense")
+            if delta_codec not in ("off", "sparse") or base_codec not in ("dense", "sparse"):
+                # Rejected before any norm check so an unreadable codec is never mistaken for a huge delta.
+                raise HTTPException(status_code=400, detail=f"Unsupported delta codec: {delta_codec}/{base_codec}")
+            sparse_idx = sparse_vals = None
+            if base_codec == "sparse":
+                # The client sends top-k entries (crowd_sparse SPK1). Expand them to the dense bf16
+                # layout here so the norm checks, normalisation and merge see one format.
+                if fmt != "bf16":
+                    raise HTTPException(status_code=400, detail="Sparse deltas must be bf16")
+                try: base_bytes = int(body.get("baseBytes") or 0)
+                except (TypeError, ValueError): base_bytes = 0
+                if base_bytes < 12 or base_bytes > 12 + MODEL_SIZE * 6:
+                    raise HTTPException(status_code=400, detail="Invalid baseBytes")
+                try: sparse_idx, sparse_vals = _parse_sparse_block(bytes(read_exact(dec_f, base_bytes)), MODEL_SIZE)
+                except ValueError as e: raise HTTPException(status_code=400, detail=f"Invalid sparse delta: {e}")
+                if sparse_idx.numel() and int(sparse_idx.max()) >= MODEL_SIZE:
+                    raise HTTPException(status_code=400, detail="Sparse index out of range")
+                sparse_idx, order = torch.sort(sparse_idx)
+                sparse_vals = sparse_vals[order]
             with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as tdf:
                 temp_delta_path = tdf.name
             norm_sq = 0.0; offset = 0; has_nan_inf = False
             with open(temp_delta_path, 'wb') as td:
                 while offset < MODEL_SIZE:
                     read_params = min(10_000_000, MODEL_SIZE - offset)
-                    chunk_bytes = dec_f.read(read_params * bpp)
+                    if sparse_idx is not None:
+                        lo, hi = torch.searchsorted(sparse_idx, torch.tensor([offset, offset + read_params])).tolist()
+                        dense = torch.zeros(read_params, dtype=torch.float32)
+                        dense.index_add_(0, sparse_idx[lo:hi] - offset, sparse_vals[lo:hi])
+                        chunk_bytes = _encode_float32_to_bf16_bytes(dense); del dense
+                    else:
+                        chunk_bytes = dec_f.read(read_params * bpp)
                     if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
                         raise HTTPException(status_code=400, detail="Incomplete base delta payload")
                     td.write(chunk_bytes)
