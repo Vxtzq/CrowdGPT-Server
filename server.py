@@ -1606,6 +1606,27 @@ def _flag_byzantine(client_key: str, client_ip: str, reason: str):
 _OOM_EXEMPT = {"count": 0}
 
 
+def _describe_delta_config(md: dict) -> str:
+    """The configuration a peer declared when it submitted, on the flag line.
+
+    A flag without the submitter's own numbers is unactionable. Both false-positive
+    classes this project has hit looked like cheating from the reason alone: a small
+    card halving its batch after an OOM (now declared via oomDownscales) and a
+    pre-degraded CPU-head client embedding from a bf16 cast. Neither was visible in
+    "cross-check outlier in pool X".
+    """
+    keys = ("paradigm", "declaredBatchSize", "actualBatchSize", "oomDownscales",
+            "actualSteps", "headOnGpu", "headDtype", "streamDtype")
+    parts = [f"{k}={md[k]}" for k in keys if md.get(k) is not None]
+    loss = md.get("lastLoss")
+    if isinstance(loss, (int, float)):
+        parts.append(f"loss={float(loss):.4f}")
+    tokens = md.get("tokensProcessed")
+    if isinstance(tokens, (int, float)):
+        parts.append(f"tokens={int(tokens)}")
+    return " ".join(parts) if parts else "no declared config"
+
+
 def _flag_byzantine_from_delta(path: str, reason: str):
     try:
         with open(path, 'rb') as f:
@@ -1618,7 +1639,8 @@ def _flag_byzantine_from_delta(path: str, reason: str):
                      f"downscale(s) — not flagging ({reason}); the delta is still judged "
                      f"by the objective gate")
             return
-        _flag_byzantine(md.get("nodeKey", "unknown"), md.get("nodeIp", "unknown"), reason)
+        _flag_byzantine(md.get("nodeKey", "unknown"), md.get("nodeIp", "unknown"),
+                        f"{reason} [{_describe_delta_config(md)}]")
     except Exception as e: log.warning(f"Could not flag delta {path}: {e}")
 
 # ============ DATASET STATE ============
