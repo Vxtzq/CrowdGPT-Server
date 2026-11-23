@@ -81,19 +81,14 @@ def activation_target(*, pool_size: int, overflow_max: int, starved_waiting: boo
                       forming_age_s: float, forming_timeout_s: float) -> int:
     """How many clients a pool needs before the round may start.
 
-    Defaults to the target. While a compatible starved peer is waiting, the bar
-    rises by at most one so that peer's poll can land as a rescue seat; if the
-    pool has already been forming for `forming_timeout_s`, the bar drops back so
-    an absent peer cannot delay the cohort indefinitely.
+    Always the target. It used to rise by one while a compatible starved peer was
+    waiting, so that peer's next poll could land as a rescue seat; in production
+    that stalled every full pair at 2/2 for up to `forming_timeout_s` (30 min)
+    whenever one straggler was waiting, which costs the whole cohort more than the
+    straggler waiting for the next pool. A complete pool never waits. The rescue
+    seat still exists for pools that are forming anyway -- see `admits()`.
     """
-    target = max(0, int(pool_size))
-    if not starved_waiting:
-        return target
-    if int(overflow_max) <= 0:
-        return target
-    if float(forming_age_s) >= float(forming_timeout_s):
-        return target
-    return target + 1
+    return max(0, int(pool_size))
 
 
 def describe(*, pool_size: int, overflow_max: int, starved_s: int) -> dict:
