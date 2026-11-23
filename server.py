@@ -1064,6 +1064,8 @@ def _starved_peer_waiting(pool) -> bool:
             continue
         if time.time() - float(entry.get("since", time.time())) < starved:
             continue
+        if time.time() - active_clients.get(key, 0) > FL_CONFIG["IP_TIMEOUT_S"]:
+            continue  # stopped polling; its entry is pruned by the cleanup loop
         hw = entry.get("hw")
         if hw is None or not _pools_compatible(hw, pool["hardware_sig"]):
             continue
@@ -1821,7 +1823,8 @@ def _hw_signature(client_key: str) -> tuple:
     optim    = (hw.get("optim")    or "any").lower()
     gpu      = hw.get("gpu") or ""
     cc       = (hw.get("compute_cap") or "").lower()
-    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc)
+    engram   = bool(hw.get("engram", True))
+    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc, engram)
 
 def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     """v2.3 ASYMMETRIC matching — backend exact, optimizer normalize+wildcard,
@@ -1843,6 +1846,10 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     Arch is intentionally ignored (cross-arch tolerated at 5× threshold)."""
     if len(client_sig) < 4 or len(pool_sig) < 4: return False
     if client_sig[0] != pool_sig[0]: return False  # backend exact
+    # Pools saved before the Engram flag have 7-entry signatures; treat them as Engram pools.
+    c_engram = client_sig[7] if len(client_sig) > 7 else True
+    p_engram = pool_sig[7] if len(pool_sig) > 7 else True
+    if c_engram != p_engram: return False  # an Engram-less delta has no Engram tail to merge
 
     def _norm_opt(s):
         s = str(s or "any").lower()
@@ -3308,6 +3315,8 @@ def cleanup_loop():
                         del bucket[k]
         for key in list(active_clients.keys()):
             if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
+        for key in list(_WAITERS.keys()):
+            if key not in active_clients: _WAITERS.pop(key, None)
         for k in list(client_hardware.keys()):
             hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
             if now - hw_ls > 24 * 3600: del client_hardware[k]
@@ -4718,6 +4727,7 @@ def get_task(request: Request, format: str = "bf16", skip_weights: bool = False)
                             request.headers.get("X-Client-Gpu-Name") or "",
                             request.headers.get("X-Client-Backend") or "")),
         "client_ip": client_ip,             # ← NEW: used by same-actor pool check
+        "engram": request.headers.get("X-Client-Engram", "1") != "0",
         "last_seen": time.time(),
     }
     hw = client_hardware[client_key]
@@ -5367,6 +5377,7 @@ def reload_checkpoint(request: Request = None, step: int = -1, secret: str = "")
                 buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
                 if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
             global_step = step
+        _OUTER.update(grad=None, rounds=0)  # momentum from the replaced weights would push the reloaded ones
         loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None}); _save_loss_state()
         save_latest_checkpoint()
     sync_huggingface_state(); update_and_save_status(push_hf=True)
@@ -5452,6 +5463,7 @@ def _reset_weights_to_init():
     global_weights = build_init_weights()
     global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
     global_step = 0
+    _OUTER.update(grad=None, rounds=0)
     loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None, "history": []}); _save_loss_state()
     global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
     lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
@@ -5696,7 +5708,16 @@ def admin_ban_user(request: Request = None, secret: str = "", user_id: str = "",
                 else: kept.append(p)
             round_state["pending_deltas"] = kept
         with pool_lock:
-            for pool in pools.values():
+            for pid, pool in list(pools.items()):
+                if pool["status"] == "forming":
+                    gone = [c for c in pool["clients"] if _user_id_from_key(c) == user_id]
+                    for c in gone:
+                        pool["clients"].remove(c)
+                        if client_pool_map.get(c) == pid: client_pool_map.pop(c, None)
+                    if gone and not pool["clients"]:
+                        pools.pop(pid, None); _persist_pool_removed(pid)
+                    elif gone:
+                        _persist_pool_join(pool, pool["clients"][0])
                 for ck in list(pool["deltas"].keys()):
                     if _user_id_from_key(ck) == user_id:
                         try: os.remove(pool["deltas"][ck])

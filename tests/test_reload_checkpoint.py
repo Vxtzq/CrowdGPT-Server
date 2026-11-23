@@ -116,6 +116,7 @@ class ReloadCheckpointTest(unittest.TestCase):
             "loss_ratchet_state": {"lastAcceptedLoss": 1.0, "lastAcceptedStep": 500},
             "round_state": {"is_aggregating": False},
             "shard_lock": __import__("threading").RLock(),
+            "_OUTER": {"grad": None, "momentum": None, "rounds": 0},
             # Admin auth is covered by tests/test_admin_secret_header.py; here the
             # header path is irrelevant, so resolve straight to the query value.
             "_admin_secret": lambda request, secret="": secret,
