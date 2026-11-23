@@ -197,6 +197,54 @@ class UploadToAggregationTest(unittest.TestCase):
         self.assertEqual(md["accum"], 250)
         os.remove(dpath)
 
+    def _submit_raw(self, header_extra, base_bytes, *, compress=True):
+        body = {"taskId": "task-1", "loss": 3.5, "localSteps": 500, "tokensProcessed": 10,
+                "loraRank": 0, "isDelta": True, "weightFormat": "bf16", "hasEngram": False,
+                "engramSparseCount": 0, "crossCheckUsed": False, **header_extra}
+        hdr = json.dumps(body).encode()
+        raw = struct.pack("<I", len(hdr)) + hdr + base_bytes
+        path = os.path.join(self.tmp, "payload_raw.bin")
+        with open(path, "wb") as f:
+            f.write(gzip.compress(raw) if compress else raw)
+        return server.process_compressed_payload(path, "127.0.0.1", CLIENT_KEY, _Req(), None)
+
+    def test_sparse_upload_is_stored_dense(self):
+        """Client `deltaCodec=sparse` writes an SPK1 block (crowd_sparse.encode_block) as the base."""
+        idx = np.array([5, 1], dtype=np.uint32)
+        vals = torch.tensor([0.25, -0.5]).to(torch.bfloat16)
+        block = (b"SPK1" + struct.pack("<II", 2, MODEL_SIZE) + idx.tobytes()
+                 + vals.view(torch.int16).numpy().astype(np.uint16).tobytes())
+        self._submit_raw({"deltaCodec": "sparse", "baseCodec": "sparse",
+                          "baseBytes": len(block), "baseCount": 2}, block)
+        dpath = server.pools["p1"]["deltas"][CLIENT_KEY]
+        df = server.open_delta(dpath, MODEL_SIZE)
+        with open(dpath, "rb") as f:
+            f.seek(df.base_offset)
+            stored = torch.frombuffer(bytearray(f.read(MODEL_SIZE * 2)), dtype=torch.int16)
+        expected = [0.0] * MODEL_SIZE
+        expected[1], expected[5] = -0.5, 0.25
+        self.assertEqual(stored.view(torch.bfloat16).float().tolist(), expected)
+        os.remove(dpath)
+
+    def test_sparse_index_out_of_range_is_rejected(self):
+        idx = np.array([MODEL_SIZE], dtype=np.uint32)
+        vals = torch.tensor([1.0]).to(torch.bfloat16)
+        block = (b"SPK1" + struct.pack("<II", 1, MODEL_SIZE) + idx.tobytes()
+                 + vals.view(torch.int16).numpy().astype(np.uint16).tobytes())
+        with self.assertRaises(server.HTTPException) as cm:
+            self._submit_raw({"deltaCodec": "sparse", "baseCodec": "sparse",
+                              "baseBytes": len(block), "baseCount": 1}, block)
+        self.assertEqual(cm.exception.status_code, 400)
+        self.assertNotIn(CLIENT_KEY, server.pools["p1"]["deltas"])
+
+    def test_unsupported_codec_is_rejected_not_banned(self):
+        """ngd1 is not decoded server-side; it must be a plain 400, not a norm-check ban."""
+        with self.assertRaises(server.HTTPException) as cm:
+            self._submit_raw({"deltaCodec": "ngd1"}, b"NGD2" + b"\0" * 32, compress=False)
+        self.assertEqual(cm.exception.status_code, 400)
+        self.assertIn("Unsupported delta codec", str(cm.exception.detail))
+        self.assertNotIn(CLIENT_KEY, server.pools["p1"]["deltas"])
+
 
 if __name__ == "__main__":
     unittest.main()
