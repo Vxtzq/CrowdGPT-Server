@@ -5809,6 +5809,27 @@ def admin_list_bans(request: Request = None, secret: str = ""):
         "is_aggregating": round_state.get("is_aggregating", False)}
 
 # ============ PUBLIC STATS ============
+_STARTED_AT = time.time()
+
+
+@app.get("/health")
+async def health():
+    """Liveness for uptime checks and the site status pill.
+
+    Deliberately cheap: no model work, no disk, no locks. A monitor has to be able
+    to tell "the process is up" apart from "the process is gone" without competing
+    with a round for the coordinator's memory, and a missing /health makes a
+    healthy server look offline to anything that probes it.
+    """
+    return {
+        "status": "ok",
+        "round": int(round_state.get("current_round", 0) or 0),
+        "aggregating": bool(round_state.get("is_aggregating", False)),
+        "uptimeSeconds": round(time.time() - _STARTED_AT, 1),
+        "modelSize": int(MODEL_SIZE),
+    }
+
+
 @app.get("/api/stats")
 def get_stats(request: Request):
     recent = global_stats["lossHistory"][-10:]
