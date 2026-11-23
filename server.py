@@ -1513,11 +1513,12 @@ def get_client_key(request: Request) -> str:
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
-        with users_lock:
-            user_uuid = users_db["tokens"].get(token)
-            if user_uuid:
-                dev = _sanitize_device_id(request.headers.get("X-Client-Device"))
-                return f"user:{user_uuid}:dev:{dev}" if dev else f"user:{user_uuid}"
+        # Runs on the event loop (country middleware); one dict read is atomic, and taking users_lock
+        # here would stall every request behind a users.json rewrite.
+        user_uuid = users_db["tokens"].get(token)
+        if user_uuid:
+            dev = _sanitize_device_id(request.headers.get("X-Client-Device"))
+            return f"user:{user_uuid}:dev:{dev}" if dev else f"user:{user_uuid}"
     # Anonymous clients stay ip-keyed — no device suffix, keeps NAT ambiguity intact
     return f"ip:{get_client_ip(request)}"
 
@@ -2611,12 +2612,17 @@ def _complete_pool_sync(pool: dict):
         _pub_pool_result(pool, survivors)
         # read the A3 metadata before taking the pool lock (it touches the delta headers on disk)
         stats = _pool_delta_stats(survivors) if survivors else {"tokens": 0, "optimizerSteps": None}
+        power_solo = bool(survivors) and pool.get("power") and len(pool["clients"]) == 1
+        # The merge reads and writes several GB; do it before taking pool_lock so
+        # matchmaking, heartbeats and round status are not stalled behind it.
+        merged = None
+        if survivors and not power_solo and len(survivors) > 1:
+            merged = _merge_pool_deltas(pool_id, survivors)
         with pool_lock:
-            if survivors and pool.get("power") and len(pool["clients"]) == 1:
+            if power_solo:
                 _merge_power_solo(pool, survivors)
             elif survivors:
                 if len(survivors) > 1:
-                    merged = _merge_pool_deltas(pool_id, survivors)
                     if merged:
                         ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
                                             "deltas": [(merged, 1.0)],
@@ -4622,10 +4628,12 @@ def get_round_status(request: Request):
     if _reason: raise HTTPException(status_code=403, detail=_reason)
     client_key = get_client_key(request)
     active_clients[client_key] = time.time()
-    with shard_lock:
-        if client_key not in round_state["participating_clients"]:
-            round_state["participating_clients"][client_key] = {"joined": time.time(), "submitted": False, "ultimatum_sent": False}
-            _persist_round_state()
+    # Aggregation holds shard_lock for minutes; known clients must not queue behind it on every poll.
+    if client_key not in round_state["participating_clients"]:
+        with shard_lock:
+            if client_key not in round_state["participating_clients"]:
+                round_state["participating_clients"][client_key] = {"joined": time.time(), "submitted": False, "ultimatum_sent": False}
+                _persist_round_state()
     in_cooldown = (time.time() - round_state["last_aggregation_time"]) < ROUND_CONFIG["AGGREGATION_COOLDOWN_SEC"]
     round_elapsed_hours = (time.time() - round_state["round_start_time"]) / 3600
     time_left = round_state["round_duration_hours"] - round_elapsed_hours
@@ -4753,7 +4761,7 @@ async def object_put(request: Request, key: str, exp: int, sha256: str, sig: str
                     raise HTTPException(413, "Object too large")
                 f.write(chunk)
         if total == 0: raise HTTPException(400, "Empty object")
-        result = OBJECT_STORE.commit_file(key, tmp, expected_sha256=sha256)
+        result = await run_in_threadpool(OBJECT_STORE.commit_file, key, tmp, expected_sha256=sha256)
         return {"ok": True, **result}
     except ValueError as e:
         raise HTTPException(400, {"reason": str(e)})
@@ -4812,6 +4820,10 @@ async def submit_init(request: Request):
     try: data = await request.json()
     except ClientDisconnect: raise HTTPException(status_code=499, detail="Client disconnected before init body")
     except Exception: raise HTTPException(status_code=400, detail="Invalid JSON")
+    # Validation takes pool_lock and uploads_lock (threading locks); keep them off the event loop.
+    return await run_in_threadpool(_init_upload, request, data, client_ip, client_key)
+
+def _init_upload(request: Request, data: dict, client_ip: str, client_key: str):
     required = ["taskId", "totalBytes", "chunkSize", "chunks", "checksum", "weightFormat", "hasEngram", "engramSparseCount"]
     for k in required:
         if k not in data: raise HTTPException(status_code=400, detail=f"Missing field: {k}")
@@ -4979,6 +4991,10 @@ async def submit_finalize(request: Request):
     except Exception: raise HTTPException(400, "Invalid JSON")
     upload_id = data.get("uploadId")
     if not _valid_upload_id(upload_id): raise HTTPException(400, "Invalid uploadId")
+    # Assembling and hashing the upload reads up to several GB; do it in a worker thread.
+    return await run_in_threadpool(_finalize_upload, request, data, upload_id)
+
+def _finalize_upload(request: Request, data: dict, upload_id: str):
     if ORCH is not None:
         _replay = ORCH.submission.get_upload_result(upload_id, client_key=get_client_key(request))
         if _replay is not None:
@@ -5007,7 +5023,7 @@ async def submit_finalize(request: Request):
         client_key = up.get("client_key") or get_client_key(request)
         up["status"] = "finalizing"; up["last_activity"] = time.time()
         try:
-            result = await run_in_threadpool(_guarded_process, str(OBJECT_STORE.path_for(str(object_key))),
+            result = _guarded_process(str(OBJECT_STORE.path_for(str(object_key))),
                                              client_ip, client_key, request, up["meta"])
             if ORCH is not None:
                 try: ORCH.submission.complete_upload(upload_id, result)
@@ -5054,7 +5070,7 @@ async def submit_finalize(request: Request):
                         out.write(b); h.update(b)
         if total != up["total_bytes"]: raise HTTPException(400, "Size mismatch")
         if h.hexdigest() != up["checksum"]: raise HTTPException(400, "Checksum mismatch")
-        result = await run_in_threadpool(_guarded_process, str(compressed_path), client_ip, client_key, request, up["meta"])
+        result = _guarded_process(str(compressed_path), client_ip, client_key, request, up["meta"])
         completed = True
         if ORCH is not None:
             try: ORCH.submission.complete_upload(upload_id, result)
@@ -5089,6 +5105,10 @@ async def register(request: Request):
     try: data = await request.json()
     except ClientDisconnect: raise HTTPException(499, "Client disconnected")
     except Exception: raise HTTPException(400, "Invalid JSON")
+    # Password hashing and the users.json rewrite are slow; keep them off the event loop.
+    return await run_in_threadpool(_register_user, data)
+
+def _register_user(data: dict):
     username = data.get("username", "").strip(); email = data.get("email", "").strip()
     password = data.get("password", "")
     if not username or not (3 <= len(username) <= 20): raise HTTPException(400, "Username 3-20 chars")
@@ -5096,16 +5116,17 @@ async def register(request: Request):
     if contains_bad_word(username): raise HTTPException(400, "Prohibited words")
     if not email or "@" not in email: raise HTTPException(400, "Invalid email")
     if not password or len(password) < 6: raise HTTPException(400, "Password too short")
+    salt = secrets.token_hex(16); password_hash = hash_password(password, salt)
     with users_lock:
         for u in users_db["users"].values():
             if u["username_lower"] == username.lower():
                 if _is_user_banned(u["uuid"]): raise HTTPException(403, "Username belongs to a suspended account")
                 raise HTTPException(400, "Username taken")
             if u.get("email", "").lower() == email.lower(): raise HTTPException(400, "Email registered")
-        user_uuid = str(uuid.uuid4()); salt = secrets.token_hex(16); token = generate_token()
+        user_uuid = str(uuid.uuid4()); token = generate_token()
         users_db["users"][user_uuid] = {
             "uuid": user_uuid, "username": username, "username_lower": username.lower(),
-            "email": email, "password_hash": hash_password(password, salt), "salt": salt,
+            "email": email, "password_hash": password_hash, "salt": salt,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "stats": {"contributions": 0, "totalTokens": 0, "totalSteps": 0, "byzantine_flags": 0}}
         users_db["tokens"][token] = user_uuid
@@ -5122,12 +5143,17 @@ async def auth_login(request: Request):
     try: data = await request.json()
     except ClientDisconnect: raise HTTPException(499, "Client disconnected")
     except Exception: raise HTTPException(400, "Invalid JSON")
+    return await run_in_threadpool(_login_user, data)
+
+def _login_user(data: dict):
     username = data.get("username", "").strip(); password = data.get("password", "")
     with users_lock:
         user = next((u for u in users_db["users"].values() if u["username_lower"] == username.lower()), None)
-        if not user: raise HTTPException(401, "Invalid credentials")
-        if _is_user_banned(user["uuid"]): raise HTTPException(403, "Account suspended")
-        if hash_password(password, user["salt"]) != user["password_hash"]: raise HTTPException(401, "Invalid credentials")
+    if not user: raise HTTPException(401, "Invalid credentials")
+    if _is_user_banned(user["uuid"]): raise HTTPException(403, "Account suspended")
+    if not secrets.compare_digest(hash_password(password, user["salt"]), user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+    with users_lock:
         token = generate_token(); users_db["tokens"][token] = user["uuid"]; save_users_db()
         log.info(f"✅ Login {username}")
     return {"token": token, "uuid": user["uuid"], "username": user["username"]}
