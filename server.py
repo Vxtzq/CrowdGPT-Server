@@ -111,6 +111,7 @@ except Exception: pass
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
+import anyio
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import ipaddress
@@ -5104,8 +5105,8 @@ def get_node():
     return {"nodes": [n.record for n in nodes]}
 
 @app.get("/api/nodes")
-async def get_nodes():
-    return await get_node()
+def get_nodes():
+    return get_node()
 
 @app.get("/api/checkpoints")
 def list_checkpoints(request: Request = None, secret: str = ""):
@@ -5205,20 +5206,24 @@ def admin_dissolve_pool(request: Request = None, secret: str = "", pool_id: str 
 def reload_checkpoint(request: Request = None, step: int = -1, secret: str = ""):
     global global_weights, global_engram_weights, global_step
     if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
-    if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
-    else:
-        cp_file = CHECKPOINT_DIR / f"model_step_{step}.bin"
-        if not cp_file.exists(): raise HTTPException(404, "Not found")
-        buf = np.fromfile(cp_file, dtype=np.float32)
-        if len(buf) != MODEL_SIZE: raise HTTPException(400, "Size mismatch")
-        global_weights = torch.from_numpy(buf.copy())
-        cp_eng_file = CHECKPOINT_DIR / f"engram_step_{step}.bin"
-        if cp_eng_file.exists():
-            buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
-            if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
-        global_step = step
-    loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None}); _save_loss_state()
-    save_latest_checkpoint(); sync_huggingface_state(); update_and_save_status(push_hf=True)
+    # Admin routes run in the threadpool, so a reload could otherwise swap the weights in the middle of a merge.
+    with shard_lock:
+        if round_state.get("is_aggregating"): raise HTTPException(409, "Aggregation in progress, retry in a minute")
+        if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
+        else:
+            cp_file = CHECKPOINT_DIR / f"model_step_{step}.bin"
+            if not cp_file.exists(): raise HTTPException(404, "Not found")
+            buf = np.fromfile(cp_file, dtype=np.float32)
+            if len(buf) != MODEL_SIZE: raise HTTPException(400, "Size mismatch")
+            global_weights = torch.from_numpy(buf.copy())
+            cp_eng_file = CHECKPOINT_DIR / f"engram_step_{step}.bin"
+            if cp_eng_file.exists():
+                buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
+                if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
+            global_step = step
+        loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None}); _save_loss_state()
+        save_latest_checkpoint()
+    sync_huggingface_state(); update_and_save_status(push_hf=True)
     return {"status": "reloaded", "step": global_step}
 
 @app.post("/api/admin/push_hf")
@@ -5312,6 +5317,7 @@ def admin_reset(request: Request = None, secret: str = "", push: int = 1):
     push=0 skips the Hugging Face upload (use it if HF_REPO_ID is not the repo you want overwritten)."""
     if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with shard_lock:
+        if round_state.get("is_aggregating"): raise HTTPException(409, "Aggregation in progress, retry in a minute")
         _reset_weights_to_init()
     save_latest_checkpoint()
     if push:
@@ -5868,6 +5874,11 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
 # ============ STARTUP ============
 @app.on_event("startup")
 async def startup():
+    # The route handlers are plain `def` (threadpool). Bound the pool so a burst of polling clients
+    # cannot exhaust pids.max; it must stay well above the number of requests that can wait on a lock.
+    # Set here because the limiter only exists inside the running event loop.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = int(os.environ.get("CROWDGPT_REQUEST_THREADS", "24"))
+    log.info(f"🔧 Request thread pool: {anyio.to_thread.current_default_thread_limiter().total_tokens}")
     load_dataset_state(); load_users_db(); load_global_state(); _load_loss_state()
     initialize_model(); load_model_weights(); load_engram_weights()
     _load_user_countries() 
@@ -5955,12 +5966,6 @@ if __name__ == "__main__":
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().setLevel(logging.INFO)
 
-    try:
-        import anyio
-        # The route handlers are plain `def` (threadpool). Bound the pool so a burst of polling clients
-        # cannot exhaust pids.max; it must stay well above the number of requests that can wait on a lock.
-        anyio.to_thread.current_default_thread_limiter().total_tokens = int(os.environ.get("CROWDGPT_REQUEST_THREADS", "24"))
-    except Exception as _e: log.warning(f"thread limiter not set: {_e}")
     import threading as _th
     try: import resource; _np = resource.getrlimit(resource.RLIMIT_NPROC)[0]
     except Exception: _np = '?'
