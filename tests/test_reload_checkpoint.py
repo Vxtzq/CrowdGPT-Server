@@ -9,7 +9,6 @@ tiny stub that supports the operations the extracted code uses.
 Run:  python3 -m unittest discover -s tests -v
 """
 import ast
-import asyncio
 import logging
 import os
 import tempfile
@@ -115,6 +114,8 @@ class ReloadCheckpointTest(unittest.TestCase):
             "global_engram_weights": _FakeTensor(self.old_engram.copy()),
             "global_step": 500,
             "loss_ratchet_state": {"lastAcceptedLoss": 1.0, "lastAcceptedStep": 500},
+            "round_state": {"is_aggregating": False},
+            "shard_lock": __import__("threading").RLock(),
             # Admin auth is covered by tests/test_admin_secret_header.py; here the
             # header path is irrelevant, so resolve straight to the query value.
             "_admin_secret": lambda request, secret="": secret,
@@ -136,7 +137,7 @@ class ReloadCheckpointTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _reload(self, step, secret="ok"):
-        return asyncio.run(self.ns["reload_checkpoint"](step=step, secret=secret))
+        return self.ns["reload_checkpoint"](step=step, secret=secret)
 
     def _step_files(self, step, model, engram=None):
         _write_f32(self.dir / f"model_step_{step}.bin", model)
@@ -251,6 +252,16 @@ class ReloadCheckpointTest(unittest.TestCase):
             self._reload(100, secret="wrong")
         self.assertEqual(cm.exception.status_code, 403)
 
+    def test_reload_during_aggregation_returns_409_without_side_effects(self):
+        self._step_files(100, np.arange(MODEL_SIZE, dtype=np.float32))
+        self.ns["round_state"]["is_aggregating"] = True
+        with self.assertRaises(_HTTPException) as cm:
+            self._reload(100)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(self.ns["global_step"], 500)
+        np.testing.assert_array_equal(self.ns["global_weights"].arr, self.old_model)
+        self.assertEqual(self.calls, [])
+
     def test_reload_latest_loads_engram_from_latest_file(self):
         model = np.arange(MODEL_SIZE, dtype=np.float32)
         engram = np.arange(ENG_PARAMS, dtype=np.float32) + 100
@@ -337,7 +348,7 @@ class GlobalDeclarationTest(unittest.TestCase):
     def test_guard_detects_original_reload_bug(self):
         # server.py as it was before the fix, rebuilt in memory only.
         head = ('@app.post("/api/admin/reload")\n'
-                'async def reload_checkpoint(request: Request = None, step: int = -1, secret: str = ""):\n')
+                'def reload_checkpoint(request: Request = None, step: int = -1, secret: str = ""):\n')
         fixed = head + "    global global_weights, global_engram_weights, global_step\n"
         source = SERVER_PY.read_text(encoding="utf-8")
         self.assertEqual(source.count(fixed), 1)
