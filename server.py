@@ -404,6 +404,74 @@ def build_init_weights(cfg: Optional[dict] = None, mode: Optional[str] = None):
 
 
 # ============ MEMORY GUARDS ============
+def _rss_mb() -> float:
+    """Resident set size in MB — the number an OOM actually measures."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _trim_heap() -> float:
+    """Return freed arenas to the OS instead of keeping them in the heap.
+
+    A round boundary allocates and drops several full-model buffers: a delta read
+    is ~1.3 GB raw plus ~1.3 GB converted plus a 2.5 GB fp32 view, and a
+    checkpoint save is another 2.5 GB fp32. CPython frees them and glibc keeps the
+    arena, so VmRSS ratchets a few GB per round while the live heap stays flat —
+    which is how a 2.5 GB model walks into OOM after three rounds. malloc_trim(0)
+    releases the free tops back to the kernel. Returns the RSS afterwards, in MB.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    return _memory_report("trim")
+
+
+_RSS_MARK = 0.0
+
+
+def _active_upload_bytes() -> int:
+    """Buffered bytes of chunked uploads that have not been finalised.
+
+    A volunteer that abandons a 1.3 GB upload leaves its chunks in memory until
+    the sweeper collects them. If RSS climbs and this number climbs with it, the
+    retainer is a live object and trimming native arenas cannot help.
+    """
+    total = 0
+    for entry in list((globals().get("_active_uploads") or {}).values()):
+        try:
+            total += sum(len(b) for b in (entry.get("chunks") or []))
+        except Exception:
+            total += 0
+    return total
+
+
+def _memory_report(stage: str) -> float:
+    """One line per round boundary: RSS, its delta, and the two plausible retainers.
+
+    Without this, a growing server looks identical whether the memory is free
+    arenas (malloc_trim fixes it) or a live object (it does not), and the logs
+    say nothing either way, which is exactly what was reported.
+    """
+    global _RSS_MARK
+    rss = _rss_mb()
+    delta = rss - _RSS_MARK
+    _RSS_MARK = rss
+    uploads = globals().get("_active_uploads") or {}
+    log.info("📈 memory %s: RSS %.0f MB (delta %+.0f MB), uploads=%d buffered=%.0f MB, pools=%d",
+             stage, rss, delta, len(uploads),
+             _active_upload_bytes() / (1024.0 * 1024.0),
+             len(globals().get("pools") or {}))
+    return rss
+
+
 def _avail_mem_gb() -> float:
     if _HAS_PSUTIL: return psutil.virtual_memory().available / (1024 ** 3)
     try:
@@ -2715,7 +2783,7 @@ def save_model_weights():
         with open(temp_file, 'wb') as f:
             for i in range(0, MODEL_SIZE, 10_000_000):
                 global_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
-        gc.collect(); os.replace(temp_file, LATEST_CHECKPOINT_FILE)
+        gc.collect(); _trim_heap(); os.replace(temp_file, LATEST_CHECKPOINT_FILE)
     except Exception as e: log.error(f"❌ Failed to save base model weights: {e}")
 
 def save_engram_weights():
@@ -2724,7 +2792,7 @@ def save_engram_weights():
         with open(temp_file, 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
-        gc.collect(); os.replace(temp_file, ENGRAM_CHECKPOINT_FILE)
+        gc.collect(); _trim_heap(); os.replace(temp_file, ENGRAM_CHECKPOINT_FILE)
     except Exception as e: log.error(f"❌ Failed to save engram weights: {e}")
 
 def save_latest_checkpoint(): save_global_state(); save_model_weights(); save_engram_weights()
@@ -2833,7 +2901,7 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                     src = global_weights if fn.startswith("model_") else global_engram_weights
                     w = src.cpu().to(dtype)
                     save_file({"weights": w}, str(temp_dir / fn))
-                    del w; gc.collect()
+                    del w; gc.collect(); _trim_heap()
                 config_data = {"architecture": MODEL_CONFIG["architecture"], "vocabSize": MODEL_CONFIG["vocabSize"],
                     "dim": MODEL_CONFIG["dim"], "nLayers": MODEL_CONFIG["nLayers"],
                     "nHeads": MODEL_CONFIG["nHeads"], "nKvHeads": MODEL_CONFIG["nKvHeads"],
@@ -3005,7 +3073,7 @@ def handle_checkpoints():
         with open(fp_eng, 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
-        gc.collect()
+        gc.collect(); _trim_heap()
         if not (_link_latest(fp, LATEST_CHECKPOINT_FILE) and _link_latest(fp_eng, ENGRAM_CHECKPOINT_FILE)):
             save_model_weights(); save_engram_weights()      # filesystem without hard links: old behaviour
         with open(CHECKPOINT_DIR / f"model_step_{global_step}.json", 'w', encoding='utf-8') as f:
@@ -3254,7 +3322,7 @@ def cleanup_loop():
         except Exception as e: log.error(f"pool cleanup error: {e}")
         if expired_tasks or stale_shards:
             log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
-        gc.collect()
+        gc.collect(); _trim_heap()
 
 def _bg_hf_upload_and_status():
     if not _mem_guard(8.0, "HF weights upload"):
@@ -4311,7 +4379,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
             finally:
                 try: os.remove(path)
                 except Exception: pass
-                gc.collect()
+                gc.collect(); _trim_heap()
     with shard_lock:
         norm_sq = 0.0; cs = 10_000_000
         for i in range(0, MODEL_SIZE, cs):
@@ -4352,7 +4420,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     sp = idx * MODEL_CONFIG["dim"]; ep = sp + MODEL_CONFIG["dim"]
                     global_engram_weights[sp:ep] += avg * (lr * trust)   # pool_w/step_scale/trust folded into avg
             del engram_accumulator
-            gc.collect()
+            gc.collect(); _trim_heap()
         every = anchor_every()
         if _ANCHOR["step"] is not None and _should_anchor(global_step + 1, every):
             # Measured at 65 M: this is the only change that closes MOSAIC's gap
@@ -4382,7 +4450,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
              f"step_scaled={step_scaled}, legacy_steps={legacy_steps}"
              + (f", outer_momentum={mom} (x{1.0 + mom:.2f} update)" if mom > 0 else ""))
     if HARDEN["LOSS_CHECK_MODE"] == "off": handle_checkpoints()
-    gc.collect()
+    gc.collect(); _trim_heap()
 
 # ============ FASTAPI + /fl/* ENDPOINTS ============
 limiter = Limiter(key_func=get_remote_address)
@@ -5825,7 +5893,7 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
         w = tensors["weights"]
         if w.numel() != MODEL_SIZE: raise ValueError(f"numel mismatch: {w.numel():,} vs {MODEL_SIZE:,}")
         arr = w.float().numpy().astype(np.float32)
-        del w, tensors; gc.collect()
+        del w, tensors; gc.collect(); _trim_heap()
     except Exception as e: raise HTTPException(500, f"weights at {revision}: {e}")
     step_bin = CHECKPOINT_DIR / f"model_step_{step}.bin"
     tmp = step_bin.with_suffix('.bin.tmp')
@@ -5846,7 +5914,7 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
             with stats_lock: global_step = step
         log.warning(f"🔧 global_weights ← step {step} (revision {revision[:12]})")
     finally:
-        del arr; gc.collect()
+        del arr; gc.collect(); _trim_heap()
     try:
         eng_path = hf_hub_download(repo_id=HF_REPO_ID, filename="engram_bf16.safetensors",
             revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache))
