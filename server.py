@@ -111,6 +111,7 @@ except Exception: pass
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
+import anyio
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import ipaddress
@@ -403,6 +404,74 @@ def build_init_weights(cfg: Optional[dict] = None, mode: Optional[str] = None):
 
 
 # ============ MEMORY GUARDS ============
+def _rss_mb() -> float:
+    """Resident set size in MB — the number an OOM actually measures."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _trim_heap() -> float:
+    """Return freed arenas to the OS instead of keeping them in the heap.
+
+    A round boundary allocates and drops several full-model buffers: a delta read
+    is ~1.3 GB raw plus ~1.3 GB converted plus a 2.5 GB fp32 view, and a
+    checkpoint save is another 2.5 GB fp32. CPython frees them and glibc keeps the
+    arena, so VmRSS ratchets a few GB per round while the live heap stays flat —
+    which is how a 2.5 GB model walks into OOM after three rounds. malloc_trim(0)
+    releases the free tops back to the kernel. Returns the RSS afterwards, in MB.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    return _memory_report("trim")
+
+
+_RSS_MARK = 0.0
+
+
+def _active_upload_bytes() -> int:
+    """Buffered bytes of chunked uploads that have not been finalised.
+
+    A volunteer that abandons a 1.3 GB upload leaves its chunks in memory until
+    the sweeper collects them. If RSS climbs and this number climbs with it, the
+    retainer is a live object and trimming native arenas cannot help.
+    """
+    total = 0
+    for entry in list((globals().get("_active_uploads") or {}).values()):
+        try:
+            total += sum(len(b) for b in (entry.get("chunks") or []))
+        except Exception:
+            total += 0
+    return total
+
+
+def _memory_report(stage: str) -> float:
+    """One line per round boundary: RSS, its delta, and the two plausible retainers.
+
+    Without this, a growing server looks identical whether the memory is free
+    arenas (malloc_trim fixes it) or a live object (it does not), and the logs
+    say nothing either way, which is exactly what was reported.
+    """
+    global _RSS_MARK
+    rss = _rss_mb()
+    delta = rss - _RSS_MARK
+    _RSS_MARK = rss
+    uploads = globals().get("_active_uploads") or {}
+    log.info("📈 memory %s: RSS %.0f MB (delta %+.0f MB), uploads=%d buffered=%.0f MB, pools=%d",
+             stage, rss, delta, len(uploads),
+             _active_upload_bytes() / (1024.0 * 1024.0),
+             len(globals().get("pools") or {}))
+    return rss
+
+
 def _avail_mem_gb() -> float:
     if _HAS_PSUTIL: return psutil.virtual_memory().available / (1024 ** 3)
     try:
@@ -1533,11 +1602,26 @@ def _flag_byzantine(client_key: str, client_ip: str, reason: str):
         if byzantine_flag_counts[subnet] >= CROSS_CHECK["BAN_THRESHOLD"]:
             ban_subnet(client_ip, f"subnet has {byzantine_flag_counts[subnet]} byzantine flags")
 
+# Deltas whose client declared an OOM-driven batch reduction. They are still
+# judged by the objective gate; they are only spared the byzantine flag, because a
+# smaller effective batch is a legitimate hardware response, not an attack. Before
+# this, a 16 GB volunteer that halved its batch changed its own hardware signature
+# mid-life and its deltas were flagged as cross-check outliers.
+_OOM_EXEMPT = {"count": 0}
+
+
 def _flag_byzantine_from_delta(path: str, reason: str):
     try:
         with open(path, 'rb') as f:
             ml = struct.unpack('<I', f.read(4))[0]
             md = json.loads(f.read(ml).decode('utf-8'))
+        downscales = int(md.get("oomDownscales") or 0)
+        if downscales > 0:
+            _OOM_EXEMPT["count"] += 1
+            log.info(f"🩹 {md.get('nodeKey', 'unknown')}: declared {downscales} OOM "
+                     f"downscale(s) — not flagging ({reason}); the delta is still judged "
+                     f"by the objective gate")
+            return
         _flag_byzantine(md.get("nodeKey", "unknown"), md.get("nodeIp", "unknown"), reason)
     except Exception as e: log.warning(f"Could not flag delta {path}: {e}")
 
@@ -1731,7 +1815,11 @@ def _hw_signature(client_key: str) -> tuple:
     hw = client_hardware.get(client_key) or {}
     backend  = (hw.get("backend")  or "?").upper()
     bs       = int(hw.get("bs") or 0)
-    bucket   = (1 << (bs.bit_length() - 1)) if bs > 0 else 0
+    # Bucket on the value the client declared at startup, never on the live one:
+    # a 16 GB card that halves its batch after an OOM is the same machine, and
+    # re-bucketing it here is what made its deltas look like a different peer's.
+    declared = int(hw.get("bs_declared") or 0) or bs
+    bucket   = (1 << (declared.bit_length() - 1)) if declared > 0 else 0
     autocast = (hw.get("autocast") or "any").lower()
     if POOL_BF16 == "off": autocast = "fp32"     # pools never train in bf16; fp32 pools accept any client
     optim    = (hw.get("optim")    or "any").lower()
@@ -2703,7 +2791,7 @@ def save_model_weights():
         with open(temp_file, 'wb') as f:
             for i in range(0, MODEL_SIZE, 10_000_000):
                 global_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
-        gc.collect(); os.replace(temp_file, LATEST_CHECKPOINT_FILE)
+        gc.collect(); _trim_heap(); os.replace(temp_file, LATEST_CHECKPOINT_FILE)
     except Exception as e: log.error(f"❌ Failed to save base model weights: {e}")
 
 def save_engram_weights():
@@ -2712,7 +2800,7 @@ def save_engram_weights():
         with open(temp_file, 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
-        gc.collect(); os.replace(temp_file, ENGRAM_CHECKPOINT_FILE)
+        gc.collect(); _trim_heap(); os.replace(temp_file, ENGRAM_CHECKPOINT_FILE)
     except Exception as e: log.error(f"❌ Failed to save engram weights: {e}")
 
 def save_latest_checkpoint(): save_global_state(); save_model_weights(); save_engram_weights()
@@ -2821,7 +2909,7 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                     src = global_weights if fn.startswith("model_") else global_engram_weights
                     w = src.cpu().to(dtype)
                     save_file({"weights": w}, str(temp_dir / fn))
-                    del w; gc.collect()
+                    del w; gc.collect(); _trim_heap()
                 config_data = {"architecture": MODEL_CONFIG["architecture"], "vocabSize": MODEL_CONFIG["vocabSize"],
                     "dim": MODEL_CONFIG["dim"], "nLayers": MODEL_CONFIG["nLayers"],
                     "nHeads": MODEL_CONFIG["nHeads"], "nKvHeads": MODEL_CONFIG["nKvHeads"],
@@ -2996,8 +3084,7 @@ def handle_checkpoints():
         with open(fp_eng.with_suffix('.bin.tmp'), 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
-        os.replace(fp_eng.with_suffix('.bin.tmp'), fp_eng)
-        gc.collect()
+        gc.collect(); _trim_heap()
         if not (_link_latest(fp, LATEST_CHECKPOINT_FILE) and _link_latest(fp_eng, ENGRAM_CHECKPOINT_FILE)):
             save_model_weights(); save_engram_weights()      # filesystem without hard links: old behaviour
         with open(CHECKPOINT_DIR / f"model_step_{global_step}.json", 'w', encoding='utf-8') as f:
@@ -3209,54 +3296,45 @@ def _sweep_orphans():
 def cleanup_loop():
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
-        try:
-            _cleanup_tick()
-        except Exception:
-            # One bad pass (a file or dict entry vanishing mid-scan) must not stop
-            # cleanup for the life of the process.
-            log.exception("cleanup loop error; retrying next interval")
-
-def _cleanup_tick():
-    now = time.time(); now_ms = int(now * 1000)
-    # prune auth rate-limit buckets so memory stays bounded
-    with _auth_rate_lock:
-        for bucket in (_register_attempts, _login_attempts):
-            for k in list(bucket.keys()):
-                bucket[k] = [t for t in bucket[k] if now - t < 3600]
-                if not bucket[k]:
-                    del bucket[k]
-    for key in list(active_clients.keys()):
-        if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
-    for k in list(client_hardware.keys()):
-        hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
-        if now - hw_ls > 24 * 3600: del client_hardware[k]
-    for k in list(client_last_submit.keys()):
-        if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
-    for sn in list(blacklisted_subnets.keys()):
-        if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
-    for k in list(banned_client_keys.keys()):
-        if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
-    for k, ban in list(banned_users.items()):
-        if ban.get("until") and ban["until"] < now: banned_users.pop(k, None)
-    task_timeout_ms = 72 * 60 * 60 * 1000
-    expired_tasks = [tid for tid, meta in list(db["tasks"].items()) if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
-    for tid in expired_tasks: db["tasks"].pop(tid, None)
-    stale_shards = [sid for sid, meta in list(db["shardMeta"].items()) if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
-    for sid in stale_shards:
-        db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
-    for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
-        try:
-            if time.time() - f.stat().st_mtime > 18000: f.unlink()
-        except FileNotFoundError:
-            pass  # removed by aggregation between glob and stat
-    _cleanup_expired_uploads()
-    try: _sweep_orphans()
-    except Exception as e: log.error(f"orphan sweep error: {e}")
-    try: _pool_cleanup_tick()
-    except Exception as e: log.error(f"pool cleanup error: {e}")
-    if expired_tasks or stale_shards:
-        log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
-    gc.collect()
+        now = time.time(); now_ms = int(now * 1000)
+        # prune auth rate-limit buckets so memory stays bounded
+        with _auth_rate_lock:
+            for bucket in (_register_attempts, _login_attempts):
+                for k in list(bucket.keys()):
+                    bucket[k] = [t for t in bucket[k] if now - t < 3600]
+                    if not bucket[k]:
+                        del bucket[k]
+        for key in list(active_clients.keys()):
+            if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
+        for k in list(client_hardware.keys()):
+            hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
+            if now - hw_ls > 24 * 3600: del client_hardware[k]
+        for k in list(client_last_submit.keys()):
+            if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
+        for sn in list(blacklisted_subnets.keys()):
+            if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
+        for k in list(banned_client_keys.keys()):
+            if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
+        for k in list(banned_users.keys()):
+            if banned_users[k].get("until") and banned_users[k]["until"] < now: del banned_users[k]
+        task_timeout_ms = 72 * 60 * 60 * 1000
+        expired_tasks = [tid for tid, meta in db["tasks"].items() if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
+        for tid in expired_tasks: del db["tasks"][tid]
+        stale_shards = [sid for sid, meta in db["shardMeta"].items() if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
+        for sid in stale_shards:
+            db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
+        for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
+            if time.time() - f.stat().st_mtime > 18000:
+                try: f.unlink()
+                except Exception: pass
+        _cleanup_expired_uploads()
+        try: _sweep_orphans()
+        except Exception as e: log.error(f"orphan sweep error: {e}")
+        try: _pool_cleanup_tick()
+        except Exception as e: log.error(f"pool cleanup error: {e}")
+        if expired_tasks or stale_shards:
+            log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
+        gc.collect(); _trim_heap()
 
 def _bg_hf_upload_and_status():
     if not _mem_guard(8.0, "HF weights upload"):
@@ -4313,7 +4391,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
             finally:
                 try: os.remove(path)
                 except Exception: pass
-                gc.collect()
+                gc.collect(); _trim_heap()
     with shard_lock:
         norm_sq = 0.0; cs = 10_000_000
         for i in range(0, MODEL_SIZE, cs):
@@ -4355,7 +4433,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     sp = idx * MODEL_CONFIG["dim"]; ep = sp + MODEL_CONFIG["dim"]
                     global_engram_weights[sp:ep] += avg * (lr * trust)   # pool_w/step_scale/trust folded into avg
             del engram_accumulator
-            gc.collect()
+            gc.collect(); _trim_heap()
         every = anchor_every()
         if _ANCHOR["step"] is not None and _should_anchor(global_step + 1, every):
             # Measured at 65 M: this is the only change that closes MOSAIC's gap
@@ -4386,7 +4464,7 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
              f"step_scaled={step_scaled}, legacy_steps={legacy_steps}"
              + (f", outer_momentum={mom} (x{1.0 + mom:.2f} update)" if mom > 0 else ""))
     if HARDEN["LOSS_CHECK_MODE"] == "off": handle_checkpoints()
-    gc.collect()
+    gc.collect(); _trim_heap()
 
 # ============ FASTAPI + /fl/* ENDPOINTS ============
 limiter = Limiter(key_func=get_remote_address)
@@ -4585,6 +4663,10 @@ def get_task(request: Request, format: str = "bf16", skip_weights: bool = False)
     client_hardware[client_key] = {
         "backend":  (request.headers.get("X-Client-Backend")    or "").upper(),
         "bs":        int(request.headers.get("X-Client-Batch-Size") or 0),
+        # Declared at startup; an OOM downscale lowers "bs" but not this, so a
+        # volunteer that runs out of VRAM keeps one identity for its whole life.
+        "bs_declared": int(request.headers.get("X-Client-Batch-Size-Declared") or 0),
+        "oom_downscales": int(request.headers.get("X-Client-Oom-Downscales") or 0),
         "vram_gb":   float(request.headers.get("X-Client-Vram-Gb")   or 0.0),
         "gpu":       request.headers.get("X-Client-Gpu-Name")      or "",
         "autocast": (request.headers.get("X-Client-Autocast")   or "any").lower(),
@@ -5105,8 +5187,8 @@ def get_node():
     return {"nodes": [n.record for n in nodes]}
 
 @app.get("/api/nodes")
-async def get_nodes():
-    return await get_node()
+def get_nodes():
+    return get_node()
 
 @app.get("/api/checkpoints")
 def list_checkpoints(request: Request = None, secret: str = ""):
@@ -5206,20 +5288,24 @@ def admin_dissolve_pool(request: Request = None, secret: str = "", pool_id: str 
 def reload_checkpoint(request: Request = None, step: int = -1, secret: str = ""):
     global global_weights, global_engram_weights, global_step
     if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
-    if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
-    else:
-        cp_file = CHECKPOINT_DIR / f"model_step_{step}.bin"
-        if not cp_file.exists(): raise HTTPException(404, "Not found")
-        buf = np.fromfile(cp_file, dtype=np.float32)
-        if len(buf) != MODEL_SIZE: raise HTTPException(400, "Size mismatch")
-        global_weights = torch.from_numpy(buf.copy())
-        cp_eng_file = CHECKPOINT_DIR / f"engram_step_{step}.bin"
-        if cp_eng_file.exists():
-            buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
-            if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
-        global_step = step
-    loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None}); _save_loss_state()
-    save_latest_checkpoint(); sync_huggingface_state(); update_and_save_status(push_hf=True)
+    # Admin routes run in the threadpool, so a reload could otherwise swap the weights in the middle of a merge.
+    with shard_lock:
+        if round_state.get("is_aggregating"): raise HTTPException(409, "Aggregation in progress, retry in a minute")
+        if step == -1: load_global_state(); load_model_weights(); load_engram_weights()
+        else:
+            cp_file = CHECKPOINT_DIR / f"model_step_{step}.bin"
+            if not cp_file.exists(): raise HTTPException(404, "Not found")
+            buf = np.fromfile(cp_file, dtype=np.float32)
+            if len(buf) != MODEL_SIZE: raise HTTPException(400, "Size mismatch")
+            global_weights = torch.from_numpy(buf.copy())
+            cp_eng_file = CHECKPOINT_DIR / f"engram_step_{step}.bin"
+            if cp_eng_file.exists():
+                buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
+                if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
+            global_step = step
+        loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None}); _save_loss_state()
+        save_latest_checkpoint()
+    sync_huggingface_state(); update_and_save_status(push_hf=True)
     return {"status": "reloaded", "step": global_step}
 
 @app.post("/api/admin/push_hf")
@@ -5313,6 +5399,7 @@ def admin_reset(request: Request = None, secret: str = "", push: int = 1):
     push=0 skips the Hugging Face upload (use it if HF_REPO_ID is not the repo you want overwritten)."""
     if not _admin_ok(_admin_secret(request, secret)): raise HTTPException(403, "Invalid secret")
     with shard_lock:
+        if round_state.get("is_aggregating"): raise HTTPException(409, "Aggregation in progress, retry in a minute")
         _reset_weights_to_init()
     save_latest_checkpoint()
     if push:
@@ -5820,7 +5907,7 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
         w = tensors["weights"]
         if w.numel() != MODEL_SIZE: raise ValueError(f"numel mismatch: {w.numel():,} vs {MODEL_SIZE:,}")
         arr = w.float().numpy().astype(np.float32)
-        del w, tensors; gc.collect()
+        del w, tensors; gc.collect(); _trim_heap()
     except Exception as e: raise HTTPException(500, f"weights at {revision}: {e}")
     step_bin = CHECKPOINT_DIR / f"model_step_{step}.bin"
     tmp = step_bin.with_suffix('.bin.tmp')
@@ -5841,7 +5928,7 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
             with stats_lock: global_step = step
         log.warning(f"🔧 global_weights ← step {step} (revision {revision[:12]})")
     finally:
-        del arr; gc.collect()
+        del arr; gc.collect(); _trim_heap()
     try:
         eng_path = hf_hub_download(repo_id=HF_REPO_ID, filename="engram_bf16.safetensors",
             revision=revision, token=HF_TOKEN, cache_dir=str(hf_cache))
@@ -5869,6 +5956,11 @@ def admin_restore_from_hf(request: Request = None, secret: str = "", revision: s
 # ============ STARTUP ============
 @app.on_event("startup")
 async def startup():
+    # The route handlers are plain `def` (threadpool). Bound the pool so a burst of polling clients
+    # cannot exhaust pids.max; it must stay well above the number of requests that can wait on a lock.
+    # Set here because the limiter only exists inside the running event loop.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = int(os.environ.get("CROWDGPT_REQUEST_THREADS", "24"))
+    log.info(f"🔧 Request thread pool: {anyio.to_thread.current_default_thread_limiter().total_tokens}")
     load_dataset_state(); load_users_db(); load_global_state(); _load_loss_state()
     initialize_model()
     weights_ok = load_model_weights()
@@ -5974,12 +6066,6 @@ if __name__ == "__main__":
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().setLevel(logging.INFO)
 
-    try:
-        import anyio
-        # The route handlers are plain `def` (threadpool). Bound the pool so a burst of polling clients
-        # cannot exhaust pids.max; it must stay well above the number of requests that can wait on a lock.
-        anyio.to_thread.current_default_thread_limiter().total_tokens = int(os.environ.get("CROWDGPT_REQUEST_THREADS", "24"))
-    except Exception as _e: log.warning(f"thread limiter not set: {_e}")
     import threading as _th
     try: import resource; _np = resource.getrlimit(resource.RLIMIT_NPROC)[0]
     except Exception: _np = '?'
