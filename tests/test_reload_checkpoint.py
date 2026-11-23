@@ -114,6 +114,7 @@ class ReloadCheckpointTest(unittest.TestCase):
             "global_engram_weights": _FakeTensor(self.old_engram.copy()),
             "global_step": 500,
             "loss_ratchet_state": {"lastAcceptedLoss": 1.0, "lastAcceptedStep": 500},
+            "_trim_heap": lambda: 0.0,
             "round_state": {"is_aggregating": False},
             "shard_lock": __import__("threading").RLock(),
             "_OUTER": {"grad": None, "momentum": None, "rounds": 0},

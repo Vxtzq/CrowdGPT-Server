@@ -412,8 +412,10 @@ def _rss_mb() -> float:
             for line in f:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024.0
-    except Exception:
-        pass
+    except OSError:
+        pass  # no /proc outside Linux (macOS dev machines); psutil covers it below
+    if _HAS_PSUTIL:
+        return psutil.Process().memory_info().rss / (1024.0 * 1024.0)
     return 0.0
 
 
@@ -3093,6 +3095,7 @@ def handle_checkpoints():
         with open(fp_eng.with_suffix('.bin.tmp'), 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
+        os.replace(fp_eng.with_suffix('.bin.tmp'), fp_eng)
         gc.collect(); _trim_heap()
         if not (_link_latest(fp, LATEST_CHECKPOINT_FILE) and _link_latest(fp_eng, ENGRAM_CHECKPOINT_FILE)):
             save_model_weights(); save_engram_weights()      # filesystem without hard links: old behaviour
@@ -3305,47 +3308,56 @@ def _sweep_orphans():
 def cleanup_loop():
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
-        now = time.time(); now_ms = int(now * 1000)
-        # prune auth rate-limit buckets so memory stays bounded
-        with _auth_rate_lock:
-            for bucket in (_register_attempts, _login_attempts):
-                for k in list(bucket.keys()):
-                    bucket[k] = [t for t in bucket[k] if now - t < 3600]
-                    if not bucket[k]:
-                        del bucket[k]
-        for key in list(active_clients.keys()):
-            if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
-        for key in list(_WAITERS.keys()):
-            if key not in active_clients: _WAITERS.pop(key, None)
-        for k in list(client_hardware.keys()):
-            hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
-            if now - hw_ls > 24 * 3600: del client_hardware[k]
-        for k in list(client_last_submit.keys()):
-            if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
-        for sn in list(blacklisted_subnets.keys()):
-            if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
-        for k in list(banned_client_keys.keys()):
-            if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
-        for k in list(banned_users.keys()):
-            if banned_users[k].get("until") and banned_users[k]["until"] < now: del banned_users[k]
-        task_timeout_ms = 72 * 60 * 60 * 1000
-        expired_tasks = [tid for tid, meta in db["tasks"].items() if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
-        for tid in expired_tasks: del db["tasks"][tid]
-        stale_shards = [sid for sid, meta in db["shardMeta"].items() if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
-        for sid in stale_shards:
-            db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
-        for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
-            if time.time() - f.stat().st_mtime > 18000:
-                try: f.unlink()
-                except Exception: pass
-        _cleanup_expired_uploads()
-        try: _sweep_orphans()
-        except Exception as e: log.error(f"orphan sweep error: {e}")
-        try: _pool_cleanup_tick()
-        except Exception as e: log.error(f"pool cleanup error: {e}")
-        if expired_tasks or stale_shards:
-            log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
-        gc.collect(); _trim_heap()
+        try:
+            _cleanup_tick()
+        except Exception:
+            # One bad pass (a file or dict entry vanishing mid-scan) must not stop
+            # cleanup for the life of the process.
+            log.exception("cleanup loop error; retrying next interval")
+
+def _cleanup_tick():
+    now = time.time(); now_ms = int(now * 1000)
+    # prune auth rate-limit buckets so memory stays bounded
+    with _auth_rate_lock:
+        for bucket in (_register_attempts, _login_attempts):
+            for k in list(bucket.keys()):
+                bucket[k] = [t for t in bucket[k] if now - t < 3600]
+                if not bucket[k]:
+                    del bucket[k]
+    for key in list(active_clients.keys()):
+        if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
+    for key in list(_WAITERS.keys()):
+        if key not in active_clients: _WAITERS.pop(key, None)
+    for k in list(client_hardware.keys()):
+        hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
+        if now - hw_ls > 24 * 3600: del client_hardware[k]
+    for k in list(client_last_submit.keys()):
+        if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
+    for sn in list(blacklisted_subnets.keys()):
+        if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
+    for k in list(banned_client_keys.keys()):
+        if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
+    for k, ban in list(banned_users.items()):
+        if ban.get("until") and ban["until"] < now: banned_users.pop(k, None)
+    task_timeout_ms = 72 * 60 * 60 * 1000
+    expired_tasks = [tid for tid, meta in list(db["tasks"].items()) if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
+    for tid in expired_tasks: db["tasks"].pop(tid, None)
+    stale_shards = [sid for sid, meta in list(db["shardMeta"].items()) if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
+    for sid in stale_shards:
+        db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
+    for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
+        try:
+            if time.time() - f.stat().st_mtime > 18000: f.unlink()
+        except FileNotFoundError:
+            pass  # removed by aggregation between glob and stat
+    _cleanup_expired_uploads()
+    try: _sweep_orphans()
+    except Exception as e: log.error(f"orphan sweep error: {e}")
+    try: _pool_cleanup_tick()
+    except Exception as e: log.error(f"pool cleanup error: {e}")
+    if expired_tasks or stale_shards:
+        log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
+    gc.collect(); _trim_heap()
 
 def _bg_hf_upload_and_status():
     if not _mem_guard(8.0, "HF weights upload"):

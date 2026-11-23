@@ -67,7 +67,7 @@ class SourceChecksTest(unittest.TestCase):
         self.assertIn("Upload larger than declared totalBytes", body)
 
     def test_finalize_requires_granted_object_key(self):
-        self.assertIn("object_key_mismatch", ast.unparse(_function("submit_finalize")))
+        self.assertIn("object_key_mismatch", ast.unparse(_function("_finalize_upload")))
 
 
 class BanUserTest(unittest.TestCase):
