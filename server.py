@@ -1414,8 +1414,7 @@ def get_client_country(request: Request) -> Optional[str]:
     if raw:
         cc = raw.strip().upper()
         if len(cc) == 2 and cc != "XX":
-            nets = HARDEN["TRUSTED_PROXY_NETS"]
-            if not nets or _peer_in_trusted(request):
+            if _peer_in_trusted(request):
                 return cc
     return _lookup_country_by_ip(get_client_ip(request))
 
@@ -1473,13 +1472,8 @@ def stamp_client_country(request: Request) -> Optional[str]:
         return None
 
 def get_client_ip(request: Request) -> str:
+    # Forwarding headers are only believed from a trusted proxy; anyone else could forge them.
     nets = HARDEN["TRUSTED_PROXY_NETS"]
-    if not nets:
-        cf = request.headers.get("cf-connecting-ip")
-        if cf: return cf.strip()
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd: return fwd.split(",")[0].strip()
-        return request.client.host if request.client else "unknown"
     if _peer_in_trusted(request):
         cf = request.headers.get("cf-connecting-ip")
         if cf: return cf.strip()
@@ -3631,6 +3625,13 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             except Exception: local_steps = 1
             if local_steps <= 0: local_steps = 1
             local_steps = min(local_steps, HARDEN["MAX_LOCAL_STEPS"])
+            # The token cap, merge weight and norm limit all grow with localSteps,
+            # so never credit more steps than the task assigned.
+            try: assigned_steps = int(task_meta.get("targetLocalSteps") or 0)
+            except (TypeError, ValueError): assigned_steps = 0
+            if 0 < assigned_steps < local_steps:
+                log.warning(f"⚠️ {client_key}: localSteps {local_steps} clamped to assigned {assigned_steps}")
+                local_steps = assigned_steps
             # A3: the client reports the optimizer steps it actually took (and its accum), so the
             # aggregate can be normalised by steps instead of by an assumed trajectory length.
             # Absent fields mean a legacy client; they are stored as absent, never guessed.
@@ -3879,12 +3880,12 @@ def _stream_f32_file(path, n_params: int, fmt: str, piece: int = 10_000_000):
 def _log_hardening_summary():
     log.info("🛡️ Hardening: proxies=%s | quota client/subnet=%s/%s | krum f=%s ram=%dMB | "
              "slots=%s | loss=%s | cross-check=%s" % (
-        [str(n) for n in HARDEN["TRUSTED_PROXY_NETS"]] or "NONE (spoofable)",
+        [str(n) for n in HARDEN["TRUSTED_PROXY_NETS"]] or "NONE (headers ignored)",
         HARDEN["MAX_SUBMISSIONS_PER_CLIENT_ROUND"], HARDEN["MAX_SUBMISSIONS_PER_SUBNET_ROUND"],
         HARDEN["KRUM_F"], HARDEN["KRUM_RAM_BYTES"] // (1024 * 1024),
         HARDEN["MAX_CONCURRENT_UPLOADS"], HARDEN["LOSS_CHECK_MODE"],
         "ON" if CROSS_CHECK["ENABLED"] else "OFF"))
-    if not HARDEN["TRUSTED_PROXY_NETS"]: log.warning("⚠️ CROWDGPT_TRUSTED_PROXIES unset: client IPs from X-Forwarded-For are spoofable.")
+    if not HARDEN["TRUSTED_PROXY_NETS"]: log.warning("⚠️ CROWDGPT_TRUSTED_PROXIES is empty: forwarding headers are ignored and every client is identified by its socket address.")
 def _log_cross_check_summary():
     if not CROSS_CHECK["ENABLED"]: log.info(f"🔍 Cross-check: DISABLED"); return
     log.info(f"🔍 Cross-check: ENABLED — pool={MATCHMAKING['POOL_SIZE']} (MANDATORY)")
@@ -4888,6 +4889,8 @@ async def submit_init(request: Request):
             key = f"deltas/r{round_state['current_round']}/{client_key.replace(':', '_')}/{upload_id}.bin"
             response["object"] = OBJECT_STORE.grant_put(
                 key, checksum, expires_s=UPLOAD_TTL_SECONDS).as_dict()
+            with uploads_lock:
+                _active_uploads[upload_id]["object_key"] = key
         except Exception as e:
             log.warning(f"⚠️ object grant failed: {e}")
     return response
@@ -4909,6 +4912,7 @@ async def submit_chunk(request: Request, uploadId: str, index: int):
             if up.get("client_key") and get_client_key(request) != up["client_key"]:
                 raise HTTPException(403, "Owner mismatch")
         up_dir = up["dir"]; up["last_activity"] = time.time()
+        chunk_limit = up["chunk_size"]
     part_tmp = up_dir / f"part_{index:06d}.tmp"
     part_final = up_dir / f"part_{index:06d}.bin"
     h = hashlib.sha256(); size = 0
@@ -4917,7 +4921,7 @@ async def submit_chunk(request: Request, uploadId: str, index: int):
             try:
                 async for chunk in request.stream():
                     size += len(chunk)
-                    if size > MAX_CHUNK_BYTES: raise HTTPException(413, "Chunk too large")
+                    if size > chunk_limit: raise HTTPException(413, "Chunk larger than declared chunkSize")
                     f.write(chunk); h.update(chunk)
             except ClientDisconnect:
                 raise HTTPException(status_code=499, detail="Client disconnected during chunk upload")
@@ -4948,6 +4952,9 @@ async def submit_chunk(request: Request, uploadId: str, index: int):
             up = _active_uploads.get(uploadId)
             if not up: raise HTTPException(404, "Unknown uploadId")
             old = up["chunk_sizes"].get(index, 0)
+            if up["bytes_received"] - old + size > up["total_bytes"]:
+                part_final.unlink(missing_ok=True)
+                raise HTTPException(413, "Upload larger than declared totalBytes")
             up["chunk_sizes"][index] = size
             up["bytes_received"] = up["bytes_received"] - old + size
             up["received"].add(index); up["last_activity"] = time.time()
@@ -4973,12 +4980,11 @@ async def submit_finalize(request: Request):
     upload_id = data.get("uploadId")
     if not _valid_upload_id(upload_id): raise HTTPException(400, "Invalid uploadId")
     if ORCH is not None:
-        _replay = ORCH.submission.get_upload_result(upload_id)
+        _replay = ORCH.submission.get_upload_result(upload_id, client_key=get_client_key(request))
         if _replay is not None:
             log.info(f"♻️ replaying finalized upload {upload_id}")
             return JSONResponse(_replay)
-    object_key = data.get("objectKey")
-    if object_key and OBJECT_STORE is not None:
+    if data.get("objectKey") and OBJECT_STORE is not None:
         with uploads_lock:
             up = _active_uploads.get(upload_id)
         if not up: raise HTTPException(404, "Unknown uploadId")
@@ -4989,7 +4995,10 @@ async def submit_finalize(request: Request):
         else:
             if up.get("client_key") and get_client_key(request) != up["client_key"]:
                 raise HTTPException(403, "Owner mismatch")
-        expected = str(data.get("sha256") or up.get("checksum") or "").lower()
+        object_key = up.get("object_key")
+        if not object_key or data["objectKey"] != object_key:
+            raise HTTPException(400, {"reason": "object_key_mismatch"})
+        expected = str(up.get("checksum") or "").lower()
         if len(expected) != 64:
             raise HTTPException(400, {"reason": "object_hash_missing"})
         if not OBJECT_STORE.verify_file(str(object_key), expected):
@@ -5607,11 +5616,16 @@ def admin_ban_user(request: Request = None, secret: str = "", user_id: str = "",
     with users_lock:
         user = users_db["users"].get(user_id)
         if not user: raise HTTPException(404, "User not found")
-        ips = {t.get("requestedByIp") for t in db["tasks"].values()
-               if t.get("requestedByKey") == f"user:{user_id}" and t.get("requestedByIp")}
+        # Tasks never record the requester's IP; the country tracker keeps the last one seen.
+        with user_countries_lock:
+            last_ip = (user_countries.get(f"user:{user_id}") or {}).get("last_ip")
+        ips = {last_ip} if last_ip else set()
         banned_users[user_id] = {"username": user["username"], "reason": reason,
             "bannedAt": time.time(), "until": until, "ips": list(ips)}
         banned_client_keys[f"user:{user_id}"] = until
+        for token, owner in list(users_db["tokens"].items()):
+            if owner == user_id:
+                del users_db["tokens"][token]
         if ban_ip:
             for ip in ips: ban_subnet(ip, f"user {user['username']} banned", hours or 24)
         save_users_db()
