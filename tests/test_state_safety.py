@@ -8,6 +8,7 @@ functions with ``ast`` and run them in a namespace that stands in for the module
 Run:  python3 -m unittest discover -s tests -v
 """
 import ast
+import gc
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -122,9 +124,9 @@ class CleanupTest(unittest.TestCase):
     def _ns(self):
         noop = lambda *a, **k: None  # noqa: E731
         return _load(("cleanup_loop", "_cleanup_tick"), {
-            "time": time, "gc": type("G", (), {"collect": staticmethod(noop)}),
+            "time": time, "_trim_heap": noop, "gc": type("G", (), {"collect": staticmethod(noop)}),
             "log": logging.getLogger("test"), "_auth_rate_lock": threading.Lock(),
-            "_register_attempts": {}, "_login_attempts": {}, "active_clients": {},
+            "_register_attempts": {}, "_login_attempts": {}, "active_clients": {}, "_WAITERS": {},
             "client_hardware": {}, "client_last_submit": {}, "blacklisted_subnets": {},
             "banned_client_keys": {}, "banned_users": {"old": {"until": 1.0}, "live": {"until": None}},
             "db": {"tasks": {}, "shardMeta": {}, "pendingSubmissions": {}},
@@ -179,6 +181,51 @@ class LoadWeightsTest(unittest.TestCase):
         np.arange(4, dtype=np.float32).tofile(self.path)
         self.assertTrue(self.ns["load_model_weights"]())
         self.assertEqual(list(self.ns["global_weights"]), [0, 1, 2, 3])
+
+
+class _Weights:
+    """Enough of a torch tensor for handle_checkpoints: slice, .cpu().float().numpy()."""
+
+    def __init__(self, values):
+        self.values = np.asarray(values, dtype=np.float32)
+
+    def __getitem__(self, key):
+        return _Weights(self.values[key])
+
+    def cpu(self):
+        return self
+
+    def float(self):
+        return self
+
+    def numpy(self):
+        return self.values
+
+
+class StepCheckpointTest(unittest.TestCase):
+    def test_step_files_are_renamed_into_place_and_linked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = Path(tmp)
+            fallback = []
+            ns = _load(("_link_latest", "handle_checkpoints"), {
+                "os": os, "json": json, "Path": Path, "gc": gc, "datetime": datetime, "timezone": timezone,
+                "_trim_heap": lambda: 0.0, "log": logging.getLogger("test"),
+                "CHECKPOINT_DIR": ckpt, "global_step": 7, "MODEL_SIZE": 4, "ENG_PARAMS": 3,
+                "global_weights": _Weights([1, 2, 3, 4]), "global_engram_weights": _Weights([5, 6, 7]),
+                "LATEST_CHECKPOINT_FILE": ckpt / "model_latest.bin",
+                "ENGRAM_CHECKPOINT_FILE": ckpt / "engram_latest.bin",
+                "save_model_weights": lambda: fallback.append("model"),
+                "save_engram_weights": lambda: fallback.append("engram"),
+                "FL_CONFIG": {"MAX_CHECKPOINTS": 5},
+            })
+            ns["handle_checkpoints"]()
+            self.assertEqual(sorted(p.name for p in ckpt.glob("*.tmp")), [])
+            engram = ckpt / "engram_step_7.bin"
+            self.assertTrue(engram.exists())
+            np.testing.assert_array_equal(np.fromfile(engram, dtype=np.float32), [5, 6, 7])
+            self.assertTrue(os.path.samefile(engram, ckpt / "engram_latest.bin"))
+            self.assertTrue(os.path.samefile(ckpt / "model_step_7.bin", ckpt / "model_latest.bin"))
+            self.assertEqual(fallback, [])
 
 
 if __name__ == "__main__":

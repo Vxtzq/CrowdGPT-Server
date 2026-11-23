@@ -412,8 +412,10 @@ def _rss_mb() -> float:
             for line in f:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024.0
-    except Exception:
-        pass
+    except OSError:
+        pass  # no /proc outside Linux (macOS dev machines); psutil covers it below
+    if _HAS_PSUTIL:
+        return psutil.Process().memory_info().rss / (1024.0 * 1024.0)
     return 0.0
 
 
@@ -1064,6 +1066,8 @@ def _starved_peer_waiting(pool) -> bool:
             continue
         if time.time() - float(entry.get("since", time.time())) < starved:
             continue
+        if time.time() - active_clients.get(key, 0) > FL_CONFIG["IP_TIMEOUT_S"]:
+            continue  # stopped polling; its entry is pruned by the cleanup loop
         hw = entry.get("hw")
         if hw is None or not _pools_compatible(hw, pool["hardware_sig"]):
             continue
@@ -1843,7 +1847,8 @@ def _hw_signature(client_key: str) -> tuple:
     optim    = (hw.get("optim")    or "any").lower()
     gpu      = hw.get("gpu") or ""
     cc       = (hw.get("compute_cap") or "").lower()
-    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc)
+    engram   = bool(hw.get("engram", True))
+    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc, engram)
 
 def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     """v2.3 ASYMMETRIC matching — backend exact, optimizer normalize+wildcard,
@@ -1865,6 +1870,10 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     Arch is intentionally ignored (cross-arch tolerated at 5× threshold)."""
     if len(client_sig) < 4 or len(pool_sig) < 4: return False
     if client_sig[0] != pool_sig[0]: return False  # backend exact
+    # Pools saved before the Engram flag have 7-entry signatures; treat them as Engram pools.
+    c_engram = client_sig[7] if len(client_sig) > 7 else True
+    p_engram = pool_sig[7] if len(pool_sig) > 7 else True
+    if c_engram != p_engram: return False  # an Engram-less delta has no Engram tail to merge
 
     def _norm_opt(s):
         s = str(s or "any").lower()
@@ -3108,6 +3117,7 @@ def handle_checkpoints():
         with open(fp_eng.with_suffix('.bin.tmp'), 'wb') as f:
             for i in range(0, ENG_PARAMS, 10_000_000):
                 global_engram_weights[i:i+10_000_000].cpu().float().numpy().tofile(f)
+        os.replace(fp_eng.with_suffix('.bin.tmp'), fp_eng)
         gc.collect(); _trim_heap()
         if not (_link_latest(fp, LATEST_CHECKPOINT_FILE) and _link_latest(fp_eng, ENGRAM_CHECKPOINT_FILE)):
             save_model_weights(); save_engram_weights()      # filesystem without hard links: old behaviour
@@ -3320,45 +3330,56 @@ def _sweep_orphans():
 def cleanup_loop():
     while True:
         time.sleep(FL_CONFIG["CLEANUP_INTERVAL_S"])
-        now = time.time(); now_ms = int(now * 1000)
-        # prune auth rate-limit buckets so memory stays bounded
-        with _auth_rate_lock:
-            for bucket in (_register_attempts, _login_attempts):
-                for k in list(bucket.keys()):
-                    bucket[k] = [t for t in bucket[k] if now - t < 3600]
-                    if not bucket[k]:
-                        del bucket[k]
-        for key in list(active_clients.keys()):
-            if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
-        for k in list(client_hardware.keys()):
-            hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
-            if now - hw_ls > 24 * 3600: del client_hardware[k]
-        for k in list(client_last_submit.keys()):
-            if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
-        for sn in list(blacklisted_subnets.keys()):
-            if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
-        for k in list(banned_client_keys.keys()):
-            if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
-        for k in list(banned_users.keys()):
-            if banned_users[k].get("until") and banned_users[k]["until"] < now: del banned_users[k]
-        task_timeout_ms = 72 * 60 * 60 * 1000
-        expired_tasks = [tid for tid, meta in db["tasks"].items() if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
-        for tid in expired_tasks: del db["tasks"][tid]
-        stale_shards = [sid for sid, meta in db["shardMeta"].items() if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
-        for sid in stale_shards:
-            db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
-        for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
-            if time.time() - f.stat().st_mtime > 18000:
-                try: f.unlink()
-                except Exception: pass
-        _cleanup_expired_uploads()
-        try: _sweep_orphans()
-        except Exception as e: log.error(f"orphan sweep error: {e}")
-        try: _pool_cleanup_tick()
-        except Exception as e: log.error(f"pool cleanup error: {e}")
-        if expired_tasks or stale_shards:
-            log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
-        gc.collect(); _trim_heap()
+        try:
+            _cleanup_tick()
+        except Exception:
+            # One bad pass (a file or dict entry vanishing mid-scan) must not stop
+            # cleanup for the life of the process.
+            log.exception("cleanup loop error; retrying next interval")
+
+def _cleanup_tick():
+    now = time.time(); now_ms = int(now * 1000)
+    # prune auth rate-limit buckets so memory stays bounded
+    with _auth_rate_lock:
+        for bucket in (_register_attempts, _login_attempts):
+            for k in list(bucket.keys()):
+                bucket[k] = [t for t in bucket[k] if now - t < 3600]
+                if not bucket[k]:
+                    del bucket[k]
+    for key in list(active_clients.keys()):
+        if now - active_clients[key] > FL_CONFIG["IP_TIMEOUT_S"]: del active_clients[key]
+    for key in list(_WAITERS.keys()):
+        if key not in active_clients: _WAITERS.pop(key, None)
+    for k in list(client_hardware.keys()):
+        hw_ls = client_hardware[k].get("last_seen", 0) if isinstance(client_hardware[k], dict) else 0
+        if now - hw_ls > 24 * 3600: del client_hardware[k]
+    for k in list(client_last_submit.keys()):
+        if now - client_last_submit[k] > 24 * 3600: del client_last_submit[k]
+    for sn in list(blacklisted_subnets.keys()):
+        if now > blacklisted_subnets[sn]: del blacklisted_subnets[sn]
+    for k in list(banned_client_keys.keys()):
+        if banned_client_keys[k] and banned_client_keys[k] < now: del banned_client_keys[k]
+    for k, ban in list(banned_users.items()):
+        if ban.get("until") and ban["until"] < now: banned_users.pop(k, None)
+    task_timeout_ms = 72 * 60 * 60 * 1000
+    expired_tasks = [tid for tid, meta in list(db["tasks"].items()) if now_ms - meta.get("createdAt", now_ms) > task_timeout_ms]
+    for tid in expired_tasks: db["tasks"].pop(tid, None)
+    stale_shards = [sid for sid, meta in list(db["shardMeta"].items()) if now_ms - meta.get("createdAt", 0) > FL_CONFIG["SHARD_TIMEOUT_S"] * 1000]
+    for sid in stale_shards:
+        db["shardMeta"].pop(sid, None); db["pendingSubmissions"].pop(sid, None)
+    for f in DELTA_TEMP_DIR.glob("delta_*.bin"):
+        try:
+            if time.time() - f.stat().st_mtime > 18000: f.unlink()
+        except FileNotFoundError:
+            pass  # removed by aggregation between glob and stat
+    _cleanup_expired_uploads()
+    try: _sweep_orphans()
+    except Exception as e: log.error(f"orphan sweep error: {e}")
+    try: _pool_cleanup_tick()
+    except Exception as e: log.error(f"pool cleanup error: {e}")
+    if expired_tasks or stale_shards:
+        log.info(f"🧹 GC: cleaned {len(expired_tasks)} tasks + {len(stale_shards)} shards")
+    gc.collect(); _trim_heap()
 
 def _bg_hf_upload_and_status():
     if not _mem_guard(8.0, "HF weights upload"):
@@ -4740,6 +4761,7 @@ def get_task(request: Request, format: str = "bf16", skip_weights: bool = False)
                             request.headers.get("X-Client-Gpu-Name") or "",
                             request.headers.get("X-Client-Backend") or "")),
         "client_ip": client_ip,             # ← NEW: used by same-actor pool check
+        "engram": request.headers.get("X-Client-Engram", "1") != "0",
         "last_seen": time.time(),
     }
     hw = client_hardware[client_key]
@@ -5389,6 +5411,7 @@ def reload_checkpoint(request: Request = None, step: int = -1, secret: str = "")
                 buf_eng = np.fromfile(cp_eng_file, dtype=np.float32)
                 if len(buf_eng) == ENG_PARAMS: global_engram_weights = torch.from_numpy(buf_eng.copy())
             global_step = step
+        _OUTER.update(grad=None, rounds=0)  # momentum from the replaced weights would push the reloaded ones
         loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None}); _save_loss_state()
         save_latest_checkpoint()
     sync_huggingface_state(); update_and_save_status(push_hf=True)
@@ -5474,6 +5497,7 @@ def _reset_weights_to_init():
     global_weights = build_init_weights()
     global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
     global_step = 0
+    _OUTER.update(grad=None, rounds=0)
     loss_ratchet_state.update({"lastAcceptedLoss": None, "lastAcceptedStep": None, "history": []}); _save_loss_state()
     global_stats = {"totalTokens": 0, "totalSteps": 0, "lastLoss": 0.0, "lossHistory": []}
     lora_stats = {"total_submissions": 0, "rank_distribution": {}, "avg_effective_rank": 0, "last_update": None}
@@ -5718,7 +5742,16 @@ def admin_ban_user(request: Request = None, secret: str = "", user_id: str = "",
                 else: kept.append(p)
             round_state["pending_deltas"] = kept
         with pool_lock:
-            for pool in pools.values():
+            for pid, pool in list(pools.items()):
+                if pool["status"] == "forming":
+                    gone = [c for c in pool["clients"] if _user_id_from_key(c) == user_id]
+                    for c in gone:
+                        pool["clients"].remove(c)
+                        if client_pool_map.get(c) == pid: client_pool_map.pop(c, None)
+                    if gone and not pool["clients"]:
+                        pools.pop(pid, None); _persist_pool_removed(pid)
+                    elif gone:
+                        _persist_pool_join(pool, pool["clients"][0])
                 for ck in list(pool["deltas"].keys()):
                     if _user_id_from_key(ck) == user_id:
                         try: os.remove(pool["deltas"][ck])
