@@ -87,11 +87,12 @@ class SubmissionService:
                 (json.dumps(result, sort_keys=True, separators=(",", ":")), time.time(), upload_id),
             )
 
-    def get_upload_result(self, upload_id: str) -> Optional[dict]:
+    def get_upload_result(self, upload_id: str, *, client_key: str) -> Optional[dict]:
+        """Only the client that began the upload may read its stored result."""
         row = self.store.query_one(
-            "SELECT state,result FROM uploads WHERE upload_id=?", (upload_id,)
+            "SELECT state,result,client_key FROM uploads WHERE upload_id=?", (upload_id,)
         )
-        if not row or row["state"] != "completed" or not row["result"]:
+        if not row or row["state"] != "completed" or not row["result"] or row["client_key"] != client_key:
             return None
         try:
             return json.loads(row["result"])

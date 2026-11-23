@@ -111,7 +111,8 @@ def test_submission_is_idempotent_by_content_hash(tmp_path):
         assert orch.submission.get_upload(upload_id)["state"] == "finalized"
         result = {"status": "success", "savedPath": "/tmp/delta.bin"}
         orch.submission.complete_upload(upload_id, result)
-        assert orch.submission.get_upload_result(upload_id) == result
+        assert orch.submission.get_upload_result(upload_id, client_key="ip:a") == result
+        assert orch.submission.get_upload_result(upload_id, client_key="ip:b") is None
 
         first, created = orch.submission.record_submission(
             client_key="ip:a", round_no=12, content_sha256="b" * 64,
