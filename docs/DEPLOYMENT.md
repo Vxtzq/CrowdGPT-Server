@@ -138,3 +138,35 @@ the same way. Copying a live SQLite WAL database can produce an inconsistent
 snapshot, so stop the process first.
 
 The node key is identity: restoring it restores the node id.
+
+## Fixed held-out loss
+
+Set `CROWDGPT_HELDOUT_JSONL` to a local JSONL file tokenized with the model's
+tokenizer. Each line must contain an `input_ids` array with 2 to 2049 token IDs.
+For example, `{"input_ids":[100,200,300]}` contributes two next-token targets.
+Use held-out data disjoint from training. The server caches the validated
+dataset until restart and reports its SHA-256 for comparison across runs.
+
+Set `CROWDGPT_HELDOUT_CLIENT` to the path of the matching CrowdGPT `client.py`
+with Engram enabled. It defaults to `../CrowdGPT/client.py` relative to the
+server checkout. Mount the JSONL and client checkout if running in a container.
+`CROWDGPT_HELDOUT_DEVICE` defaults to `cpu`; set it to `cuda:0` to use a GPU.
+
+Each closed round evaluates the resulting global model, including unchanged
+rounds. Evaluation runs before opening the next round and can extend the
+turnaround time, so keep the fixed dataset small. Allow memory for an additional
+model and Engram table. Evaluation is observational and independent of the
+existing external loss gate.
+
+`GET /api/eval/status` serves the current state (`disabled`, `idle`,
+`running`, `ok`, or `error`) and the last successful evaluation, including
+round, global step, token-weighted cross-entropy loss, target token count,
+example count, and dataset SHA-256. Status is held in memory until restart.
+The server persists the loss history in `checkpoints/val_loss.json` and includes
+it in the existing Hugging Face status commit when publishing is enabled. The
+file has a `currentRound` field and loss entries such as `"round1": 10.22`.
+`weightsSha256` maps round keys to hashes of the evaluated weights, computed
+over the flat little-endian FP32 base weights followed by the Engram weights.
+Re-evaluating a round replaces its entry. Failed evaluations and existing
+entries after the current round use the JSON string `"NaN"`. Hashes for later
+rounds are cleared.

@@ -3051,6 +3051,15 @@ def update_and_save_status(push_hf: bool = True):
             CommitOperationAdd(path_in_repo="leaderboard.json", path_or_fileobj=str(temp_dir / "leaderboard.json")),
             CommitOperationAdd(path_in_repo="badge_tokens.json", path_or_fileobj=str(temp_dir / "badge_tokens.json")),
         ]
+        try:
+            val_loss = HELDOUT_HISTORY_FILE.read_bytes()
+        except FileNotFoundError:
+            val_loss = None
+        if val_loss is not None:
+            val_loss_path = temp_dir / "val_loss.json"
+            val_loss_path.write_bytes(val_loss)
+            operations.append(CommitOperationAdd(path_in_repo="val_loss.json",
+                                                 path_or_fileobj=str(val_loss_path)))
         operations += PUB.hf_operations(temp_dir, CommitOperationAdd)
         api.create_commit(repo_id=HF_REPO_ID, repo_type="model", operations=operations,
             commit_message=f"chore: update stats ({badge_data['message']} tokens)")
@@ -3392,6 +3401,68 @@ def _bg_hf_upload_and_status():
     try: update_and_save_status(push_hf=True)
     except Exception as e: log.error(f"❌ BG status update error: {e}")
 
+HELDOUT_JSONL = os.getenv("CROWDGPT_HELDOUT_JSONL", "").strip()
+HELDOUT_HISTORY_FILE = CHECKPOINT_DIR / "val_loss.json"
+_HELDOUT_EVAL_STATUS = {"status": "idle" if HELDOUT_JSONL else "disabled", "lastSuccess": None}
+
+
+def _record_heldout_round(round_id, loss, weights_sha256):
+    try:
+        history = json.loads(HELDOUT_HISTORY_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        history = {}
+    hashes = history.setdefault("weightsSha256", {})
+    for key in history:
+        if key.startswith("round") and key[5:].isdigit() and int(key[5:]) > round_id:
+            history[key] = "NaN"
+            hashes.pop(key, None)
+    key = f"round{round_id}"
+    history["currentRound"] = round_id
+    history[key] = loss if loss is not None else "NaN"
+    if weights_sha256 is None:
+        hashes.pop(key, None)
+    else:
+        hashes[key] = weights_sha256
+    _write_json_atomic(HELDOUT_HISTORY_FILE, history)
+
+
+def _evaluate_heldout_round(round_id):
+    global _HELDOUT_EVAL_STATUS
+    if not HELDOUT_JSONL:
+        return
+    from heldout_eval import evaluate, hash_weights
+
+    with shard_lock:
+        step = global_step
+        attempt = {"round": round_id, "globalStep": step}
+        previous = _HELDOUT_EVAL_STATUS["lastSuccess"]
+        _HELDOUT_EVAL_STATUS = {"status": "running", **attempt, "lastSuccess": previous}
+        weights_sha256 = None
+        loss = None
+        try:
+            weights_sha256 = hash_weights(global_weights, global_engram_weights)
+            client_path = os.getenv("CROWDGPT_HELDOUT_CLIENT") or str(
+                BASE_DIR.parent / "CrowdGPT" / "client.py"
+            )
+            result = evaluate(HELDOUT_JSONL, client_path,
+                              os.getenv("CROWDGPT_HELDOUT_DEVICE", "cpu"),
+                              MODEL_CONFIG, global_weights, global_engram_weights)
+            loss = result["loss"]
+            completed = {**attempt, **result, "weightsSha256": weights_sha256,
+                         "finishedAt": datetime.now(timezone.utc).isoformat()}
+            _HELDOUT_EVAL_STATUS = {"status": "ok", **completed, "lastSuccess": completed}
+            log.info("Held-out evaluation for round %s, step %s: loss=%.6f (%s tokens)",
+                     round_id, step, result["loss"], result["tokens"])
+        except Exception:
+            log.exception("Held-out evaluation failed for round %s, step %s", round_id, step)
+            _HELDOUT_EVAL_STATUS = {"status": "error", **attempt, "lastSuccess": previous,
+                                    "finishedAt": datetime.now(timezone.utc).isoformat()}
+        try:
+            _record_heldout_round(round_id, loss, weights_sha256)
+        except Exception:
+            log.exception("Could not save held-out history for round %s", round_id)
+
+
 def round_watchdog():
     while True:
         try:
@@ -3457,6 +3528,7 @@ def round_watchdog():
                             if not _finish_with_loss_check(step_before):
                                 loss_rejected = True; success = False
                     else: log.warning("⚠️ Round ended with no completed pools")
+                    _evaluate_heldout_round(current_round_ending)
                     ended_round_started_at = round_state["round_start_time"]
                     with shard_lock:
                         if success or loss_rejected:
@@ -4693,6 +4765,11 @@ def heartbeat(request: Request, taskId: Optional[str] = None):
         return Response(content='{"status":"ok"}', media_type="application/json")
     task = "active" if _task_alive_for(taskId, client_key) else "gone"
     return Response(content=json.dumps({"status": "ok", "task": task}), media_type="application/json")
+
+@app.get("/api/eval/status")
+def eval_status():
+    return JSONResponse(_HELDOUT_EVAL_STATUS, headers={"Cache-Control": "no-store"})
+
 
 @app.get("/fl/round_status")
 def get_round_status(request: Request):
